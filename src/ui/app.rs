@@ -270,6 +270,7 @@ struct CachedNodeTotals {
 const LOG_MAX_LINES: usize = 5_000;
 const LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOG_DEFAULT_TAIL_LINES: i64 = 2_000;
+const LOG_MAX_EVENTS_PER_DRAIN: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogTarget {
@@ -305,6 +306,7 @@ struct LogViewState {
     auto_scroll: bool,
     reconnect_attempt: u32,
     reconnect_after: Option<Instant>,
+    reconnect_blocked: bool,
     container_override_pod: Option<ResourceKey>,
     container_override: Option<String>,
 }
@@ -333,6 +335,7 @@ impl Default for LogViewState {
             auto_scroll: true,
             reconnect_attempt: 0,
             reconnect_after: None,
+            reconnect_blocked: false,
             container_override_pod: None,
             container_override: None,
         }
@@ -748,6 +751,7 @@ impl App {
         self.logs.auto_scroll = true;
         self.logs.reconnect_attempt = 0;
         self.logs.reconnect_after = None;
+        self.logs.reconnect_blocked = false;
     }
 
     async fn start_log_session(&mut self, selection: LogSelection, initial: bool) -> bool {
@@ -796,7 +800,7 @@ impl App {
                                 PodLogEvent::End => return,
                                 PodLogEvent::Error(error) => {
                                     let _ = tx
-                                        .send(PodLogEvent::Line(format!(
+                                        .send(PodLogEvent::Error(format!(
                                             "[{stream_name}][error] {error}"
                                         )))
                                         .await;
@@ -808,10 +812,15 @@ impl App {
                     tasks.push(forward_task);
                 }
                 Err(err) => {
-                    self.logs.last_error = Some(err.to_string());
+                    let message = err.to_string();
+                    self.logs.last_error = Some(message.clone());
+                    if !is_retryable_log_error(&message) {
+                        self.logs.reconnect_blocked = true;
+                    }
                     self.push_log_line(format!(
-                        "[error] failed to open {}: {err}",
-                        log_target_name(target)
+                        "[error] failed to open {}: {}",
+                        log_target_name(target),
+                        message
                     ));
                 }
             }
@@ -823,19 +832,41 @@ impl App {
             self.logs.reconnect_attempt = 0;
             self.logs.reconnect_after = None;
             self.logs.stream_closed = false;
+            self.logs.reconnect_blocked = false;
             self.status_line = format!("Streaming logs: {}", selection.scope);
         } else {
             self.logs.session = None;
-            self.schedule_log_reconnect();
-            self.status_line = "Failed to start log stream".to_string();
+            if self.logs.reconnect_blocked {
+                self.logs.stream_closed = true;
+                self.logs.reconnect_after = None;
+                self.status_line = "Log stream blocked by non-retryable error".to_string();
+            } else {
+                self.schedule_log_reconnect();
+                self.status_line = "Failed to start log stream".to_string();
+            }
         }
         true
     }
 
     fn schedule_log_reconnect(&mut self) {
+        if self.logs.reconnect_blocked {
+            self.logs.stream_closed = true;
+            self.logs.reconnect_after = None;
+            return;
+        }
         self.logs.stream_closed = true;
         self.logs.reconnect_attempt = self.logs.reconnect_attempt.saturating_add(1);
-        let backoff_ms = 500u64
+        let base_ms = if self
+            .logs
+            .last_error
+            .as_deref()
+            .is_some_and(is_auth_refresh_log_error)
+        {
+            1_000u64
+        } else {
+            500u64
+        };
+        let backoff_ms = base_ms
             .saturating_mul(1u64 << self.logs.reconnect_attempt.min(5))
             .min(30_000);
         self.logs.reconnect_after = Some(Instant::now() + Duration::from_millis(backoff_ms));
@@ -853,7 +884,10 @@ impl App {
             return self.start_log_session(selection, true).await;
         }
 
-        if self.logs.selection.is_none() || self.logs.session.is_some() {
+        if self.logs.selection.is_none()
+            || self.logs.session.is_some()
+            || self.logs.reconnect_blocked
+        {
             return false;
         }
         if let Some(reconnect_after) = self.logs.reconnect_after
@@ -899,14 +933,34 @@ impl App {
     fn drain_log_events(&mut self) -> bool {
         let mut changed = false;
         let mut should_close_session = false;
+        let mut processed = 0usize;
         let mut events = Vec::new();
         if let Some(session) = &mut self.logs.session {
             loop {
+                if processed >= LOG_MAX_EVENTS_PER_DRAIN {
+                    break;
+                }
                 match session.rx.try_recv() {
-                    Ok(event) => events.push(event),
+                    Ok(event) => {
+                        processed = processed.saturating_add(1);
+                        events.push(event);
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        self.schedule_log_reconnect();
+                        if self
+                            .logs
+                            .last_error
+                            .as_deref()
+                            .is_some_and(|err| !is_retryable_log_error(err))
+                        {
+                            self.logs.reconnect_blocked = true;
+                            self.logs.stream_closed = true;
+                            self.logs.reconnect_after = None;
+                            self.status_line =
+                                "Log reconnect blocked: non-retryable RBAC error".to_string();
+                        } else {
+                            self.schedule_log_reconnect();
+                        }
                         should_close_session = true;
                         changed = true;
                         break;
@@ -924,6 +978,9 @@ impl App {
                 PodLogEvent::End => {}
                 PodLogEvent::Error(error) => {
                     self.logs.last_error = Some(error.clone());
+                    if !is_retryable_log_error(&error) {
+                        self.logs.reconnect_blocked = true;
+                    }
                     self.push_log_line(format!("[error] {error}"));
                     changed = true;
                 }
@@ -932,6 +989,10 @@ impl App {
 
         if should_close_session {
             self.stop_log_session();
+        }
+
+        if processed >= LOG_MAX_EVENTS_PER_DRAIN {
+            changed = true;
         }
 
         if changed && self.logs.auto_scroll && self.current_tab().pane == Pane::Logs {
@@ -984,6 +1045,8 @@ impl App {
     fn logs_title(&self) -> String {
         let state = if self.logs.session.is_some() {
             "streaming"
+        } else if self.logs.reconnect_blocked {
+            "blocked"
         } else if self.logs.stream_closed {
             "closed"
         } else {
@@ -3378,6 +3441,25 @@ fn slice_chars(text: &str, start: usize, width: usize) -> String {
     text.chars().skip(start).take(width).collect()
 }
 
+fn is_retryable_log_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("forbidden")
+        || lower.contains("insufficient rbac")
+        || lower.contains("code: 403")
+    {
+        return false;
+    }
+    true
+}
+
+fn is_auth_refresh_log_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("unauthorized")
+        || lower.contains("code: 401")
+        || lower.contains("token")
+        || lower.contains("expired")
+}
+
 fn highlighted_text(text: &str, query: &str) -> Text<'static> {
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -3861,7 +3943,10 @@ fn parse_resource_alias(token: &str) -> ResourceAlias {
 mod tests {
     use std::{collections::VecDeque, time::Instant};
 
-    use super::{ResourceAlias, parse_resource_alias, search_match_lines_in_logs, slice_chars};
+    use super::{
+        ResourceAlias, is_auth_refresh_log_error, is_retryable_log_error, parse_resource_alias,
+        search_match_lines_in_logs, slice_chars,
+    };
     use crate::model::ResourceKind;
 
     #[test]
@@ -3898,6 +3983,26 @@ mod tests {
             parse_resource_alias("storageclasses"),
             ResourceAlias::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn classifies_non_retryable_rbac_log_errors() {
+        assert!(!is_retryable_log_error(
+            "code: 403 Forbidden: cannot get pods"
+        ));
+        assert!(!is_retryable_log_error("forbidden: insufficient RBAC"));
+        assert!(is_retryable_log_error("connection refused"));
+        assert!(is_retryable_log_error(
+            "Unauthorized token refresh in progress"
+        ));
+    }
+
+    #[test]
+    fn classifies_auth_refresh_errors() {
+        assert!(is_auth_refresh_log_error("Unauthorized"));
+        assert!(is_auth_refresh_log_error("code: 401"));
+        assert!(is_auth_refresh_log_error("token expired"));
+        assert!(!is_auth_refresh_log_error("forbidden"));
     }
 
     #[test]
