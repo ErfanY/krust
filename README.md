@@ -10,7 +10,7 @@ Built against `k8s-openapi` `v1_33` (targeting Kubernetes `1.33+` clusters).
 
 - Layered architecture: `cluster IO` -> `state cache` -> `view projector` -> `TUI renderer`
 - Multi-context tabs in one session
-- Lazy watch activation: starts with active context + active resource, then expands on navigation
+- Lazy watch activation with active-context watch plans (inactive context watchers are paused)
 - Event-driven state deltas over bounded channels
 - Invalidation-based rendering with FPS cap
 - Kubernetes watch streams for a broad set of core resource kinds
@@ -39,7 +39,8 @@ fps_limit = 60
 delta_channel_capacity = 2048
 namespace = "default"
 default_context = "dev-cluster"
-watch_buffer_size = 2048
+warm_contexts = 1
+warm_context_ttl_secs = 20
 
 [ui]
 theme = "default"
@@ -126,6 +127,8 @@ RoleBindings, ClusterRoles, ClusterRoleBindings, NetworkPolicies, HPAs, PDBs.
 - `ViewProjector` isolates table/detail projections from storage and rendering.
 - Watch loops reconnect with exponential backoff and emit contextual error deltas.
 - Context list is loaded from kubeconfig, but clients/watches are activated lazily on demand.
+- Watchers are reconciled to the active tab/pane scope (context + kind + namespace) to avoid fan-out.
+- One recently used context can be kept warm for fast tab switches (TTL-based).
 - `--all-contexts` enables eager client warmup across contexts.
 - `403 Forbidden` watchers are disabled per resource/context (no infinite retry flood).
 

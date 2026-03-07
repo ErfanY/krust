@@ -3,7 +3,7 @@ mod kube_provider;
 use async_trait::async_trait;
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::model::ResourceKey;
+use crate::model::{ResourceKey, ResourceKind};
 
 pub use kube_provider::{KubeProviderOptions, KubeResourceProvider};
 
@@ -38,6 +38,12 @@ pub struct PodLogStream {
     pub task: JoinHandle<()>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WatchTarget {
+    pub kind: ResourceKind,
+    pub namespace: Option<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ActionError {
     #[error("read-only mode is enabled")]
@@ -58,10 +64,10 @@ pub trait ResourceProvider: Send + Sync {
         &self,
         tx: tokio::sync::mpsc::Sender<crate::model::StateDelta>,
     ) -> anyhow::Result<()>;
-    async fn ensure_watch(
+    async fn replace_watch_plan(
         &self,
         context: &str,
-        kind: crate::model::ResourceKind,
+        targets: &[WatchTarget],
     ) -> anyhow::Result<()>;
     async fn stream_pod_logs(&self, request: PodLogRequest) -> anyhow::Result<PodLogStream>;
 }

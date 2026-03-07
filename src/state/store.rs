@@ -8,6 +8,7 @@ pub struct StateStore {
     context_kind_index: HashMap<(String, ResourceKind), HashSet<ResourceKey>>,
     namespaces_by_context: HashMap<String, HashSet<String>>,
     errors: HashMap<String, String>,
+    revision: u64,
 }
 
 impl StateStore {
@@ -20,6 +21,7 @@ impl StateStore {
                 self.errors.insert(context, message);
             }
         }
+        self.revision = self.revision.wrapping_add(1);
     }
 
     pub fn list(
@@ -47,6 +49,20 @@ impl StateStore {
 
     pub fn get(&self, key: &ResourceKey) -> Option<&ResourceEntity> {
         self.entities.get(key)
+    }
+
+    pub fn count(&self, context: &str, kind: ResourceKind, namespace: Option<&str>) -> usize {
+        let Some(keys) = self.context_kind_index.get(&(context.to_string(), kind)) else {
+            return 0;
+        };
+
+        if let Some(target_ns) = namespace {
+            keys.iter()
+                .filter(|key| key.namespace.as_deref() == Some(target_ns))
+                .count()
+        } else {
+            keys.len()
+        }
     }
 
     pub fn contexts(&self) -> Vec<String> {
@@ -79,6 +95,10 @@ impl StateStore {
 
     pub fn error_count(&self) -> usize {
         self.errors.len()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     fn upsert(&mut self, entity: ResourceEntity) {

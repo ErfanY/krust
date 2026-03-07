@@ -5,7 +5,7 @@ use crate::{
     state::StateStore,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ViewRequest {
     pub context: String,
     pub kind: ResourceKind,
@@ -108,6 +108,8 @@ fn human_age(when: Option<DateTime<Utc>>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use chrono::{Duration, Utc};
 
     use super::*;
@@ -148,5 +150,43 @@ mod tests {
 
         assert_eq!(vm.rows.len(), 1);
         assert_eq!(vm.rows[0].name, "worker");
+    }
+
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn perf_project_large_active_view() {
+        let mut store = StateStore::default();
+        for idx in 0..10_000 {
+            put(
+                &mut store,
+                "ctx",
+                if idx % 2 == 0 { "team-a" } else { "team-b" },
+                &format!("pod-{idx:05}"),
+                if idx % 7 == 0 { "Pending" } else { "Running" },
+            );
+        }
+
+        let projector = SimpleViewProjector;
+        let request = ViewRequest {
+            context: "ctx".to_string(),
+            kind: ResourceKind::Pods,
+            namespace: None,
+            filter: "pod-09".to_string(),
+            sort: SortColumn::Name,
+            descending: false,
+        };
+
+        let start = Instant::now();
+        let mut rows = 0usize;
+        for _ in 0..30 {
+            rows = projector.project(&store, &request).rows.len();
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "[perf] project_large_active_view rows={} total={:?} avg={:?}",
+            rows,
+            elapsed,
+            elapsed / 30
+        );
     }
 }

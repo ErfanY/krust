@@ -1,13 +1,12 @@
 use std::{
-    borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
-use chrono::{Local, Utc};
+use chrono::Local;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -29,6 +28,7 @@ use tokio::sync::mpsc;
 use crate::{
     cluster::{
         ActionError, ActionExecutor, PodLogEvent, PodLogRequest, PodLogStream, ResourceProvider,
+        WatchTarget,
     },
     keymap::{Action, Keymap},
     model::{
@@ -54,59 +54,12 @@ struct ContextTabState {
     sort: SortColumn,
     descending: bool,
     pane: Pane,
-    drill: Vec<DrillNode>,
 }
 
 impl ContextTabState {
     fn kind(&self) -> ResourceKind {
         ResourceKind::ORDERED[self.kind_idx]
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum DrillNode {
-    Deployment(ResourceKey),
-    ReplicaSet(ResourceKey),
-    Pod(ResourceKey),
-    Container { pod: ResourceKey, container: String },
-}
-
-#[derive(Debug, Clone)]
-struct ReplicaSetListRow {
-    key: ResourceKey,
-    namespace: String,
-    name: String,
-    status: String,
-    age: String,
-    summary: String,
-}
-
-#[derive(Debug, Clone)]
-struct PodListRow {
-    key: ResourceKey,
-    namespace: String,
-    name: String,
-    status: String,
-    age: String,
-    summary: String,
-}
-
-#[derive(Debug, Clone)]
-struct ContainerListRow {
-    name: String,
-    status: String,
-    restarts: u64,
-    image: String,
-}
-
-#[derive(Debug, Clone)]
-struct DrillCacheEntry {
-    context: String,
-    drill: Vec<DrillNode>,
-    filter: String,
-    replica_sets: Vec<ReplicaSetListRow>,
-    pods: Vec<PodListRow>,
-    containers: Vec<ContainerListRow>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,13 +210,12 @@ struct App {
     tabs: Vec<ContextTabState>,
     active_tab: usize,
     projector: SimpleViewProjector,
+    view_cache: Option<CachedViewModel>,
     command_input: Option<CommandInput>,
     command_history: Vec<String>,
     last_command: Option<String>,
     history_cursor: Option<usize>,
     overlay: Option<Overlay>,
-    drill_cache: Option<DrillCacheEntry>,
-    drill_cache_dirty: bool,
     pod_util_cache: HashMap<UtilScopeKey, CachedPodTotals>,
     node_util_cache: HashMap<String, CachedNodeTotals>,
     logs: LogViewState,
@@ -342,8 +294,9 @@ struct LogViewState {
     selection: Option<LogSelection>,
     session: Option<ActiveLogSession>,
     lines: VecDeque<String>,
-    render_cache: String,
-    render_dirty: bool,
+    lines_version: u64,
+    joined_cache: String,
+    joined_cache_version: u64,
     total_bytes: usize,
     max_line_width: usize,
     dropped_lines: u64,
@@ -356,14 +309,22 @@ struct LogViewState {
     container_override: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedViewModel {
+    revision: u64,
+    request: ViewRequest,
+    model: Arc<ViewModel>,
+}
+
 impl Default for LogViewState {
     fn default() -> Self {
         Self {
             selection: None,
             session: None,
             lines: VecDeque::new(),
-            render_cache: String::new(),
-            render_dirty: false,
+            lines_version: 0,
+            joined_cache: String::new(),
+            joined_cache_version: 0,
             total_bytes: 0,
             max_line_width: 0,
             dropped_lines: 0,
@@ -379,6 +340,30 @@ impl Default for LogViewState {
 }
 
 impl App {
+    fn projected_view(&mut self, request: &ViewRequest) -> Arc<ViewModel> {
+        let revision = self.store.revision();
+        let needs_recompute = self
+            .view_cache
+            .as_ref()
+            .map(|cached| cached.revision != revision || cached.request != *request)
+            .unwrap_or(true);
+
+        if needs_recompute {
+            let model = Arc::new(self.projector.project(&self.store, request));
+            self.view_cache = Some(CachedViewModel {
+                revision,
+                request: request.clone(),
+                model,
+            });
+        }
+
+        self.view_cache
+            .as_ref()
+            .expect("view cache must be set")
+            .model
+            .clone()
+    }
+
     fn view_request_for_tab(&self, tab: &ContextTabState) -> ViewRequest {
         ViewRequest {
             context: tab.context.clone(),
@@ -394,503 +379,12 @@ impl App {
         }
     }
 
-    fn selected_row(&self) -> Option<crate::view::ViewRow> {
-        if !self.current_tab().drill.is_empty() {
-            return None;
-        }
+    fn selected_row(&mut self) -> Option<crate::view::ViewRow> {
         let active = self.current_tab().clone();
         let request = self.view_request_for_tab(&active);
-        let vm = self.projector.project(&self.store, &request);
+        let vm = self.projected_view(&request);
         let selected = active.selected.min(vm.rows.len().saturating_sub(1));
         vm.rows.get(selected).cloned()
-    }
-
-    fn mark_drill_cache_dirty_for_delta(&mut self, delta: &StateDelta) {
-        let tab = self.current_tab().clone();
-        let Some(active_node) = tab.drill.last().cloned() else {
-            return;
-        };
-
-        let owned_by = |raw: &serde_json::Value, owner_kind: &str, owner_name: &str| {
-            raw.pointer("/metadata/ownerReferences")
-                .and_then(serde_json::Value::as_array)
-                .map(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.get("kind").and_then(serde_json::Value::as_str) == Some(owner_kind)
-                            && owner.get("name").and_then(serde_json::Value::as_str)
-                                == Some(owner_name)
-                    })
-                })
-                .unwrap_or(false)
-        };
-
-        let dirty = match (&active_node, delta) {
-            (_, StateDelta::Error { .. }) => false,
-            (DrillNode::Deployment(dep), StateDelta::Upsert(entity)) => {
-                if entity.key.context != tab.context {
-                    false
-                } else {
-                    match entity.key.kind {
-                        ResourceKind::Deployments => {
-                            entity.key.namespace == dep.namespace && entity.key.name == dep.name
-                        }
-                        ResourceKind::ReplicaSets => {
-                            entity.key.namespace == dep.namespace
-                                && owned_by(&entity.raw, "Deployment", &dep.name)
-                        }
-                        _ => false,
-                    }
-                }
-            }
-            (DrillNode::Deployment(dep), StateDelta::Remove(key)) => {
-                if key.context != tab.context {
-                    false
-                } else {
-                    match key.kind {
-                        ResourceKind::Deployments => {
-                            key.namespace == dep.namespace && key.name == dep.name
-                        }
-                        ResourceKind::ReplicaSets => key.namespace == dep.namespace,
-                        _ => false,
-                    }
-                }
-            }
-            (DrillNode::Deployment(_), StateDelta::Reset { context, kind }) => {
-                context == &tab.context
-                    && matches!(kind, ResourceKind::Deployments | ResourceKind::ReplicaSets)
-            }
-            (DrillNode::ReplicaSet(rs), StateDelta::Upsert(entity)) => {
-                if entity.key.context != tab.context {
-                    false
-                } else {
-                    match entity.key.kind {
-                        ResourceKind::ReplicaSets => {
-                            entity.key.namespace == rs.namespace && entity.key.name == rs.name
-                        }
-                        ResourceKind::Pods => {
-                            entity.key.namespace == rs.namespace
-                                && owned_by(&entity.raw, "ReplicaSet", &rs.name)
-                        }
-                        _ => false,
-                    }
-                }
-            }
-            (DrillNode::ReplicaSet(rs), StateDelta::Remove(key)) => {
-                if key.context != tab.context {
-                    false
-                } else {
-                    match key.kind {
-                        ResourceKind::ReplicaSets => {
-                            key.namespace == rs.namespace && key.name == rs.name
-                        }
-                        ResourceKind::Pods => key.namespace == rs.namespace,
-                        _ => false,
-                    }
-                }
-            }
-            (DrillNode::ReplicaSet(_), StateDelta::Reset { context, kind }) => {
-                context == &tab.context
-                    && matches!(kind, ResourceKind::ReplicaSets | ResourceKind::Pods)
-            }
-            (DrillNode::Pod(pod), StateDelta::Upsert(entity)) => {
-                entity.key.context == tab.context
-                    && entity.key.kind == ResourceKind::Pods
-                    && entity.key.namespace == pod.namespace
-                    && entity.key.name == pod.name
-            }
-            (DrillNode::Pod(pod), StateDelta::Remove(key)) => {
-                key.context == tab.context
-                    && key.kind == ResourceKind::Pods
-                    && key.namespace == pod.namespace
-                    && key.name == pod.name
-            }
-            (DrillNode::Pod(_), StateDelta::Reset { context, kind }) => {
-                context == &tab.context && *kind == ResourceKind::Pods
-            }
-            (DrillNode::Container { pod, .. }, StateDelta::Upsert(entity)) => {
-                entity.key.context == tab.context
-                    && entity.key.kind == ResourceKind::Pods
-                    && entity.key.namespace == pod.namespace
-                    && entity.key.name == pod.name
-            }
-            (DrillNode::Container { pod, .. }, StateDelta::Remove(key)) => {
-                key.context == tab.context
-                    && key.kind == ResourceKind::Pods
-                    && key.namespace == pod.namespace
-                    && key.name == pod.name
-            }
-            (DrillNode::Container { .. }, StateDelta::Reset { context, kind }) => {
-                context == &tab.context && *kind == ResourceKind::Pods
-            }
-        };
-
-        if dirty {
-            self.drill_cache_dirty = true;
-        }
-    }
-
-    fn ensure_active_drill_cache(&mut self) {
-        let tab = self.current_tab().clone();
-        if tab.drill.is_empty() {
-            self.drill_cache = None;
-            self.drill_cache_dirty = false;
-            return;
-        }
-
-        let reuse = !self.drill_cache_dirty
-            && self
-                .drill_cache
-                .as_ref()
-                .map(|cache| {
-                    cache.context == tab.context
-                        && cache.drill == tab.drill
-                        && cache.filter == tab.filter
-                })
-                .unwrap_or(false);
-        if reuse {
-            return;
-        }
-
-        let (replica_sets, pods, containers) = match tab.drill.last() {
-            Some(DrillNode::Deployment(_)) => (
-                self.replica_set_rows_for_tab(&tab).unwrap_or_default(),
-                Vec::new(),
-                Vec::new(),
-            ),
-            Some(DrillNode::ReplicaSet(_)) => (
-                Vec::new(),
-                self.pod_rows_for_tab(&tab).unwrap_or_default(),
-                Vec::new(),
-            ),
-            Some(DrillNode::Pod(_)) => (
-                Vec::new(),
-                Vec::new(),
-                self.container_rows_for_tab(&tab).unwrap_or_default(),
-            ),
-            Some(DrillNode::Container { .. }) => (Vec::new(), Vec::new(), Vec::new()),
-            None => (Vec::new(), Vec::new(), Vec::new()),
-        };
-        self.drill_cache = Some(DrillCacheEntry {
-            context: tab.context,
-            drill: tab.drill,
-            filter: tab.filter,
-            replica_sets,
-            pods,
-            containers,
-        });
-        self.drill_cache_dirty = false;
-    }
-
-    fn replica_set_rows_for_tab(&self, tab: &ContextTabState) -> Option<Vec<ReplicaSetListRow>> {
-        let DrillNode::Deployment(dep_key) = tab.drill.last()? else {
-            return None;
-        };
-        let deployment = self.store.get(dep_key)?;
-        let selector_labels: HashMap<String, String> = deployment
-            .raw
-            .pointer("/spec/selector/matchLabels")
-            .and_then(serde_json::Value::as_object)
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let namespace = dep_key.namespace.as_deref();
-        let replica_sets = self
-            .store
-            .list(&dep_key.context, ResourceKind::ReplicaSets, namespace);
-        let mut rows = Vec::new();
-        for rs in replica_sets {
-            let owner_match = rs
-                .raw
-                .pointer("/metadata/ownerReferences")
-                .and_then(serde_json::Value::as_array)
-                .map(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.get("kind").and_then(serde_json::Value::as_str) == Some("Deployment")
-                            && owner.get("name").and_then(serde_json::Value::as_str)
-                                == Some(dep_key.name.as_str())
-                    })
-                })
-                .unwrap_or(false);
-            let rs_selector_match = if selector_labels.is_empty() {
-                false
-            } else {
-                rs.raw
-                    .pointer("/spec/selector/matchLabels")
-                    .and_then(serde_json::Value::as_object)
-                    .map(|rs_selector| {
-                        selector_labels.iter().all(|(k, v)| {
-                            rs_selector
-                                .get(k)
-                                .and_then(serde_json::Value::as_str)
-                                .is_some_and(|candidate| candidate == v)
-                        })
-                    })
-                    .unwrap_or(false)
-            };
-
-            if !(owner_match || rs_selector_match) {
-                continue;
-            }
-
-            rows.push(ReplicaSetListRow {
-                key: rs.key.clone(),
-                namespace: rs.key.namespace.clone().unwrap_or_else(|| "-".to_string()),
-                name: rs.key.name.clone(),
-                status: rs.status.clone(),
-                age: entity_age(rs.age),
-                summary: rs.summary.clone(),
-            });
-        }
-
-        let needle = tab.filter.to_ascii_lowercase();
-        if !needle.is_empty() {
-            rows.retain(|row| {
-                format!(
-                    "{} {} {} {} {}",
-                    row.namespace, row.name, row.status, row.age, row.summary
-                )
-                .to_ascii_lowercase()
-                .contains(&needle)
-            });
-        }
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(rows)
-    }
-
-    fn pod_rows_for_tab(&self, tab: &ContextTabState) -> Option<Vec<PodListRow>> {
-        let DrillNode::ReplicaSet(rs_key) = tab.drill.last()? else {
-            return None;
-        };
-        let rs = self.store.get(rs_key)?;
-        let selector_labels: HashMap<String, String> = rs
-            .raw
-            .pointer("/spec/selector/matchLabels")
-            .and_then(serde_json::Value::as_object)
-            .map(|labels| {
-                labels
-                    .iter()
-                    .filter_map(|(k, v)| v.as_str().map(|value| (k.clone(), value.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let namespace = rs_key.namespace.as_deref();
-        let pods = self
-            .store
-            .list(&rs_key.context, ResourceKind::Pods, namespace);
-        let mut rows = Vec::new();
-        for pod in pods {
-            let owner_match = pod
-                .raw
-                .pointer("/metadata/ownerReferences")
-                .and_then(serde_json::Value::as_array)
-                .map(|owners| {
-                    owners.iter().any(|owner| {
-                        owner.get("kind").and_then(serde_json::Value::as_str) == Some("ReplicaSet")
-                            && owner.get("name").and_then(serde_json::Value::as_str)
-                                == Some(rs_key.name.as_str())
-                    })
-                })
-                .unwrap_or(false);
-            let selector_match = !selector_labels.is_empty()
-                && selector_labels
-                    .iter()
-                    .all(|(k, v)| pod.labels.iter().any(|(pk, pv)| pk == k && pv == v));
-
-            if !(owner_match || selector_match) {
-                continue;
-            }
-
-            rows.push(PodListRow {
-                key: pod.key.clone(),
-                namespace: pod.key.namespace.clone().unwrap_or_else(|| "-".to_string()),
-                name: pod.key.name.clone(),
-                status: pod.status.clone(),
-                age: entity_age(pod.age),
-                summary: pod.summary.clone(),
-            });
-        }
-
-        let needle = tab.filter.to_ascii_lowercase();
-        if !needle.is_empty() {
-            rows.retain(|row| {
-                format!(
-                    "{} {} {} {} {}",
-                    row.namespace, row.name, row.status, row.age, row.summary
-                )
-                .to_ascii_lowercase()
-                .contains(&needle)
-            });
-        }
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(rows)
-    }
-
-    fn container_rows_for_tab(&self, tab: &ContextTabState) -> Option<Vec<ContainerListRow>> {
-        let DrillNode::Pod(pod_key) = tab.drill.last()? else {
-            return None;
-        };
-        let pod = self.store.get(pod_key)?;
-
-        let mut status_by_name: HashMap<String, &serde_json::Value> = HashMap::new();
-        if let Some(statuses) = pod
-            .raw
-            .pointer("/status/containerStatuses")
-            .and_then(serde_json::Value::as_array)
-        {
-            for status in statuses {
-                if let Some(name) = status
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                {
-                    status_by_name.insert(name, status);
-                }
-            }
-        }
-
-        let mut rows = Vec::new();
-        if let Some(containers) = pod
-            .raw
-            .pointer("/spec/containers")
-            .and_then(serde_json::Value::as_array)
-        {
-            for container in containers {
-                let Some(name) = container
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                else {
-                    continue;
-                };
-
-                let image = container
-                    .get("image")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("-")
-                    .to_string();
-
-                let status = status_by_name
-                    .get(&name)
-                    .and_then(|status| {
-                        status
-                            .pointer("/state/running")
-                            .map(|_| "Running".to_string())
-                            .or_else(|| {
-                                status
-                                    .pointer("/state/waiting/reason")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                            })
-                            .or_else(|| {
-                                status
-                                    .pointer("/state/terminated/reason")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string)
-                            })
-                    })
-                    .unwrap_or_else(|| "-".to_string());
-
-                let restarts = status_by_name
-                    .get(&name)
-                    .and_then(|status| status.get("restartCount"))
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0);
-
-                rows.push(ContainerListRow {
-                    name,
-                    status,
-                    restarts,
-                    image,
-                });
-            }
-        }
-
-        let needle = tab.filter.to_ascii_lowercase();
-        if !needle.is_empty() {
-            rows.retain(|row| {
-                format!("{} {} {} {}", row.name, row.status, row.restarts, row.image)
-                    .to_ascii_lowercase()
-                    .contains(&needle)
-            });
-        }
-
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(rows)
-    }
-
-    fn current_container_rows(&mut self) -> Option<&[ContainerListRow]> {
-        self.ensure_active_drill_cache();
-        self.drill_cache
-            .as_ref()
-            .map(|cache| cache.containers.as_slice())
-    }
-
-    fn current_pod_drill_rows(&mut self) -> Option<&[PodListRow]> {
-        self.ensure_active_drill_cache();
-        self.drill_cache.as_ref().map(|cache| cache.pods.as_slice())
-    }
-
-    fn current_replica_set_rows(&mut self) -> Option<&[ReplicaSetListRow]> {
-        self.ensure_active_drill_cache();
-        self.drill_cache
-            .as_ref()
-            .map(|cache| cache.replica_sets.as_slice())
-    }
-
-    fn drill_breadcrumb(tab: &ContextTabState) -> Option<String> {
-        if tab.drill.is_empty() {
-            return None;
-        }
-        let mut nodes = vec![tab.kind().short_name().to_string()];
-        for node in &tab.drill {
-            match node {
-                DrillNode::Deployment(key) => nodes.push(format!("dep/{}", key.name)),
-                DrillNode::ReplicaSet(key) => nodes.push(format!("rs/{}", key.name)),
-                DrillNode::Pod(key) => nodes.push(format!("pod/{}", key.name)),
-                DrillNode::Container { container, .. } => {
-                    nodes.push(format!("containers/{container}"))
-                }
-            }
-        }
-        Some(nodes.join(" > "))
-    }
-
-    fn drill_up(&mut self) -> bool {
-        let breadcrumb = {
-            let tab = self.current_tab_mut();
-            if tab.drill.is_empty() {
-                return false;
-            }
-
-            if tab.pane != Pane::Table {
-                tab.pane = Pane::Table;
-                tab.detail_scroll = 0;
-                tab.detail_hscroll = 0;
-                if matches!(tab.drill.last(), Some(DrillNode::Container { .. })) {
-                    tab.drill.pop();
-                    tab.selected = 0;
-                }
-            } else {
-                tab.drill.pop();
-                tab.selected = 0;
-                tab.detail_scroll = 0;
-                tab.detail_hscroll = 0;
-            }
-
-            Self::drill_breadcrumb(tab)
-        };
-        self.status_line = if let Some(path) = breadcrumb {
-            format!("Drill: {path}")
-        } else {
-            "Drill: root".to_string()
-        };
-        true
     }
 
     fn count_kind_for_tab(&self, tab: &ContextTabState, kind: ResourceKind) -> usize {
@@ -899,7 +393,7 @@ impl App {
         } else {
             None
         };
-        self.store.list(&tab.context, kind, ns_filter).len()
+        self.store.count(&tab.context, kind, ns_filter)
     }
 
     fn pod_resource_totals(&mut self, context: &str, namespace: Option<&str>) -> PodResourceTotals {
@@ -1243,8 +737,9 @@ impl App {
 
     fn reset_log_buffer(&mut self) {
         self.logs.lines.clear();
-        self.logs.render_cache.clear();
-        self.logs.render_dirty = false;
+        self.logs.lines_version = self.logs.lines_version.wrapping_add(1);
+        self.logs.joined_cache.clear();
+        self.logs.joined_cache_version = 0;
         self.logs.total_bytes = 0;
         self.logs.max_line_width = 0;
         self.logs.dropped_lines = 0;
@@ -1372,11 +867,11 @@ impl App {
     }
 
     fn push_log_line(&mut self, line: String) {
+        self.logs.lines_version = self.logs.lines_version.wrapping_add(1);
         let new_width = line.chars().count();
         self.logs.total_bytes = self.logs.total_bytes.saturating_add(line.len());
         self.logs.max_line_width = self.logs.max_line_width.max(new_width);
         self.logs.lines.push_back(line);
-        self.logs.render_dirty = true;
 
         let mut must_recompute_width = false;
         while self.logs.lines.len() > LOG_MAX_LINES || self.logs.total_bytes > LOG_MAX_BYTES {
@@ -1398,23 +893,6 @@ impl App {
                 .map(|line| line.chars().count())
                 .max()
                 .unwrap_or(0);
-        }
-    }
-
-    fn rebuild_log_render_cache(&mut self) {
-        self.logs.render_cache = self
-            .logs
-            .lines
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        self.logs.render_dirty = false;
-    }
-
-    fn ensure_log_render_cache(&mut self) {
-        if self.logs.render_dirty {
-            self.rebuild_log_render_cache();
         }
     }
 
@@ -1463,34 +941,44 @@ impl App {
         changed
     }
 
-    fn log_body_text(&mut self) -> Cow<'_, str> {
-        self.ensure_log_render_cache();
-        if !self.logs.render_cache.is_empty() {
-            return Cow::Borrowed(self.logs.render_cache.as_str());
+    fn ensure_log_joined_cache(&mut self) {
+        if self.logs.joined_cache_version == self.logs.lines_version {
+            return;
         }
+        self.logs.joined_cache = self
+            .logs
+            .lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.logs.joined_cache_version = self.logs.lines_version;
+    }
 
+    fn log_joined_text(&mut self) -> &str {
+        self.ensure_log_joined_cache();
+        self.logs.joined_cache.as_str()
+    }
+
+    fn log_body_text(&mut self) -> String {
+        if !self.logs.lines.is_empty() {
+            return self.log_joined_text().to_string();
+        }
         if let Some(selection) = &self.logs.selection {
-            return Cow::Owned(format!(
-                "Waiting for log lines from {} ...",
-                selection.scope
-            ));
+            return format!("Waiting for log lines from {} ...", selection.scope);
         }
-
         if self.current_tab().pane == Pane::Logs {
-            if let Some(row) = self.selected_row() {
-                if !matches!(
+            if let Some(row) = self.selected_row()
+                && !matches!(
                     row.key.kind,
                     ResourceKind::Pods | ResourceKind::ReplicaSets | ResourceKind::Deployments
-                ) {
-                    return Cow::Borrowed(
-                        "Logs are available for Pods, ReplicaSets, and Deployments.",
-                    );
-                }
+                )
+            {
+                return "Logs are available for Pods, ReplicaSets, and Deployments.".to_string();
             }
-            return Cow::Borrowed("No logs yet.");
+            return "No logs yet.".to_string();
         }
-
-        Cow::Borrowed("No logs available.")
+        "No logs available.".to_string()
     }
 
     fn logs_title(&self) -> String {
@@ -1566,7 +1054,6 @@ impl App {
                 sort: SortColumn::Name,
                 descending: false,
                 pane: Pane::Table,
-                drill: Vec::new(),
             })
             .collect();
 
@@ -1580,13 +1067,12 @@ impl App {
             tabs,
             active_tab,
             projector: SimpleViewProjector,
+            view_cache: None,
             command_input: None,
             command_history: Vec::new(),
             last_command: None,
             history_cursor: None,
             overlay: None,
-            drill_cache: None,
-            drill_cache_dirty: false,
             pod_util_cache: HashMap::new(),
             node_util_cache: HashMap::new(),
             logs: LogViewState::default(),
@@ -1922,7 +1408,6 @@ impl App {
                 tab.detail_scroll = 0;
                 tab.detail_hscroll = 0;
                 tab.pane = Pane::Table;
-                tab.drill.clear();
                 tab.last_non_namespace_kind_idx = target_kind_idx;
                 (tab.kind().to_string(), row.name.clone())
             };
@@ -1945,10 +1430,10 @@ impl App {
         let tab = self.current_tab().clone();
         match tab.pane {
             Pane::Table => None,
-            Pane::Logs => Some(self.log_body_text().into_owned()),
+            Pane::Logs => Some(self.log_body_text()),
             Pane::Describe | Pane::Events => {
                 let request = self.view_request_for_tab(&tab);
-                let vm = self.projector.project(&self.store, &request);
+                let vm = self.projected_view(&request);
                 let selected = tab.selected.min(vm.rows.len().saturating_sub(1));
                 let raw = self.detail_text(&vm.rows, selected, tab.pane);
                 if tab.detail_filter.trim().is_empty() {
@@ -2864,7 +2349,7 @@ impl App {
         let active = self.current_tab().clone();
         let active_tab_idx = self.active_tab;
         let request = self.view_request_for_tab(&active);
-        let vm = self.projector.project(&self.store, &request);
+        let vm = self.projected_view(&request);
         let visible_rows = vm.rows.len();
         let max_selection = visible_rows.saturating_sub(1);
         let selected = active.selected.min(max_selection);
@@ -2907,13 +2392,7 @@ impl App {
             top_line.push_str(" | tail:");
             top_line.push_str(if self.logs.auto_scroll { "on" } else { "off" });
         }
-        if let Some(path) = Self::drill_breadcrumb(&active) {
-            top_line.push_str(" | drill:");
-            top_line.push_str(&path);
-        }
-
-        if active.drill.is_empty()
-            && active.kind() == ResourceKind::Pods
+        if active.kind() == ResourceKind::Pods
             && let Some(row) = vm.rows.get(selected)
             && let Some(entity) = self.store.get(&row.key)
         {
@@ -3183,239 +2662,47 @@ impl App {
         } else {
             match active.pane {
                 Pane::Table => {
-                    if let Some(cache) = self.drill_cache.as_ref() {
-                        match active.drill.last() {
-                            Some(DrillNode::Pod(_)) => {
-                                let rows: Vec<Row<'_>> = cache
-                                    .containers
-                                    .iter()
-                                    .map(|row| {
-                                        Row::new(vec![
-                                            Cell::from(row.name.clone()),
-                                            Cell::from(row.status.clone()),
-                                            Cell::from(row.restarts.to_string()),
-                                            Cell::from(row.image.clone()),
-                                        ])
-                                    })
-                                    .collect();
+                    let rows: Vec<Row<'_>> = vm
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            Row::new(vec![
+                                Cell::from(row.namespace.clone()),
+                                Cell::from(row.name.clone()),
+                                Cell::from(row.status.clone()),
+                                Cell::from(row.age.clone()),
+                                Cell::from(row.summary.clone()),
+                            ])
+                        })
+                        .collect();
 
-                                let table =
-                                    Table::new(
-                                        rows,
-                                        [
-                                            Constraint::Length(28),
-                                            Constraint::Length(20),
-                                            Constraint::Length(10),
-                                            Constraint::Min(24),
-                                        ],
-                                    )
-                                    .header(
-                                        Row::new(vec!["Container", "Status", "Restarts", "Image"])
-                                            .style(
-                                                Style::default()
-                                                    .fg(Color::White)
-                                                    .add_modifier(Modifier::BOLD),
-                                            ),
-                                    )
-                                    .block(Block::default().borders(Borders::ALL).title(format!(
-                                        "Pod Containers ({})",
-                                        cache.containers.len()
-                                    )))
-                                    .row_highlight_style(
-                                        Style::default().bg(Color::Blue).fg(Color::White),
-                                    );
+                    let table = Table::new(
+                        rows,
+                        [
+                            Constraint::Length(18),
+                            Constraint::Length(38),
+                            Constraint::Length(20),
+                            Constraint::Length(10),
+                            Constraint::Min(10),
+                        ],
+                    )
+                    .header(
+                        Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"]).style(
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    )
+                    .block(Block::default().borders(Borders::ALL).title(format!(
+                        "{} ({})",
+                        active.kind(),
+                        vm.rows.len()
+                    )))
+                    .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
 
-                                let mut state = ratatui::widgets::TableState::default()
-                                    .with_selected(Some(selected));
-                                frame.render_stateful_widget(table, chunks[2], &mut state);
-                            }
-                            Some(DrillNode::Deployment(_)) => {
-                                let rows: Vec<Row<'_>> = cache
-                                    .replica_sets
-                                    .iter()
-                                    .map(|row| {
-                                        Row::new(vec![
-                                            Cell::from(row.namespace.clone()),
-                                            Cell::from(row.name.clone()),
-                                            Cell::from(row.status.clone()),
-                                            Cell::from(row.age.clone()),
-                                            Cell::from(row.summary.clone()),
-                                        ])
-                                    })
-                                    .collect();
-
-                                let table = Table::new(
-                                    rows,
-                                    [
-                                        Constraint::Length(18),
-                                        Constraint::Length(38),
-                                        Constraint::Length(20),
-                                        Constraint::Length(10),
-                                        Constraint::Min(10),
-                                    ],
-                                )
-                                .header(
-                                    Row::new(vec![
-                                        "Namespace",
-                                        "ReplicaSet",
-                                        "Status",
-                                        "Age",
-                                        "Summary",
-                                    ])
-                                    .style(
-                                        Style::default()
-                                            .fg(Color::White)
-                                            .add_modifier(Modifier::BOLD),
-                                    ),
-                                )
-                                .block(Block::default().borders(Borders::ALL).title(format!(
-                                    "Deployment ReplicaSets ({})",
-                                    cache.replica_sets.len()
-                                )))
-                                .row_highlight_style(
-                                    Style::default().bg(Color::Blue).fg(Color::White),
-                                );
-
-                                let mut state = ratatui::widgets::TableState::default()
-                                    .with_selected(Some(selected));
-                                frame.render_stateful_widget(table, chunks[2], &mut state);
-                            }
-                            Some(DrillNode::ReplicaSet(_)) => {
-                                let rows: Vec<Row<'_>> = cache
-                                    .pods
-                                    .iter()
-                                    .map(|row| {
-                                        Row::new(vec![
-                                            Cell::from(row.namespace.clone()),
-                                            Cell::from(row.name.clone()),
-                                            Cell::from(row.status.clone()),
-                                            Cell::from(row.age.clone()),
-                                            Cell::from(row.summary.clone()),
-                                        ])
-                                    })
-                                    .collect();
-
-                                let table = Table::new(
-                                    rows,
-                                    [
-                                        Constraint::Length(18),
-                                        Constraint::Length(38),
-                                        Constraint::Length(20),
-                                        Constraint::Length(10),
-                                        Constraint::Min(10),
-                                    ],
-                                )
-                                .header(
-                                    Row::new(vec!["Namespace", "Pod", "Status", "Age", "Summary"])
-                                        .style(
-                                            Style::default()
-                                                .fg(Color::White)
-                                                .add_modifier(Modifier::BOLD),
-                                        ),
-                                )
-                                .block(
-                                    Block::default()
-                                        .borders(Borders::ALL)
-                                        .title(format!("ReplicaSet Pods ({})", cache.pods.len())),
-                                )
-                                .row_highlight_style(
-                                    Style::default().bg(Color::Blue).fg(Color::White),
-                                );
-
-                                let mut state = ratatui::widgets::TableState::default()
-                                    .with_selected(Some(selected));
-                                frame.render_stateful_widget(table, chunks[2], &mut state);
-                            }
-                            _ => {
-                                let rows: Vec<Row<'_>> = vm
-                                    .rows
-                                    .iter()
-                                    .map(|row| {
-                                        Row::new(vec![
-                                            Cell::from(row.namespace.clone()),
-                                            Cell::from(row.name.clone()),
-                                            Cell::from(row.status.clone()),
-                                            Cell::from(row.age.clone()),
-                                            Cell::from(row.summary.clone()),
-                                        ])
-                                    })
-                                    .collect();
-
-                                let table = Table::new(
-                                    rows,
-                                    [
-                                        Constraint::Length(18),
-                                        Constraint::Length(38),
-                                        Constraint::Length(20),
-                                        Constraint::Length(10),
-                                        Constraint::Min(10),
-                                    ],
-                                )
-                                .header(
-                                    Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"])
-                                        .style(
-                                            Style::default()
-                                                .fg(Color::White)
-                                                .add_modifier(Modifier::BOLD),
-                                        ),
-                                )
-                                .block(Block::default().borders(Borders::ALL).title(format!(
-                                    "{} ({})",
-                                    active.kind(),
-                                    vm.rows.len()
-                                )))
-                                .row_highlight_style(
-                                    Style::default().bg(Color::Blue).fg(Color::White),
-                                );
-
-                                let mut state = ratatui::widgets::TableState::default()
-                                    .with_selected(Some(selected));
-                                frame.render_stateful_widget(table, chunks[2], &mut state);
-                            }
-                        }
-                    } else {
-                        let rows: Vec<Row<'_>> = vm
-                            .rows
-                            .iter()
-                            .map(|row| {
-                                Row::new(vec![
-                                    Cell::from(row.namespace.clone()),
-                                    Cell::from(row.name.clone()),
-                                    Cell::from(row.status.clone()),
-                                    Cell::from(row.age.clone()),
-                                    Cell::from(row.summary.clone()),
-                                ])
-                            })
-                            .collect();
-
-                        let table = Table::new(
-                            rows,
-                            [
-                                Constraint::Length(18),
-                                Constraint::Length(38),
-                                Constraint::Length(20),
-                                Constraint::Length(10),
-                                Constraint::Min(10),
-                            ],
-                        )
-                        .header(
-                            Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"]).style(
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        )
-                        .block(Block::default().borders(Borders::ALL).title(format!(
-                            "{} ({})",
-                            active.kind(),
-                            vm.rows.len()
-                        )))
-                        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
-
-                        let mut state =
-                            ratatui::widgets::TableState::default().with_selected(Some(selected));
-                        frame.render_stateful_widget(table, chunks[2], &mut state);
-                    }
+                    let mut state =
+                        ratatui::widgets::TableState::default().with_selected(Some(selected));
+                    frame.render_stateful_widget(table, chunks[2], &mut state);
                 }
                 Pane::Describe | Pane::Events => {
                     let raw_body = self.detail_text(&vm.rows, selected, active.pane);
@@ -3473,12 +2760,18 @@ impl App {
                 Pane::Logs => {
                     let logs_line_count = self.logs.lines.len();
                     let logs_max_line_width = self.logs.max_line_width;
-                    let body = self.log_body_text().into_owned();
                     let content_width = chunks[2].width.saturating_sub(2);
                     let content_height = chunks[2].height.saturating_sub(2);
                     self.detail_page_step = (content_height / 2).max(1);
                     let detail_wrap = active.detail_wrap;
                     let (max_v, max_h) = if detail_wrap {
+                        let fallback;
+                        let body = if logs_line_count > 0 {
+                            self.log_joined_text()
+                        } else {
+                            fallback = self.log_body_text();
+                            &fallback
+                        };
                         (
                             max_vertical_scroll_for_text(
                                 &body,
@@ -3512,12 +2805,8 @@ impl App {
                         tab.detail_hscroll = detail_hscroll;
                     }
                     let search_query = active.detail_filter.trim();
-                    let match_lines = search_match_lines(&body, search_query);
-                    let total_lines = if detail_wrap {
-                        body.lines().count()
-                    } else {
-                        logs_line_count
-                    };
+                    let match_lines = search_match_lines_in_logs(&self.logs.lines, search_query);
+                    let total_lines = logs_line_count.max(1);
                     let title = format!(
                         "{} | {}",
                         self.logs_title(),
@@ -3530,13 +2819,35 @@ impl App {
                             total_lines
                         )
                     );
-                    let mut paragraph = Paragraph::new(highlighted_text(&body, search_query))
-                        .block(Block::default().borders(Borders::ALL).title(title))
-                        .scroll((detail_scroll, detail_hscroll));
                     if detail_wrap {
-                        paragraph = paragraph.wrap(Wrap { trim: false });
+                        let fallback;
+                        let body = if logs_line_count > 0 {
+                            self.log_joined_text()
+                        } else {
+                            fallback = self.log_body_text();
+                            &fallback
+                        };
+                        let paragraph = Paragraph::new(highlighted_text(&body, search_query))
+                            .block(Block::default().borders(Borders::ALL).title(title))
+                            .scroll((detail_scroll, detail_hscroll))
+                            .wrap(Wrap { trim: false });
+                        frame.render_widget(paragraph, chunks[2]);
+                    } else {
+                        let viewport_h = content_height.max(1) as usize;
+                        let viewport_w = content_width.max(1) as usize;
+                        let start = detail_scroll as usize;
+                        let mut visible = Vec::with_capacity(viewport_h.max(1));
+                        for line in self.logs.lines.iter().skip(start).take(viewport_h) {
+                            visible.push(slice_chars(line, detail_hscroll as usize, viewport_w));
+                        }
+                        if visible.is_empty() {
+                            visible.push(self.log_body_text());
+                        }
+                        let body = visible.join("\n");
+                        let paragraph = Paragraph::new(highlighted_text(&body, search_query))
+                            .block(Block::default().borders(Borders::ALL).title(title));
+                        frame.render_widget(paragraph, chunks[2]);
                     }
-                    frame.render_widget(paragraph, chunks[2]);
                 }
             }
         }
@@ -3576,46 +2887,6 @@ impl App {
     }
 
     fn detail_text(&self, rows: &[crate::view::ViewRow], selected: usize, pane: Pane) -> String {
-        if let Some(drill) = self.current_tab().drill.last() {
-            match drill {
-                DrillNode::Deployment(deployment) => {
-                    if pane == Pane::Describe {
-                        if let Some(entity) = self.store.get(deployment) {
-                            return serde_json::to_string_pretty(&entity.raw)
-                                .unwrap_or_else(|_| "{}".to_string());
-                        }
-                        return "Deployment details unavailable".to_string();
-                    }
-                }
-                DrillNode::ReplicaSet(replica_set) => {
-                    if pane == Pane::Describe {
-                        if let Some(entity) = self.store.get(replica_set) {
-                            return serde_json::to_string_pretty(&entity.raw)
-                                .unwrap_or_else(|_| "{}".to_string());
-                        }
-                        return "ReplicaSet details unavailable".to_string();
-                    }
-                }
-                DrillNode::Container { pod, container } => {
-                    return match pane {
-                        Pane::Describe => self.container_detail_text(pod, container),
-                        Pane::Events => "Container-scoped events view is planned.".to_string(),
-                        Pane::Logs => "Use `l` for container logs.".to_string(),
-                        Pane::Table => String::new(),
-                    };
-                }
-                DrillNode::Pod(pod) => {
-                    if pane == Pane::Describe {
-                        if let Some(entity) = self.store.get(pod) {
-                            return serde_json::to_string_pretty(&entity.raw)
-                                .unwrap_or_else(|_| "{}".to_string());
-                        }
-                        return "Pod details unavailable".to_string();
-                    }
-                }
-            }
-        }
-
         let Some(row) = rows.get(selected) else {
             return "No resource selected".to_string();
         };
@@ -3640,48 +2911,6 @@ impl App {
             }
             Pane::Table => "".to_string(),
         }
-    }
-
-    fn container_detail_text(&self, pod_key: &ResourceKey, container_name: &str) -> String {
-        let Some(entity) = self.store.get(pod_key) else {
-            return "Pod details unavailable".to_string();
-        };
-
-        let spec_container = entity
-            .raw
-            .pointer("/spec/containers")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|containers| {
-                containers.iter().find(|container| {
-                    container.get("name").and_then(serde_json::Value::as_str)
-                        == Some(container_name)
-                })
-            })
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-
-        let status_container = entity
-            .raw
-            .pointer("/status/containerStatuses")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|statuses| {
-                statuses.iter().find(|status| {
-                    status.get("name").and_then(serde_json::Value::as_str) == Some(container_name)
-                })
-            })
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
-
-        let payload = serde_json::json!({
-            "context": pod_key.context,
-            "namespace": pod_key.namespace,
-            "pod": pod_key.name,
-            "container": container_name,
-            "spec": spec_container,
-            "status": status_container,
-        });
-
-        serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string())
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -3732,7 +2961,6 @@ impl App {
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
         tab.pane = Pane::Table;
-        tab.drill.clear();
         self.overlay = None;
     }
 
@@ -3750,7 +2978,6 @@ impl App {
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
         tab.pane = Pane::Table;
-        tab.drill.clear();
         self.overlay = None;
     }
 
@@ -3762,7 +2989,6 @@ impl App {
         if namespaces.is_empty() {
             let tab = self.current_tab_mut();
             tab.namespace = None;
-            tab.drill.clear();
             tab.selected = 0;
             tab.pane = Pane::Table;
             self.status_line = "Namespace filter cleared".to_string();
@@ -3786,7 +3012,6 @@ impl App {
                     }
                 }
             }
-            tab.drill.clear();
             tab.selected = 0;
             tab.pane = Pane::Table;
             tab.namespace.clone()
@@ -3809,7 +3034,7 @@ impl App {
         let active = self.current_tab().clone();
         let selected = active.selected;
         let request = self.view_request_for_tab(&active);
-        let vm = self.projector.project(&self.store, &request);
+        let vm = self.projected_view(&request);
         let Some(row) = vm.rows.get(selected.min(vm.rows.len().saturating_sub(1))) else {
             self.status_line = "No resource selected".to_string();
             return;
@@ -3860,7 +3085,6 @@ impl App {
                 tab.detail_scroll = 0;
                 tab.detail_hscroll = 0;
                 tab.pane = Pane::Table;
-                tab.drill.clear();
                 tab.kind().to_string()
             };
             self.overlay = None;
@@ -3868,78 +3092,68 @@ impl App {
         }
     }
 
-    async fn ensure_active_watch(&mut self) {
-        let tab = self.current_tab().clone();
-        if let Err(err) = self
-            .resource_provider
-            .ensure_watch(&tab.context, ResourceKind::Namespaces)
-            .await
-        {
-            self.status_line = format!("watch setup error: {err}");
-            return;
-        }
-        if let Err(err) = self
-            .resource_provider
-            .ensure_watch(&tab.context, tab.kind())
-            .await
-        {
-            self.status_line = format!("watch setup error: {err}");
-            return;
-        }
+    fn active_watch_targets(tab: &ContextTabState) -> Vec<WatchTarget> {
+        let mut set = HashSet::new();
+        set.insert(WatchTarget {
+            kind: ResourceKind::Namespaces,
+            namespace: None,
+        });
+        set.insert(WatchTarget {
+            kind: tab.kind(),
+            namespace: if tab.kind().is_namespaced() {
+                tab.namespace.clone()
+            } else {
+                None
+            },
+        });
+
         if tab.pane == Pane::Logs {
             match tab.kind() {
                 ResourceKind::Deployments => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::ReplicaSets)
-                        .await;
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::Pods)
-                        .await;
+                    set.insert(WatchTarget {
+                        kind: ResourceKind::ReplicaSets,
+                        namespace: tab.namespace.clone(),
+                    });
+                    set.insert(WatchTarget {
+                        kind: ResourceKind::Pods,
+                        namespace: tab.namespace.clone(),
+                    });
                 }
-                ResourceKind::ReplicaSets => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::Pods)
-                        .await;
-                }
-                ResourceKind::Pods => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::Pods)
-                        .await;
+                ResourceKind::ReplicaSets | ResourceKind::Pods => {
+                    set.insert(WatchTarget {
+                        kind: ResourceKind::Pods,
+                        namespace: tab.namespace.clone(),
+                    });
                 }
                 _ => {}
             }
         }
-        if let Some(node) = tab.drill.last() {
-            match node {
-                DrillNode::Deployment(_) => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::ReplicaSets)
-                        .await;
-                }
-                DrillNode::ReplicaSet(_) => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::Pods)
-                        .await;
-                }
-                DrillNode::Pod(_) | DrillNode::Container { .. } => {
-                    let _ = self
-                        .resource_provider
-                        .ensure_watch(&tab.context, ResourceKind::Pods)
-                        .await;
-                }
-            }
-        }
         if tab.pane == Pane::Events {
-            let _ = self
-                .resource_provider
-                .ensure_watch(&tab.context, ResourceKind::Events)
-                .await;
+            set.insert(WatchTarget {
+                kind: ResourceKind::Events,
+                namespace: tab.namespace.clone(),
+            });
+        }
+
+        let mut out: Vec<WatchTarget> = set.into_iter().collect();
+        out.sort_by(|a, b| {
+            a.kind
+                .short_name()
+                .cmp(b.kind.short_name())
+                .then_with(|| a.namespace.cmp(&b.namespace))
+        });
+        out
+    }
+
+    async fn ensure_active_watch(&mut self) {
+        let tab = self.current_tab().clone();
+        let targets = Self::active_watch_targets(&tab);
+        if let Err(err) = self
+            .resource_provider
+            .replace_watch_plan(&tab.context, &targets)
+            .await
+        {
+            self.status_line = format!("watch setup error: {err}");
         }
     }
 }
@@ -4137,6 +3351,31 @@ fn search_match_lines(text: &str, query: &str) -> Vec<usize> {
             }
         })
         .collect()
+}
+
+fn search_match_lines_in_logs(lines: &VecDeque<String>, query: &str) -> Vec<usize> {
+    let needle = query.trim().to_ascii_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            if line.to_ascii_lowercase().contains(&needle) {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn slice_chars(text: &str, start: usize, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    text.chars().skip(start).take(width).collect()
 }
 
 fn highlighted_text(text: &str, query: &str) -> Text<'static> {
@@ -4471,23 +3710,6 @@ fn delete_previous_word(value: &mut String) {
     }
 }
 
-fn entity_age(when: Option<chrono::DateTime<Utc>>) -> String {
-    let Some(when) = when else {
-        return "-".to_string();
-    };
-    let delta = Utc::now().signed_duration_since(when);
-    if delta.num_days() > 0 {
-        return format!("{}d", delta.num_days());
-    }
-    if delta.num_hours() > 0 {
-        return format!("{}h", delta.num_hours());
-    }
-    if delta.num_minutes() > 0 {
-        return format!("{}m", delta.num_minutes());
-    }
-    format!("{}s", delta.num_seconds().max(0))
-}
-
 fn max_vertical_scroll_for_text(
     text: &str,
     viewport_width: u16,
@@ -4637,7 +3859,9 @@ fn parse_resource_alias(token: &str) -> ResourceAlias {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceAlias, parse_resource_alias};
+    use std::{collections::VecDeque, time::Instant};
+
+    use super::{ResourceAlias, parse_resource_alias, search_match_lines_in_logs, slice_chars};
     use crate::model::ResourceKind;
 
     #[test]
@@ -4674,6 +3898,38 @@ mod tests {
             parse_resource_alias("storageclasses"),
             ResourceAlias::Unsupported(_)
         ));
+    }
+
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn perf_log_viewport_render_large_buffer() {
+        let mut lines = VecDeque::new();
+        for idx in 0..5_000 {
+            lines.push_back(format!(
+                "2026-03-07T00:00:{idx:02}Z [ns/pod/container] line-{idx} payload=abcdefghijklmnopqrstuvwxyz0123456789"
+            ));
+        }
+
+        let start = Instant::now();
+        let mut rendered = 0usize;
+        for frame in 0..2_000 {
+            let top = frame % 4_900;
+            let hscroll = frame % 32;
+            let matches = search_match_lines_in_logs(&lines, "payload");
+            let mut visible = String::new();
+            for line in lines.iter().skip(top).take(40) {
+                visible.push_str(&slice_chars(line, hscroll, 140));
+                visible.push('\n');
+            }
+            rendered = rendered.saturating_add(visible.len() + matches.len());
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "[perf] log_viewport_render rendered={} total={:?} avg/frame={:?}",
+            rendered,
+            elapsed,
+            elapsed / 2_000
+        );
     }
 }
 

@@ -41,7 +41,8 @@ pub struct RuntimeConfig {
     pub delta_channel_capacity: usize,
     pub namespace: Option<String>,
     pub default_context: Option<String>,
-    pub watch_buffer_size: usize,
+    pub warm_contexts: usize,
+    pub warm_context_ttl_secs: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -51,7 +52,8 @@ impl Default for RuntimeConfig {
             delta_channel_capacity: 2048,
             namespace: None,
             default_context: None,
-            watch_buffer_size: 2048,
+            warm_contexts: 1,
+            warm_context_ttl_secs: 20,
         }
     }
 }

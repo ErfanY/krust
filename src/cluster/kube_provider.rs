@@ -31,14 +31,14 @@ use kube::{
 };
 use kube_runtime::watcher::{self, Event};
 use serde::Serialize;
-use tokio::{sync::mpsc, time::sleep};
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{error, warn};
 
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
     ActionError, ActionExecutor, ActionResult, PodLogEvent, PodLogRequest, PodLogStream,
-    ResourceProvider,
+    ResourceProvider, WatchTarget,
 };
 
 #[derive(Debug, Clone)]
@@ -48,18 +48,43 @@ pub struct KubeProviderOptions {
     pub all_contexts: bool,
     pub namespace: Option<String>,
     pub readonly: bool,
+    pub warm_contexts: usize,
+    pub warm_context_ttl_secs: u64,
 }
 
 #[derive(Clone)]
 pub struct KubeResourceProvider {
     contexts: Vec<String>,
     default_context: Option<String>,
-    namespace_by_context: HashMap<String, Option<String>>,
     kubeconfig: Kubeconfig,
     readonly: bool,
+    warm_contexts: usize,
+    warm_context_ttl: Duration,
     clients: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Client>>>,
-    watched: std::sync::Arc<tokio::sync::Mutex<HashSet<(String, ResourceKind)>>>,
+    watched: std::sync::Arc<tokio::sync::Mutex<HashMap<WatchKey, JoinHandle<()>>>>,
+    context_last_active: std::sync::Arc<tokio::sync::Mutex<HashMap<String, Instant>>>,
     delta_tx: std::sync::Arc<tokio::sync::Mutex<Option<mpsc::Sender<StateDelta>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct WatchKey {
+    context: String,
+    kind: ResourceKind,
+    namespace: Option<String>,
+}
+
+impl WatchKey {
+    fn new(context: &str, kind: ResourceKind, namespace: Option<String>) -> Self {
+        Self {
+            context: context.to_string(),
+            kind,
+            namespace: if kind.is_namespaced() {
+                namespace
+            } else {
+                None
+            },
+        }
+    }
 }
 
 impl KubeResourceProvider {
@@ -92,34 +117,16 @@ impl KubeResourceProvider {
             .or_else(|| kubeconfig.current_context.clone())
             .or_else(|| contexts.first().cloned());
 
-        let context_namespace_hint: HashMap<String, Option<String>> = kubeconfig
-            .contexts
-            .iter()
-            .map(|named| {
-                (
-                    named.name.clone(),
-                    named.context.as_ref().and_then(|ctx| ctx.namespace.clone()),
-                )
-            })
-            .collect();
-
-        let mut namespace_by_context = HashMap::new();
-        for context in &contexts {
-            let namespace = options
-                .namespace
-                .clone()
-                .or_else(|| context_namespace_hint.get(context).cloned().flatten());
-            namespace_by_context.insert(context.clone(), namespace);
-        }
-
         let provider = Self {
             contexts,
             default_context,
-            namespace_by_context,
             kubeconfig,
             readonly: options.readonly,
+            warm_contexts: options.warm_contexts,
+            warm_context_ttl: Duration::from_secs(options.warm_context_ttl_secs.max(1)),
             clients: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            watched: std::sync::Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+            watched: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            context_last_active: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             delta_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
@@ -182,16 +189,13 @@ impl ResourceProvider for KubeResourceProvider {
         Ok(())
     }
 
-    async fn ensure_watch(&self, context: &str, kind: ResourceKind) -> anyhow::Result<()> {
+    async fn replace_watch_plan(
+        &self,
+        context: &str,
+        targets: &[WatchTarget],
+    ) -> anyhow::Result<()> {
         if !self.contexts.iter().any(|ctx| ctx == context) {
             bail!("unknown context: {context}");
-        }
-
-        {
-            let watched = self.watched.lock().await;
-            if watched.contains(&(context.to_string(), kind)) {
-                return Ok(());
-            }
         }
 
         let tx = self
@@ -201,18 +205,61 @@ impl ResourceProvider for KubeResourceProvider {
             .as_ref()
             .cloned()
             .context("resource provider is not started")?;
+        let client = self.client_for_context(context).await?;
+        let now = Instant::now();
 
-        {
-            let mut watched = self.watched.lock().await;
-            if watched.contains(&(context.to_string(), kind)) {
-                return Ok(());
+        let warm_contexts = {
+            let mut last_active = self.context_last_active.lock().await;
+            last_active.insert(context.to_string(), now);
+            let keep = select_warm_contexts(
+                &last_active,
+                context,
+                now,
+                self.warm_contexts,
+                self.warm_context_ttl,
+            );
+
+            last_active.retain(|ctx, ts| {
+                ctx == context
+                    || (keep.contains(ctx) && now.duration_since(*ts) <= self.warm_context_ttl)
+            });
+            keep
+        };
+
+        let desired: HashSet<WatchKey> = targets
+            .iter()
+            .map(|target| WatchKey::new(context, target.kind, target.namespace.clone()))
+            .collect();
+
+        let mut watched = self.watched.lock().await;
+        let existing_keys: Vec<WatchKey> = watched.keys().cloned().collect();
+        for key in existing_keys {
+            let keep_existing = if key.context == context {
+                desired.contains(&key)
+            } else {
+                warm_contexts.contains(&key.context)
+            };
+            if !keep_existing {
+                if let Some(task) = watched.remove(&key) {
+                    task.abort();
+                }
             }
-            watched.insert((context.to_string(), kind));
         }
 
-        let client = self.client_for_context(context).await?;
-        let namespace = self.namespace_by_context.get(context).cloned().flatten();
-        spawn_watch_for_kind(client, context.to_string(), kind, namespace, tx);
+        for key in desired {
+            if watched.contains_key(&key) {
+                continue;
+            }
+            let task = spawn_watch_for_kind(
+                client.clone(),
+                key.context.clone(),
+                key.kind,
+                key.namespace.clone(),
+                tx.clone(),
+            );
+            watched.insert(key, task);
+        }
+
         Ok(())
     }
 
@@ -264,6 +311,33 @@ impl ResourceProvider for KubeResourceProvider {
     }
 }
 
+fn select_warm_contexts(
+    last_active: &HashMap<String, Instant>,
+    active_context: &str,
+    now: Instant,
+    warm_contexts: usize,
+    ttl: Duration,
+) -> HashSet<String> {
+    let mut inactive: Vec<(String, Instant)> = last_active
+        .iter()
+        .filter_map(|(ctx, ts)| {
+            if ctx == active_context {
+                None
+            } else {
+                Some((ctx.clone(), *ts))
+            }
+        })
+        .collect();
+    inactive.sort_by(|a, b| b.1.cmp(&a.1));
+
+    inactive
+        .into_iter()
+        .filter(|(_, ts)| now.duration_since(*ts) <= ttl)
+        .take(warm_contexts)
+        .map(|(ctx, _)| ctx)
+        .collect()
+}
+
 #[async_trait]
 impl ActionExecutor for KubeResourceProvider {
     async fn delete_resource(&self, key: &ResourceKey) -> Result<ActionResult, ActionError> {
@@ -309,7 +383,8 @@ fn spawn_namespaced_watch<K>(
     kind: ResourceKind,
     namespace: Option<String>,
     tx: mpsc::Sender<StateDelta>,
-) where
+) -> JoinHandle<()>
+where
     K: Clone
         + Resource<Scope = NamespaceResourceScope>
         + ResourceExt
@@ -327,7 +402,7 @@ fn spawn_namespaced_watch<K>(
             None => Api::all(client),
         };
         run_watch_loop(api, context, kind, tx).await;
-    });
+    })
 }
 
 fn spawn_cluster_watch<K>(
@@ -335,7 +410,8 @@ fn spawn_cluster_watch<K>(
     context: String,
     kind: ResourceKind,
     tx: mpsc::Sender<StateDelta>,
-) where
+) -> JoinHandle<()>
+where
     K: Clone
         + Resource
         + ResourceExt
@@ -350,7 +426,7 @@ fn spawn_cluster_watch<K>(
     tokio::spawn(async move {
         let api: Api<K> = Api::all(client);
         run_watch_loop(api, context, kind, tx).await;
-    });
+    })
 }
 
 async fn run_watch_loop<K>(
@@ -375,17 +451,6 @@ async fn run_watch_loop<K>(
     loop {
         let cfg = watcher::Config::default().timeout(20);
         let mut stream = watcher::watcher(api.clone(), cfg).boxed();
-
-        if tx
-            .send(StateDelta::Reset {
-                context: context.clone(),
-                kind,
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
 
         let loop_started = Instant::now();
 
@@ -599,79 +664,137 @@ fn spawn_watch_for_kind(
     kind: ResourceKind,
     namespace: Option<String>,
     tx: mpsc::Sender<StateDelta>,
-) {
+) -> JoinHandle<()> {
     match kind {
-        ResourceKind::Pods => {
-            spawn_namespaced_watch::<Pod>(client, context, kind, namespace, tx);
-        }
+        ResourceKind::Pods => spawn_namespaced_watch::<Pod>(client, context, kind, namespace, tx),
         ResourceKind::Deployments => {
-            spawn_namespaced_watch::<Deployment>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<Deployment>(client, context, kind, namespace, tx)
         }
         ResourceKind::ReplicaSets => {
-            spawn_namespaced_watch::<ReplicaSet>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<ReplicaSet>(client, context, kind, namespace, tx)
         }
         ResourceKind::StatefulSets => {
-            spawn_namespaced_watch::<StatefulSet>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<StatefulSet>(client, context, kind, namespace, tx)
         }
         ResourceKind::DaemonSets => {
-            spawn_namespaced_watch::<DaemonSet>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<DaemonSet>(client, context, kind, namespace, tx)
         }
         ResourceKind::Services => {
-            spawn_namespaced_watch::<Service>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<Service>(client, context, kind, namespace, tx)
         }
         ResourceKind::Ingresses => {
-            spawn_namespaced_watch::<Ingress>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<Ingress>(client, context, kind, namespace, tx)
         }
         ResourceKind::ConfigMaps => {
-            spawn_namespaced_watch::<ConfigMap>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<ConfigMap>(client, context, kind, namespace, tx)
         }
         ResourceKind::Secrets => {
-            spawn_namespaced_watch::<Secret>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<Secret>(client, context, kind, namespace, tx)
         }
-        ResourceKind::Jobs => {
-            spawn_namespaced_watch::<Job>(client, context, kind, namespace, tx);
-        }
+        ResourceKind::Jobs => spawn_namespaced_watch::<Job>(client, context, kind, namespace, tx),
         ResourceKind::CronJobs => {
-            spawn_namespaced_watch::<CronJob>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<CronJob>(client, context, kind, namespace, tx)
         }
         ResourceKind::PersistentVolumeClaims => {
-            spawn_namespaced_watch::<PersistentVolumeClaim>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<PersistentVolumeClaim>(client, context, kind, namespace, tx)
         }
         ResourceKind::PersistentVolumes => {
-            spawn_cluster_watch::<PersistentVolume>(client, context, kind, tx);
+            spawn_cluster_watch::<PersistentVolume>(client, context, kind, tx)
         }
-        ResourceKind::Nodes => {
-            spawn_cluster_watch::<Node>(client, context, kind, tx);
-        }
-        ResourceKind::Namespaces => {
-            spawn_cluster_watch::<Namespace>(client, context, kind, tx);
-        }
+        ResourceKind::Nodes => spawn_cluster_watch::<Node>(client, context, kind, tx),
+        ResourceKind::Namespaces => spawn_cluster_watch::<Namespace>(client, context, kind, tx),
         ResourceKind::Events => {
-            spawn_namespaced_watch::<KubeEvent>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<KubeEvent>(client, context, kind, namespace, tx)
         }
         ResourceKind::ServiceAccounts => {
-            spawn_namespaced_watch::<ServiceAccount>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<ServiceAccount>(client, context, kind, namespace, tx)
         }
-        ResourceKind::Roles => {
-            spawn_namespaced_watch::<Role>(client, context, kind, namespace, tx);
-        }
+        ResourceKind::Roles => spawn_namespaced_watch::<Role>(client, context, kind, namespace, tx),
         ResourceKind::RoleBindings => {
-            spawn_namespaced_watch::<RoleBinding>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<RoleBinding>(client, context, kind, namespace, tx)
         }
-        ResourceKind::ClusterRoles => {
-            spawn_cluster_watch::<ClusterRole>(client, context, kind, tx);
-        }
+        ResourceKind::ClusterRoles => spawn_cluster_watch::<ClusterRole>(client, context, kind, tx),
         ResourceKind::ClusterRoleBindings => {
-            spawn_cluster_watch::<ClusterRoleBinding>(client, context, kind, tx);
+            spawn_cluster_watch::<ClusterRoleBinding>(client, context, kind, tx)
         }
         ResourceKind::NetworkPolicies => {
-            spawn_namespaced_watch::<NetworkPolicy>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<NetworkPolicy>(client, context, kind, namespace, tx)
         }
         ResourceKind::HorizontalPodAutoscalers => {
-            spawn_namespaced_watch::<HorizontalPodAutoscaler>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<HorizontalPodAutoscaler>(client, context, kind, namespace, tx)
         }
         ResourceKind::PodDisruptionBudgets => {
-            spawn_namespaced_watch::<PodDisruptionBudget>(client, context, kind, namespace, tx);
+            spawn_namespaced_watch::<PodDisruptionBudget>(client, context, kind, namespace, tx)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_warm_contexts;
+    use std::{
+        collections::HashMap,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn select_warm_contexts_respects_limit_and_ttl() {
+        let now = Instant::now();
+        let mut last_active = HashMap::new();
+        last_active.insert("active".to_string(), now);
+        last_active.insert("ctx-a".to_string(), now - Duration::from_secs(2));
+        last_active.insert("ctx-b".to_string(), now - Duration::from_secs(5));
+        last_active.insert("ctx-c".to_string(), now - Duration::from_secs(50));
+
+        let keep = select_warm_contexts(&last_active, "active", now, 2, Duration::from_secs(20));
+        assert_eq!(keep.len(), 2);
+        assert!(keep.contains("ctx-a"));
+        assert!(keep.contains("ctx-b"));
+        assert!(!keep.contains("ctx-c"));
+    }
+
+    #[test]
+    fn select_warm_contexts_bounded_under_many_contexts() {
+        let now = Instant::now();
+        let mut last_active = HashMap::new();
+        last_active.insert("active".to_string(), now);
+        for idx in 0..200 {
+            last_active.insert(
+                format!("ctx-{idx}"),
+                now - Duration::from_secs(idx as u64 + 1),
+            );
+        }
+
+        let keep = select_warm_contexts(&last_active, "active", now, 1, Duration::from_secs(120));
+        assert!(keep.len() <= 1);
+    }
+
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn perf_select_warm_contexts_many_contexts() {
+        let now = Instant::now();
+        let mut last_active = HashMap::new();
+        last_active.insert("active".to_string(), now);
+        for idx in 0..5_000 {
+            last_active.insert(
+                format!("ctx-{idx}"),
+                now - Duration::from_secs(idx as u64 + 1),
+            );
+        }
+
+        let start = Instant::now();
+        let mut total = 0usize;
+        for _ in 0..10_000 {
+            total = total.saturating_add(
+                select_warm_contexts(&last_active, "active", now, 1, Duration::from_secs(30)).len(),
+            );
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "[perf] select_warm_contexts total={} elapsed={:?} avg/op={:?}",
+            total,
+            elapsed,
+            elapsed / 10_000
+        );
     }
 }

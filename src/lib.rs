@@ -36,6 +36,8 @@ pub async fn run() -> anyhow::Result<()> {
                 .clone()
                 .or(app_config.runtime.namespace.clone()),
             readonly: cli.readonly,
+            warm_contexts: app_config.runtime.warm_contexts,
+            warm_context_ttl_secs: app_config.runtime.warm_context_ttl_secs,
         })
         .await
         .context("failed to initialize Kubernetes provider")?,
