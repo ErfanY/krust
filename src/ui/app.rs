@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -277,6 +277,53 @@ const LOG_MAX_LINES: usize = 5_000;
 const LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOG_DEFAULT_TAIL_LINES: i64 = 2_000;
 const LOG_MAX_EVENTS_PER_DRAIN: usize = 1_024;
+
+#[derive(Clone, Copy)]
+struct UiTheme {
+    header: Style,
+    block: Style,
+    table_header: Style,
+    row_highlight: Style,
+    status_ok: Style,
+    status_warn: Style,
+    status_err: Style,
+    help: Style,
+    command_active: Style,
+    command_idle: Style,
+}
+
+fn ui_theme() -> UiTheme {
+    UiTheme {
+        header: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(255, 242, 204))
+            .add_modifier(Modifier::BOLD),
+        block: Style::default().fg(Color::Rgb(238, 244, 255)),
+        table_header: Style::default()
+            .fg(Color::Rgb(255, 247, 214))
+            .add_modifier(Modifier::BOLD),
+        row_highlight: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(186, 223, 255))
+            .add_modifier(Modifier::BOLD),
+        status_ok: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(214, 245, 214)),
+        status_warn: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(255, 235, 179)),
+        status_err: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(255, 204, 204))
+            .add_modifier(Modifier::BOLD),
+        help: Style::default().fg(Color::Rgb(192, 208, 235)),
+        command_active: Style::default()
+            .fg(Color::Black)
+            .bg(Color::Rgb(229, 242, 255))
+            .add_modifier(Modifier::BOLD),
+        command_idle: Style::default().fg(Color::Rgb(161, 180, 214)),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogTarget {
@@ -2693,6 +2740,7 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut ratatui::Frame<'_>) {
+        let theme = ui_theme();
         let active = self.current_tab().clone();
         let active_tab_idx = self.active_tab;
         let request = self.view_request_for_tab(&active);
@@ -2715,12 +2763,19 @@ impl App {
         };
         let now = Local::now().format("%Y-%m-%d %H:%M:%S");
         let selected_human = if visible_rows == 0 { 0 } else { selected + 1 };
+        let hb = heartbeat_icon();
+        let ctx_short = compact_context_name(&active.context);
         let mut top_line = format!(
-            "time:{now} | active:{} | ns:{} | kind:{} | pane:{} | sel:{selected_human}/{} | visible:{} | cache:{} | errs:{}",
-            compact_context_name(&active.context),
+            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
+            hb,
+            now,
+            ctx_short,
+            self.active_tab + 1,
+            self.tabs.len(),
             ns_label,
             active.kind().short_name(),
             pane_label,
+            pane_icon(active.pane),
             visible_rows,
             visible_rows,
             self.store.entity_count(),
@@ -2732,11 +2787,13 @@ impl App {
             active.detail_filter.as_str()
         };
         if !active_filter.is_empty() {
-            top_line.push_str(" | filter:");
+            top_line.push_str("  [F]");
             top_line.push_str(active_filter);
         }
         if active.pane == Pane::Logs {
-            top_line.push_str(" | tail:");
+            top_line.push_str("  [LOG]");
+            top_line.push_str(logs_state_icon(&self.logs));
+            top_line.push_str(" tail:");
             top_line.push_str(if self.logs.auto_scroll { "on" } else { "off" });
         }
         if active.kind() == ResourceKind::Pods
@@ -2745,7 +2802,7 @@ impl App {
         {
             let (cpu_req, cpu_lim, mem_req, mem_lim) = pod_resources_from_raw(&entity.raw);
             top_line.push_str(&format!(
-                " | sel cpu {}/{} mem {}/{}",
+                "  [SEL-RES] cpu {}/{} mem {}/{}",
                 format_millicpu(cpu_req),
                 format_millicpu(cpu_lim),
                 format_bytes(mem_req),
@@ -2769,16 +2826,26 @@ impl App {
         let cronjobs = self.count_kind_for_tab(&active, ResourceKind::CronJobs);
 
         let scope_label = active.namespace.as_deref().unwrap_or("all namespaces");
+        let watch_health = if self.store.error_for_context(&active.context).is_some() {
+            "[XX]"
+        } else {
+            "[OK]"
+        };
+        let pod_health = health_icon(failed, pending);
         let mut pulse_sections = vec![
             format!(
-                "Overview   Context: {} ({}/{})   Scope: {}",
-                compact_context_name(&active.context),
+                "[SYS] {}  [WATCH] {}  [POD] {}  [LOG] {}  Context:{} ({}/{})  Scope:{}",
+                hb,
+                watch_health,
+                pod_health,
+                logs_state_icon(&self.logs),
+                ctx_short,
                 self.active_tab + 1,
                 self.tabs.len(),
                 scope_label
             ),
             format!(
-                "Capacity   Cluster CPU req/alloc: {}/{} ({})   Mem req/alloc: {}/{} ({})   Pods: {}/{} ({})",
+                "[CLUSTER] CPU req/alloc {}/{} ({})  MEM req/alloc {}/{} ({})  PODS {}/{} ({})",
                 format_millicpu(cluster_pods.cpu_request_m),
                 format_millicpu(node_caps.cpu_alloc_m),
                 cpu_pct,
@@ -2790,14 +2857,14 @@ impl App {
                 pod_pct
             ),
             format!(
-                "Capacity   Scope CPU req/lim: {}/{}   Mem req/lim: {}/{}",
+                "[SCOPE] CPU req/lim {}/{}  MEM req/lim {}/{}",
                 format_millicpu(scope_pods.cpu_request_m),
                 format_millicpu(scope_pods.cpu_limit_m),
                 format_bytes(scope_pods.mem_request_b),
                 format_bytes(scope_pods.mem_limit_b),
             ),
             format!(
-                "Health     Pods Running:{}  Pending:{}  Failed:{}  Other:{}   Nodes Ready:{}/{}  Unsched:{}",
+                "[HEALTH] Pods run:{} pend:{} fail:{} other:{}  Nodes ready:{}/{} unsched:{}",
                 running,
                 pending,
                 failed,
@@ -2807,12 +2874,12 @@ impl App {
                 node_caps.nodes_unschedulable
             ),
             format!(
-                "Workloads  dp:{}  sts:{}  ds:{}  svc:{}  ing:{}  job:{}  cj:{}",
+                "[WORKLOADS] dp:{}  sts:{}  ds:{}  svc:{}  ing:{}  job:{}  cj:{}",
                 deployments, statefulsets, daemonsets, services, ingresses, jobs, cronjobs
             ),
         ];
         if let Some(err) = self.store.error_for_context(&active.context) {
-            pulse_sections.push(format!("Status     API/watch error: {}", err));
+            pulse_sections.push(format!("[ALERT] API/watch error: {}", err));
         }
         let pulse_text = pulse_sections.join("\n");
         let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | d describe | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
@@ -2853,19 +2920,18 @@ impl App {
             .constraints(constraints)
             .split(frame.area());
 
-        let top_status = Paragraph::new(Line::from(top_line))
-            .style(Style::default().fg(Color::Black).bg(Color::Cyan));
+        let top_status = Paragraph::new(Line::from(top_line)).style(theme.header);
         frame.render_widget(top_status, chunks[0]);
 
         let pulse_widget = Paragraph::new(pulse_text)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title("Resource Pulse")
+                    .title("[PULSE] Resource Pulse")
                     .padding(Padding::new(1, 1, 0, 0)),
             )
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(Color::White));
+            .style(theme.block);
         frame.render_widget(pulse_widget, chunks[1]);
 
         if let Some(overlay) = &mut self.overlay {
@@ -2888,11 +2954,12 @@ impl App {
 
                     let mut paragraph = Paragraph::new(body)
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "{} | wrap:{}",
+                            "[TXT] {} | wrap:{}",
                             title,
                             if *wrap { "on" } else { "off" }
                         )))
-                        .scroll((*scroll, *hscroll));
+                        .scroll((*scroll, *hscroll))
+                        .style(theme.block);
                     if *wrap {
                         paragraph = paragraph.wrap(Wrap { trim: false });
                     }
@@ -2927,22 +2994,16 @@ impl App {
                     };
 
                     let table = Table::new(rows, [Constraint::Length(2), Constraint::Min(10)])
-                        .header(
-                            Row::new(vec!["", "Context"]).style(
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        )
+                        .header(Row::new(vec!["", "Context"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "{title} (Enter to switch, '/' filter, Esc close) | filter:{}",
+                            "[CTX] {title} (Enter switch, '/' filter, Esc close) | filter:{}",
                             if filter.is_empty() {
                                 "-"
                             } else {
                                 filter.as_str()
                             }
                         )))
-                        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+                        .row_highlight_style(theme.row_highlight);
 
                     let selected_visible = if filtered.is_empty() {
                         None
@@ -2979,22 +3040,16 @@ impl App {
                     };
 
                     let table = Table::new(rows, [Constraint::Min(10)])
-                        .header(
-                            Row::new(vec!["Container"]).style(
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        )
+                        .header(Row::new(vec!["Container"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "{title} (Enter select, '/' filter, Esc close) | filter:{}",
+                            "[CTR] {title} (Enter select, '/' filter, Esc close) | filter:{}",
                             if filter.is_empty() {
                                 "-"
                             } else {
                                 filter.as_str()
                             }
                         )))
-                        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+                        .row_highlight_style(theme.row_highlight);
 
                     let selected_visible = if filtered.is_empty() {
                         None
@@ -3038,22 +3093,16 @@ impl App {
                     };
 
                     let table = Table::new(rows, [Constraint::Length(4), Constraint::Min(10)])
-                        .header(
-                            Row::new(vec!["Use", "Source"]).style(
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        )
+                        .header(Row::new(vec!["Use", "Source"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "{title} (Enter/Space toggle, 'a' show all, '/' filter, Esc close) | filter:{}",
+                            "[SRC] {title} (Enter/Space toggle, 'a' show all, '/' filter, Esc close) | filter:{}",
                             if filter.is_empty() {
                                 "-"
                             } else {
                                 filter.as_str()
                             }
                         )))
-                        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+                        .row_highlight_style(theme.row_highlight);
 
                     let selected_visible = if filtered.is_empty() {
                         None
@@ -3093,18 +3142,15 @@ impl App {
                         ],
                     )
                     .header(
-                        Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"]).style(
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        ),
+                        Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"])
+                            .style(theme.table_header),
                     )
                     .block(Block::default().borders(Borders::ALL).title(format!(
-                        "{} ({})",
+                        "[KIND] {} ({})",
                         active.kind(),
                         vm.rows.len()
                     )))
-                    .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+                    .row_highlight_style(theme.row_highlight);
 
                     let mut state =
                         ratatui::widgets::TableState::default().with_selected(Some(selected));
@@ -3157,7 +3203,8 @@ impl App {
                     );
                     let mut paragraph = Paragraph::new(highlighted_text(&body, search_query))
                         .block(Block::default().borders(Borders::ALL).title(title))
-                        .scroll((detail_scroll, detail_hscroll));
+                        .scroll((detail_scroll, detail_hscroll))
+                        .style(theme.block);
                     if detail_wrap {
                         paragraph = paragraph.wrap(Wrap { trim: false });
                     }
@@ -3249,6 +3296,7 @@ impl App {
                             Paragraph::new(highlighted_text(body.as_str(), search_query))
                                 .block(Block::default().borders(Borders::ALL).title(title))
                                 .scroll((detail_scroll, detail_hscroll))
+                                .style(theme.block)
                                 .wrap(Wrap { trim: false });
                         frame.render_widget(paragraph, chunks[2]);
                     } else {
@@ -3282,7 +3330,8 @@ impl App {
                         }
                         let body = visible.join("\n");
                         let paragraph = Paragraph::new(highlighted_text(&body, search_query))
-                            .block(Block::default().borders(Borders::ALL).title(title));
+                            .block(Block::default().borders(Borders::ALL).title(title))
+                            .style(theme.block);
                         frame.render_widget(paragraph, chunks[2]);
                     }
                 }
@@ -3296,12 +3345,13 @@ impl App {
         if self.pending_confirmation.is_some() {
             status.push_str(" | Confirm with 'y'");
         }
-        let status_widget = Paragraph::new(status).style(Style::default().fg(Color::Green));
+        let status_widget =
+            Paragraph::new(status).style(status_style_for_line(&theme, &self.status_line));
         frame.render_widget(status_widget, chunks[3]);
 
         if self.show_help {
             let help = Paragraph::new(help_text)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(theme.help)
                 .wrap(Wrap { trim: false });
             frame.render_widget(help, chunks[4]);
         }
@@ -3313,9 +3363,9 @@ impl App {
             "Command: ':' for commands, '/' for filter".to_string()
         };
         let command_style = if self.command_input.is_some() {
-            Style::default().fg(Color::Yellow)
+            theme.command_active
         } else {
-            Style::default().fg(Color::DarkGray)
+            theme.command_idle
         };
         frame.render_widget(
             Paragraph::new(command_line).style(command_style),
@@ -3932,6 +3982,69 @@ fn detail_viewer_title(
         total,
         if wrap { "on" } else { "off" }
     )
+}
+
+fn heartbeat_icon() -> &'static str {
+    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+    let frame = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        / 250;
+    FRAMES[(frame % FRAMES.len() as u128) as usize]
+}
+
+fn pane_icon(pane: Pane) -> &'static str {
+    match pane {
+        Pane::Table => "[TB]",
+        Pane::Describe => "[DS]",
+        Pane::Events => "[EV]",
+        Pane::Logs => "[LG]",
+    }
+}
+
+fn logs_state_icon(logs: &LogViewState) -> &'static str {
+    if logs.paused {
+        "||"
+    } else if logs.session.is_some() {
+        ">>>"
+    } else if logs.reconnect_blocked {
+        "!!"
+    } else if logs.stream_closed {
+        "--"
+    } else {
+        ".."
+    }
+}
+
+fn health_icon(failed: usize, pending: usize) -> &'static str {
+    if failed > 0 {
+        "[XX]"
+    } else if pending > 0 {
+        "[!!]"
+    } else {
+        "[OK]"
+    }
+}
+
+fn status_style_for_line(theme: &UiTheme, status: &str) -> Style {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("error")
+        || lower.contains("failed")
+        || lower.contains("denied")
+        || lower.contains("forbidden")
+        || lower.contains("blocked")
+    {
+        return theme.status_err;
+    }
+    if lower.contains("warn")
+        || lower.contains("retry")
+        || lower.contains("pending")
+        || lower.contains("paused")
+    {
+        return theme.status_warn;
+    }
+    theme.status_ok
 }
 
 fn context_filtered_indices(contexts: &[String], filter: &str) -> Vec<usize> {
