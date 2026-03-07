@@ -3551,10 +3551,11 @@ impl App {
                         detail_scroll,
                         total_lines,
                     );
+                    let active_line = active_match_line(detail_scroll, &match_lines);
                     let detail_text = if active.pane == Pane::Describe {
-                        highlighted_json_text(&body, search_query, self.color_support)
+                        highlighted_json_text(&body, search_query, self.color_support, active_line)
                     } else {
-                        highlighted_text(&body, search_query)
+                        highlighted_text(&body, search_query, active_line)
                     };
                     let mut paragraph = Paragraph::new(detail_text)
                         .block(Block::default().borders(Borders::ALL).title(title))
@@ -3633,6 +3634,7 @@ impl App {
                             total_lines
                         )
                     );
+                    let active_line = active_match_line(detail_scroll, match_lines.as_slice());
                     if detail_wrap {
                         let body = if logs_line_count > 0 {
                             if self.logs.hidden_sources.is_empty() {
@@ -3647,12 +3649,15 @@ impl App {
                         } else {
                             self.log_body_text()
                         };
-                        let paragraph =
-                            Paragraph::new(highlighted_text(body.as_str(), search_query))
-                                .block(Block::default().borders(Borders::ALL).title(title))
-                                .scroll((detail_scroll, detail_hscroll))
-                                .style(theme.block)
-                                .wrap(Wrap { trim: false });
+                        let paragraph = Paragraph::new(highlighted_text(
+                            body.as_str(),
+                            search_query,
+                            active_line,
+                        ))
+                        .block(Block::default().borders(Borders::ALL).title(title))
+                        .scroll((detail_scroll, detail_hscroll))
+                        .style(theme.block)
+                        .wrap(Wrap { trim: false });
                         frame.render_widget(paragraph, chunks[2]);
                     } else {
                         let viewport_h = content_height.max(1) as usize;
@@ -3684,9 +3689,19 @@ impl App {
                             }
                         }
                         let body = visible.join("\n");
-                        let paragraph = Paragraph::new(highlighted_text(&body, search_query))
-                            .block(Block::default().borders(Borders::ALL).title(title))
-                            .style(theme.block);
+                        let active_rel = active_line.and_then(|line| {
+                            let start = detail_scroll as usize;
+                            let end = start.saturating_add(visible.len());
+                            if line >= start && line < end {
+                                Some(line - start)
+                            } else {
+                                None
+                            }
+                        });
+                        let paragraph =
+                            Paragraph::new(highlighted_text(&body, search_query, active_rel))
+                                .block(Block::default().borders(Borders::ALL).title(title))
+                                .style(theme.block);
                         frame.render_widget(paragraph, chunks[2]);
                     }
                 }
@@ -4264,17 +4279,46 @@ fn next_log_reconnect_backoff_ms(attempt: u32, last_error: Option<&str>) -> u64 
     base_ms.saturating_mul(1u64 << attempt.min(5)).min(30_000)
 }
 
-fn highlighted_text(text: &str, query: &str) -> Text<'static> {
+fn search_match_highlight_style(active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+fn active_match_line(scroll: u16, match_lines: &[usize]) -> Option<usize> {
+    if match_lines.is_empty() {
+        return None;
+    }
+    let current_line = scroll as usize;
+    Some(
+        match_lines
+            .iter()
+            .copied()
+            .find(|line| *line >= current_line)
+            .unwrap_or(*match_lines.last().unwrap_or(&match_lines[0])),
+    )
+}
+
+fn highlighted_text(text: &str, query: &str, active_line: Option<usize>) -> Text<'static> {
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
         return Text::from(text.to_string());
     }
 
     let mut out = Vec::new();
-    for line in text.lines() {
+    for (line_idx, line) in text.lines().enumerate() {
         let lower = line.to_ascii_lowercase();
         let mut spans = Vec::new();
         let mut cursor = 0usize;
+        let highlight_style = search_match_highlight_style(active_line == Some(line_idx));
         while let Some(found) = lower[cursor..].find(&needle) {
             let start = cursor + found;
             let end = start + needle.len();
@@ -4283,10 +4327,7 @@ fn highlighted_text(text: &str, query: &str) -> Text<'static> {
             }
             spans.push(Span::styled(
                 line.get(start..end).unwrap_or("").to_string(),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
+                highlight_style,
             ));
             cursor = end;
         }
@@ -4351,6 +4392,7 @@ fn push_query_highlighted_span(
     text: &str,
     base_style: Style,
     needle: &str,
+    highlight_style: Style,
 ) {
     if needle.is_empty() {
         out.push(Span::styled(text.to_string(), base_style));
@@ -4365,13 +4407,7 @@ fn push_query_highlighted_span(
         if start > cursor {
             out.push(Span::styled(text[cursor..start].to_string(), base_style));
         }
-        out.push(Span::styled(
-            text[start..end].to_string(),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
+        out.push(Span::styled(text[start..end].to_string(), highlight_style));
         cursor = end;
     }
     if cursor < text.len() {
@@ -4518,13 +4554,19 @@ fn json_spans_for_line(line: &str, support: ColorSupport) -> Vec<(String, Style)
     out
 }
 
-fn highlighted_json_text(text: &str, query: &str, support: ColorSupport) -> Text<'static> {
+fn highlighted_json_text(
+    text: &str,
+    query: &str,
+    support: ColorSupport,
+    active_line: Option<usize>,
+) -> Text<'static> {
     let needle = query.trim().to_ascii_lowercase();
     let mut out = Vec::new();
-    for line in text.lines() {
+    for (line_idx, line) in text.lines().enumerate() {
         let mut spans = Vec::new();
+        let highlight_style = search_match_highlight_style(active_line == Some(line_idx));
         for (segment, style) in json_spans_for_line(line, support) {
-            push_query_highlighted_span(&mut spans, &segment, style, &needle);
+            push_query_highlighted_span(&mut spans, &segment, style, &needle, highlight_style);
         }
         if spans.is_empty() {
             spans.push(Span::raw(String::new()));
@@ -5219,7 +5261,7 @@ mod tests {
 
     use super::{
         App, ColorSupport, ResourceAlias, classify_status_severity, color_support_label,
-        command_names, detect_color_support_from_env, highlighted_json_text,
+        command_names, detect_color_support_from_env, highlighted_json_text, highlighted_text,
         is_auth_refresh_log_error, is_retryable_log_error, is_visible_log_line,
         json_spans_for_line, next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
         resource_alias_names, search_match_lines_in_logs, severity_tag, slice_chars, ui_theme_for,
@@ -5504,16 +5546,43 @@ mod tests {
 
     #[test]
     fn json_syntax_highlighter_keeps_search_highlight() {
-        let rendered =
-            highlighted_json_text("{\n  \"name\": \"demo\"\n}", "demo", ColorSupport::Basic);
+        let rendered = highlighted_json_text(
+            "{\n  \"name\": \"demo\"\n}",
+            "demo",
+            ColorSupport::Basic,
+            Some(1),
+        );
         assert!(
             rendered
                 .lines
                 .iter()
                 .any(|line| line.spans.iter().any(|span| {
-                    span.content.contains("demo") && span.style.bg == Some(Color::Yellow)
+                    span.content.contains("demo")
+                        && (span.style.bg == Some(Color::Yellow)
+                            || span.style.bg == Some(Color::Cyan))
                 }))
         );
+    }
+
+    #[test]
+    fn active_search_match_uses_distinct_highlight_color() {
+        let rendered = highlighted_text("alpha\ndemo\nomega demo", "demo", Some(1));
+        let mut saw_active = false;
+        let mut saw_regular = false;
+        for line in &rendered.lines {
+            for span in &line.spans {
+                if span.content.contains("demo") {
+                    if span.style.bg == Some(Color::Cyan) {
+                        saw_active = true;
+                    }
+                    if span.style.bg == Some(Color::Yellow) {
+                        saw_regular = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_active);
+        assert!(saw_regular);
     }
 
     #[test]
