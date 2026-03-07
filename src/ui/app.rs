@@ -112,6 +112,12 @@ enum Overlay {
         selected: usize,
         filter: String,
     },
+    LogSources {
+        title: String,
+        sources: Vec<String>,
+        selected: usize,
+        filter: String,
+    },
 }
 
 pub async fn run(
@@ -307,8 +313,16 @@ struct LogViewState {
     reconnect_attempt: u32,
     reconnect_after: Option<Instant>,
     reconnect_blocked: bool,
+    paused: bool,
+    paused_skipped_lines: u64,
     container_override_pod: Option<ResourceKey>,
     container_override: Option<String>,
+    hidden_sources: HashSet<String>,
+    source_filter_version: u64,
+    search_cache_query: String,
+    search_cache_lines_version: u64,
+    search_cache_source_filter_version: u64,
+    search_cache_matches: Vec<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -336,8 +350,16 @@ impl Default for LogViewState {
             reconnect_attempt: 0,
             reconnect_after: None,
             reconnect_blocked: false,
+            paused: false,
+            paused_skipped_lines: 0,
             container_override_pod: None,
             container_override: None,
+            hidden_sources: HashSet::new(),
+            source_filter_version: 0,
+            search_cache_query: String::new(),
+            search_cache_lines_version: 0,
+            search_cache_source_filter_version: 0,
+            search_cache_matches: Vec::new(),
         }
     }
 }
@@ -497,7 +519,9 @@ impl App {
     fn active_filter_value(&self) -> String {
         if let Some(overlay) = &self.overlay {
             match overlay {
-                Overlay::Contexts { filter, .. } | Overlay::Containers { filter, .. } => {
+                Overlay::Contexts { filter, .. }
+                | Overlay::Containers { filter, .. }
+                | Overlay::LogSources { filter, .. } => {
                     return filter.clone();
                 }
                 Overlay::Text { .. } => {}
@@ -519,6 +543,10 @@ impl App {
                     ..
                 }
                 | Overlay::Containers {
+                    filter: overlay_filter,
+                    ..
+                }
+                | Overlay::LogSources {
                     filter: overlay_filter,
                     ..
                 } => {
@@ -746,12 +774,16 @@ impl App {
         self.logs.total_bytes = 0;
         self.logs.max_line_width = 0;
         self.logs.dropped_lines = 0;
+        self.logs.paused_skipped_lines = 0;
         self.logs.last_error = None;
         self.logs.stream_closed = false;
         self.logs.auto_scroll = true;
         self.logs.reconnect_attempt = 0;
         self.logs.reconnect_after = None;
         self.logs.reconnect_blocked = false;
+        self.logs.paused = false;
+        self.logs.hidden_sources.clear();
+        self.logs.source_filter_version = self.logs.source_filter_version.wrapping_add(1);
     }
 
     async fn start_log_session(&mut self, selection: LogSelection, initial: bool) -> bool {
@@ -856,19 +888,10 @@ impl App {
         }
         self.logs.stream_closed = true;
         self.logs.reconnect_attempt = self.logs.reconnect_attempt.saturating_add(1);
-        let base_ms = if self
-            .logs
-            .last_error
-            .as_deref()
-            .is_some_and(is_auth_refresh_log_error)
-        {
-            1_000u64
-        } else {
-            500u64
-        };
-        let backoff_ms = base_ms
-            .saturating_mul(1u64 << self.logs.reconnect_attempt.min(5))
-            .min(30_000);
+        let backoff_ms = next_log_reconnect_backoff_ms(
+            self.logs.reconnect_attempt,
+            self.logs.last_error.as_deref(),
+        );
         self.logs.reconnect_after = Some(Instant::now() + Duration::from_millis(backoff_ms));
     }
 
@@ -972,8 +995,13 @@ impl App {
         for event in events {
             match event {
                 PodLogEvent::Line(line) => {
-                    self.push_log_line(line);
-                    changed = true;
+                    if self.logs.paused {
+                        self.logs.paused_skipped_lines =
+                            self.logs.paused_skipped_lines.saturating_add(1);
+                    } else {
+                        self.push_log_line(line);
+                        changed = true;
+                    }
                 }
                 PodLogEvent::End => {}
                 PodLogEvent::Error(error) => {
@@ -1043,7 +1071,9 @@ impl App {
     }
 
     fn logs_title(&self) -> String {
-        let state = if self.logs.session.is_some() {
+        let state = if self.logs.paused {
+            "paused"
+        } else if self.logs.session.is_some() {
             "streaming"
         } else if self.logs.reconnect_blocked {
             "blocked"
@@ -1070,14 +1100,21 @@ impl App {
             .as_ref()
             .map(|_| " | err".to_string())
             .unwrap_or_default();
+        let source_filters = if self.logs.hidden_sources.is_empty() {
+            "all".to_string()
+        } else {
+            format!("{} hidden", self.logs.hidden_sources.len())
+        };
 
         format!(
-            "Logs | target:{} | streams:{} | state:{} | lines:{} | dropped:{}{} | wrap:{}",
+            "Logs | target:{} | streams:{} | state:{} | src:{} | lines:{} | dropped:{} | paused-drop:{}{} | wrap:{}",
             target,
             streams,
             state,
+            source_filters,
             self.logs.lines.len(),
             self.logs.dropped_lines,
+            self.logs.paused_skipped_lines,
             err,
             if self.current_tab().detail_wrap {
                 "on"
@@ -1085,6 +1122,108 @@ impl App {
                 "off"
             }
         )
+    }
+
+    fn set_log_paused(&mut self, paused: bool) {
+        self.logs.paused = paused;
+        if paused {
+            self.logs.auto_scroll = false;
+            self.status_line = "Log stream paused".to_string();
+        } else {
+            self.status_line = "Log stream resumed".to_string();
+        }
+    }
+
+    fn jump_logs_to_latest(&mut self) {
+        self.logs.paused = false;
+        self.logs.auto_scroll = true;
+        self.current_tab_mut().detail_scroll = u16::MAX;
+        self.status_line = "Logs: jumped to latest and resumed tailing".to_string();
+    }
+
+    fn available_log_sources(&self) -> Vec<String> {
+        let mut sources = HashSet::new();
+        for line in &self.logs.lines {
+            if let Some(source) = parse_log_source(line) {
+                sources.insert(source.to_string());
+            }
+        }
+        let mut out: Vec<String> = sources.into_iter().collect();
+        out.sort();
+        out
+    }
+
+    fn toggle_log_source(&mut self, source: &str) -> bool {
+        let changed = if self.logs.hidden_sources.contains(source) {
+            self.logs.hidden_sources.remove(source)
+        } else {
+            self.logs.hidden_sources.insert(source.to_string())
+        };
+        if changed {
+            self.logs.source_filter_version = self.logs.source_filter_version.wrapping_add(1);
+            self.current_tab_mut().detail_scroll = 0;
+        }
+        changed
+    }
+
+    fn filtered_log_line_count_and_width(&self) -> (usize, usize) {
+        if self.logs.hidden_sources.is_empty() {
+            return (self.logs.lines.len(), self.logs.max_line_width);
+        }
+        let mut count = 0usize;
+        let mut max_width = 0usize;
+        for line in &self.logs.lines {
+            if is_visible_log_line(line, &self.logs.hidden_sources) {
+                count = count.saturating_add(1);
+                max_width = max_width.max(line.chars().count());
+            }
+        }
+        (count, max_width)
+    }
+
+    fn filtered_log_body_text(&mut self) -> String {
+        if self.logs.hidden_sources.is_empty() {
+            return self.log_joined_text().to_string();
+        }
+        self.logs
+            .lines
+            .iter()
+            .filter(|line| is_visible_log_line(line, &self.logs.hidden_sources))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn log_search_match_lines(&mut self, query: &str) -> Vec<usize> {
+        let needle = query.trim().to_ascii_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+
+        if self.logs.search_cache_query == needle
+            && self.logs.search_cache_lines_version == self.logs.lines_version
+            && self.logs.search_cache_source_filter_version == self.logs.source_filter_version
+        {
+            return self.logs.search_cache_matches.clone();
+        }
+
+        let mut matches = Vec::new();
+        let mut visible_idx = 0usize;
+        for line in &self.logs.lines {
+            if !is_visible_log_line(line, &self.logs.hidden_sources) {
+                continue;
+            }
+            if line.to_ascii_lowercase().contains(&needle) {
+                matches.push(visible_idx);
+            }
+            visible_idx = visible_idx.saturating_add(1);
+        }
+
+        self.logs.search_cache_query = needle;
+        self.logs.search_cache_lines_version = self.logs.lines_version;
+        self.logs.search_cache_source_filter_version = self.logs.source_filter_version;
+        self.logs.search_cache_matches = matches.clone();
+        matches
     }
 
     fn new(
@@ -1312,6 +1451,30 @@ impl App {
             self.ensure_active_watch().await;
             return Ok(false);
         }
+        if self.current_tab().pane == Pane::Logs
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('p')
+        {
+            self.set_log_paused(!self.logs.paused);
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
+        if self.current_tab().pane == Pane::Logs
+            && ((key.code == KeyCode::Char('L'))
+                || (key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.jump_logs_to_latest();
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
+        if self.current_tab().pane == Pane::Logs
+            && ((key.code == KeyCode::Char('S'))
+                || (key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.show_log_sources_overlay();
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
 
         if self.keymap.is(Action::Quit, &key) {
             return Ok(true);
@@ -1372,6 +1535,7 @@ impl App {
             if self.current_tab().pane == Pane::Logs {
                 self.logs.auto_scroll = !self.logs.auto_scroll;
                 if self.logs.auto_scroll {
+                    self.logs.paused = false;
                     self.current_tab_mut().detail_scroll = u16::MAX;
                     self.status_line = "Log tailing: on".to_string();
                 } else {
@@ -1512,29 +1676,32 @@ impl App {
         if !self.in_detail_pane() {
             return;
         }
-        let needle = self.current_tab().detail_filter.trim().to_ascii_lowercase();
+        let needle = self.current_tab().detail_filter.trim().to_string();
         if needle.is_empty() {
             self.status_line = "No active detail search. Press '/' to search.".to_string();
             return;
         }
-        let Some(body) = self.current_detail_body_for_search() else {
-            self.status_line = "No detail content".to_string();
-            return;
+        let matches: Vec<usize> = if self.current_tab().pane == Pane::Logs {
+            self.log_search_match_lines(&needle)
+        } else {
+            let Some(body) = self.current_detail_body_for_search() else {
+                self.status_line = "No detail content".to_string();
+                return;
+            };
+            let lower = needle.to_ascii_lowercase();
+            body.lines()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    if line.to_ascii_lowercase().contains(&lower) {
+                        Some(idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         };
-
-        let matches: Vec<usize> = body
-            .lines()
-            .enumerate()
-            .filter_map(|(idx, line)| {
-                if line.to_ascii_lowercase().contains(&needle) {
-                    Some(idx)
-                } else {
-                    None
-                }
-            })
-            .collect();
         if matches.is_empty() {
-            self.status_line = format!("No matches for '{}'", needle);
+            self.status_line = format!("No matches for '{}'", needle.trim());
             return;
         }
 
@@ -1693,7 +1860,7 @@ impl App {
         match cmd.as_str() {
             "q" | "quit" | "exit" => true,
             "help" | "?" => {
-                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :c | :resources | :clear | :quit | :all".to_string();
+                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :c | :sources | :pause | :resume | :tail | :resources | :clear | :quit | :all".to_string();
                 false
             }
             "contexts" | "ctxs" => {
@@ -1769,6 +1936,22 @@ impl App {
             }
             "c" | "container" | "containers" => {
                 self.open_container_picker_from_selection();
+                false
+            }
+            "sources" | "src" => {
+                self.show_log_sources_overlay();
+                false
+            }
+            "pause" => {
+                self.set_log_paused(true);
+                false
+            }
+            "resume" => {
+                self.set_log_paused(false);
+                false
+            }
+            "tail" => {
+                self.jump_logs_to_latest();
                 false
             }
             "pulse" | "pulses" | "pu" | "xray" | "popeye" | "pop" | "plugins" | "plugin"
@@ -2068,6 +2251,17 @@ impl App {
         self.status_line = "Context list opened".to_string();
     }
 
+    fn show_log_sources_overlay(&mut self) {
+        let sources = self.available_log_sources();
+        self.overlay = Some(Overlay::LogSources {
+            title: "Log Sources".to_string(),
+            sources,
+            selected: 0,
+            filter: String::new(),
+        });
+        self.status_line = "Log source filter opened".to_string();
+    }
+
     fn open_container_picker_from_selection(&mut self) {
         let Some(row) = self.selected_row() else {
             self.status_line = "No resource selected".to_string();
@@ -2210,6 +2404,56 @@ impl App {
                         );
                     }
                     self.ensure_active_watch().await;
+                    return;
+                }
+
+                if let Some(Overlay::LogSources {
+                    selected, sources, ..
+                }) = &self.overlay
+                {
+                    if *selected >= sources.len() {
+                        self.status_line = "No log source selected".to_string();
+                        return;
+                    }
+                    let source = sources[*selected].clone();
+                    if self.toggle_log_source(&source) {
+                        let hidden = self.logs.hidden_sources.contains(&source);
+                        self.status_line = if hidden {
+                            format!("Log source hidden: {source}")
+                        } else {
+                            format!("Log source shown: {source}")
+                        };
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some(Overlay::LogSources {
+                    selected, sources, ..
+                }) = &self.overlay
+                {
+                    if *selected < sources.len() {
+                        let source = sources[*selected].clone();
+                        if self.toggle_log_source(&source) {
+                            let hidden = self.logs.hidden_sources.contains(&source);
+                            self.status_line = if hidden {
+                                format!("Log source hidden: {source}")
+                            } else {
+                                format!("Log source shown: {source}")
+                            };
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if matches!(self.overlay, Some(Overlay::LogSources { .. })) {
+                    if self.logs.hidden_sources.is_empty() {
+                        self.status_line = "All log sources already visible".to_string();
+                    } else {
+                        self.logs.hidden_sources.clear();
+                        self.logs.source_filter_version =
+                            self.logs.source_filter_version.wrapping_add(1);
+                        self.status_line = "All log sources enabled".to_string();
+                    }
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -2293,6 +2537,28 @@ impl App {
                 };
                 *selected = filtered[new_pos];
             }
+            Some(Overlay::LogSources {
+                sources,
+                selected,
+                filter,
+                ..
+            }) => {
+                let filtered = list_filtered_indices(sources, filter);
+                if filtered.is_empty() {
+                    *selected = 0;
+                    return;
+                }
+                let current_pos = filtered
+                    .iter()
+                    .position(|idx| *idx == *selected)
+                    .unwrap_or(0);
+                let new_pos = if delta < 0 {
+                    current_pos.saturating_sub(delta.unsigned_abs())
+                } else {
+                    (current_pos + delta as usize).min(filtered.len() - 1)
+                };
+                *selected = filtered[new_pos];
+            }
             None => {}
         }
     }
@@ -2331,6 +2597,15 @@ impl App {
                 let filtered = list_filtered_indices(containers, filter);
                 *selected = filtered.first().copied().unwrap_or(0);
             }
+            Some(Overlay::LogSources {
+                sources,
+                selected,
+                filter,
+                ..
+            }) => {
+                let filtered = list_filtered_indices(sources, filter);
+                *selected = filtered.first().copied().unwrap_or(0);
+            }
             None => {}
         }
     }
@@ -2354,6 +2629,15 @@ impl App {
                 ..
             }) => {
                 let filtered = list_filtered_indices(containers, filter);
+                *selected = filtered.last().copied().unwrap_or(0);
+            }
+            Some(Overlay::LogSources {
+                sources,
+                selected,
+                filter,
+                ..
+            }) => {
+                let filtered = list_filtered_indices(sources, filter);
                 *selected = filtered.last().copied().unwrap_or(0);
             }
             None => {}
@@ -2531,7 +2815,7 @@ impl App {
             pulse_sections.push(format!("Status     API/watch error: {}", err));
         }
         let pulse_text = pulse_sections.join("\n");
-        let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | d describe | l logs(stream) | c container picker | ctrl+d delete(table) | ctrl+k kill";
+        let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | d describe | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
         let help_height = if self.show_help {
             max_vertical_scroll_for_text(help_text, frame.area().width.max(1), 1, true) + 1
         } else {
@@ -2721,6 +3005,65 @@ impl App {
                         ratatui::widgets::TableState::default().with_selected(selected_visible);
                     frame.render_stateful_widget(table, chunks[2], &mut state);
                 }
+                Overlay::LogSources {
+                    title,
+                    sources,
+                    selected,
+                    filter,
+                } => {
+                    let filtered = list_filtered_indices(sources, filter);
+                    if filtered.is_empty() {
+                        *selected = 0;
+                    } else if !filtered.contains(selected) {
+                        *selected = filtered[0];
+                    }
+                    let rows: Vec<Row<'_>> = if filtered.is_empty() {
+                        vec![Row::new(vec![
+                            Cell::from(" "),
+                            Cell::from(format!("No sources match '{}'", filter)),
+                        ])]
+                    } else {
+                        filtered
+                            .iter()
+                            .map(|idx| {
+                                let source = &sources[*idx];
+                                let marker = if self.logs.hidden_sources.contains(source) {
+                                    "off"
+                                } else {
+                                    "on"
+                                };
+                                Row::new(vec![Cell::from(marker), Cell::from(source.clone())])
+                            })
+                            .collect()
+                    };
+
+                    let table = Table::new(rows, [Constraint::Length(4), Constraint::Min(10)])
+                        .header(
+                            Row::new(vec!["Use", "Source"]).style(
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        )
+                        .block(Block::default().borders(Borders::ALL).title(format!(
+                            "{title} (Enter/Space toggle, 'a' show all, '/' filter, Esc close) | filter:{}",
+                            if filter.is_empty() {
+                                "-"
+                            } else {
+                                filter.as_str()
+                            }
+                        )))
+                        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White));
+
+                    let selected_visible = if filtered.is_empty() {
+                        None
+                    } else {
+                        filtered.iter().position(|idx| idx == selected)
+                    };
+                    let mut state =
+                        ratatui::widgets::TableState::default().with_selected(selected_visible);
+                    frame.render_stateful_widget(table, chunks[2], &mut state);
+                }
             }
         } else {
             match active.pane {
@@ -2821,23 +3164,29 @@ impl App {
                     frame.render_widget(paragraph, chunks[2]);
                 }
                 Pane::Logs => {
-                    let logs_line_count = self.logs.lines.len();
-                    let logs_max_line_width = self.logs.max_line_width;
+                    let (logs_line_count, logs_max_line_width) =
+                        self.filtered_log_line_count_and_width();
                     let content_width = chunks[2].width.saturating_sub(2);
                     let content_height = chunks[2].height.saturating_sub(2);
                     self.detail_page_step = (content_height / 2).max(1);
                     let detail_wrap = active.detail_wrap;
                     let (max_v, max_h) = if detail_wrap {
-                        let fallback;
                         let body = if logs_line_count > 0 {
-                            self.log_joined_text()
+                            if self.logs.hidden_sources.is_empty() {
+                                self.log_joined_text().to_string()
+                            } else {
+                                self.filtered_log_body_text()
+                            }
+                        } else if !self.logs.lines.is_empty()
+                            && !self.logs.hidden_sources.is_empty()
+                        {
+                            "No log lines match the current source filter.".to_string()
                         } else {
-                            fallback = self.log_body_text();
-                            &fallback
+                            self.log_body_text()
                         };
                         (
                             max_vertical_scroll_for_text(
-                                &body,
+                                body.as_str(),
                                 content_width,
                                 content_height,
                                 detail_wrap,
@@ -2868,7 +3217,7 @@ impl App {
                         tab.detail_hscroll = detail_hscroll;
                     }
                     let search_query = active.detail_filter.trim();
-                    let match_lines = search_match_lines_in_logs(&self.logs.lines, search_query);
+                    let match_lines = self.log_search_match_lines(search_query);
                     let total_lines = logs_line_count.max(1);
                     let title = format!(
                         "{} | {}",
@@ -2877,34 +3226,59 @@ impl App {
                             "VIEWER",
                             detail_wrap,
                             search_query,
-                            &match_lines,
+                            match_lines.as_slice(),
                             detail_scroll,
                             total_lines
                         )
                     );
                     if detail_wrap {
-                        let fallback;
                         let body = if logs_line_count > 0 {
-                            self.log_joined_text()
+                            if self.logs.hidden_sources.is_empty() {
+                                self.log_joined_text().to_string()
+                            } else {
+                                self.filtered_log_body_text()
+                            }
+                        } else if !self.logs.lines.is_empty()
+                            && !self.logs.hidden_sources.is_empty()
+                        {
+                            "No log lines match the current source filter.".to_string()
                         } else {
-                            fallback = self.log_body_text();
-                            &fallback
+                            self.log_body_text()
                         };
-                        let paragraph = Paragraph::new(highlighted_text(&body, search_query))
-                            .block(Block::default().borders(Borders::ALL).title(title))
-                            .scroll((detail_scroll, detail_hscroll))
-                            .wrap(Wrap { trim: false });
+                        let paragraph =
+                            Paragraph::new(highlighted_text(body.as_str(), search_query))
+                                .block(Block::default().borders(Borders::ALL).title(title))
+                                .scroll((detail_scroll, detail_hscroll))
+                                .wrap(Wrap { trim: false });
                         frame.render_widget(paragraph, chunks[2]);
                     } else {
                         let viewport_h = content_height.max(1) as usize;
                         let viewport_w = content_width.max(1) as usize;
                         let start = detail_scroll as usize;
                         let mut visible = Vec::with_capacity(viewport_h.max(1));
-                        for line in self.logs.lines.iter().skip(start).take(viewport_h) {
+                        let mut visible_idx = 0usize;
+                        for line in &self.logs.lines {
+                            if !is_visible_log_line(line, &self.logs.hidden_sources) {
+                                continue;
+                            }
+                            if visible_idx < start {
+                                visible_idx = visible_idx.saturating_add(1);
+                                continue;
+                            }
+                            if visible.len() >= viewport_h {
+                                break;
+                            }
                             visible.push(slice_chars(line, detail_hscroll as usize, viewport_w));
+                            visible_idx = visible_idx.saturating_add(1);
                         }
                         if visible.is_empty() {
-                            visible.push(self.log_body_text());
+                            if !self.logs.lines.is_empty() && !self.logs.hidden_sources.is_empty() {
+                                visible.push(
+                                    "No log lines match the current source filter.".to_string(),
+                                );
+                            } else {
+                                visible.push(self.log_body_text());
+                            }
                         }
                         let body = visible.join("\n");
                         let paragraph = Paragraph::new(highlighted_text(&body, search_query))
@@ -3260,11 +3634,26 @@ fn command_names() -> &'static [&'static str] {
         "c",
         "container",
         "containers",
+        "sources",
+        "src",
+        "pause",
+        "resume",
+        "tail",
         "help",
         "?",
         "quit",
         "exit",
         "q",
+        "pulse",
+        "pulses",
+        "pu",
+        "xray",
+        "popeye",
+        "pop",
+        "plugins",
+        "plugin",
+        "screendump",
+        "sd",
     ]
 }
 
@@ -3416,6 +3805,7 @@ fn search_match_lines(text: &str, query: &str) -> Vec<usize> {
         .collect()
 }
 
+#[cfg(test)]
 fn search_match_lines_in_logs(lines: &VecDeque<String>, query: &str) -> Vec<usize> {
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -3458,6 +3848,15 @@ fn is_auth_refresh_log_error(message: &str) -> bool {
         || lower.contains("code: 401")
         || lower.contains("token")
         || lower.contains("expired")
+}
+
+fn next_log_reconnect_backoff_ms(attempt: u32, last_error: Option<&str>) -> u64 {
+    let base_ms = if last_error.is_some_and(is_auth_refresh_log_error) {
+        1_000u64
+    } else {
+        500u64
+    };
+    base_ms.saturating_mul(1u64 << attempt.min(5)).min(30_000)
 }
 
 fn highlighted_text(text: &str, query: &str) -> Text<'static> {
@@ -3772,6 +4171,27 @@ fn log_target_name(target: &LogTarget) -> String {
     }
 }
 
+fn parse_log_source(line: &str) -> Option<&str> {
+    if !line.starts_with('[') {
+        return None;
+    }
+    let end = line.find(']')?;
+    if end <= 1 {
+        return None;
+    }
+    Some(&line[1..end])
+}
+
+fn is_visible_log_line(line: &str, hidden_sources: &HashSet<String>) -> bool {
+    if hidden_sources.is_empty() {
+        return true;
+    }
+    let Some(source) = parse_log_source(line) else {
+        return true;
+    };
+    !hidden_sources.contains(source)
+}
+
 fn normalize_log_targets(mut targets: Vec<LogTarget>) -> Vec<LogTarget> {
     targets.sort_by(|a, b| {
         a.namespace
@@ -3941,11 +4361,15 @@ fn parse_resource_alias(token: &str) -> ResourceAlias {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, time::Instant};
+    use std::{
+        collections::{HashSet, VecDeque},
+        time::Instant,
+    };
 
     use super::{
-        ResourceAlias, is_auth_refresh_log_error, is_retryable_log_error, parse_resource_alias,
-        search_match_lines_in_logs, slice_chars,
+        ResourceAlias, command_names, is_auth_refresh_log_error, is_retryable_log_error,
+        is_visible_log_line, next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
+        resource_alias_names, search_match_lines_in_logs, slice_chars,
     };
     use crate::model::ResourceKind;
 
@@ -3986,6 +4410,74 @@ mod tests {
     }
 
     #[test]
+    fn resource_alias_catalog_stays_supported() {
+        for alias in resource_alias_names() {
+            assert!(
+                matches!(parse_resource_alias(alias), ResourceAlias::Supported(_)),
+                "resource alias '{alias}' is listed for completion but is not supported"
+            );
+        }
+    }
+
+    #[test]
+    fn command_catalog_covers_explicit_builtin_commands() {
+        let known: HashSet<&str> = command_names().iter().copied().collect();
+        let expected = [
+            "q",
+            "quit",
+            "exit",
+            "help",
+            "?",
+            "contexts",
+            "ctxs",
+            "ctx",
+            "context",
+            "ns",
+            "namespace",
+            "all",
+            "0",
+            "kind",
+            "resources",
+            "res",
+            "aliases",
+            "clear",
+            "clear-filter",
+            "c",
+            "container",
+            "containers",
+            "sources",
+            "src",
+            "pause",
+            "resume",
+            "tail",
+            "pulse",
+            "pulses",
+            "pu",
+            "xray",
+            "popeye",
+            "pop",
+            "plugins",
+            "plugin",
+            "screendump",
+            "sd",
+        ];
+        for cmd in expected {
+            assert!(
+                known.contains(cmd),
+                "command '{cmd}' is handled by parser but missing from completion catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn command_catalog_has_no_duplicates() {
+        let mut seen = HashSet::new();
+        for cmd in command_names() {
+            assert!(seen.insert(*cmd), "duplicate command '{cmd}'");
+        }
+    }
+
+    #[test]
     fn classifies_non_retryable_rbac_log_errors() {
         assert!(!is_retryable_log_error(
             "code: 403 Forbidden: cannot get pods"
@@ -4003,6 +4495,40 @@ mod tests {
         assert!(is_auth_refresh_log_error("code: 401"));
         assert!(is_auth_refresh_log_error("token expired"));
         assert!(!is_auth_refresh_log_error("forbidden"));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_higher_for_auth_refresh_failures() {
+        let normal = next_log_reconnect_backoff_ms(1, Some("connection reset by peer"));
+        let auth = next_log_reconnect_backoff_ms(1, Some("Unauthorized token expired"));
+        assert!(auth > normal);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_capped() {
+        let non_auth = next_log_reconnect_backoff_ms(99, Some("connection reset by peer"));
+        let auth = next_log_reconnect_backoff_ms(99, Some("token expired"));
+        assert_eq!(non_auth, 16_000);
+        assert_eq!(auth, 30_000);
+    }
+
+    #[test]
+    fn parses_log_source_prefix() {
+        assert_eq!(
+            parse_log_source("[ns/pod/container] hello world"),
+            Some("ns/pod/container")
+        );
+        assert_eq!(parse_log_source("plain line"), None);
+    }
+
+    #[test]
+    fn hides_and_shows_log_lines_by_source() {
+        let mut hidden = HashSet::new();
+        hidden.insert("ns-a/pod-a/c1".to_string());
+
+        assert!(!is_visible_log_line("[ns-a/pod-a/c1] hidden", &hidden));
+        assert!(is_visible_log_line("[ns-b/pod-b/c1] visible", &hidden));
+        assert!(is_visible_log_line("no prefix line", &hidden));
     }
 
     #[test]

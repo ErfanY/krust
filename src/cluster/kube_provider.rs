@@ -490,13 +490,17 @@ async fn run_watch_loop<K>(
             }
         }
 
-        if loop_started.elapsed() > Duration::from_secs(20) {
-            backoff = Duration::from_millis(500);
-        } else {
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-        }
+        backoff = next_watch_backoff(backoff, loop_started.elapsed());
 
         sleep(backoff).await;
+    }
+}
+
+fn next_watch_backoff(current: Duration, run_elapsed: Duration) -> Duration {
+    if run_elapsed > Duration::from_secs(20) {
+        Duration::from_millis(500)
+    } else {
+        (current * 2).min(Duration::from_secs(30))
     }
 }
 
@@ -731,7 +735,10 @@ fn spawn_watch_for_kind(
 
 #[cfg(test)]
 mod tests {
-    use super::select_warm_contexts;
+    use kube::{Error, error::Status};
+    use kube_runtime::watcher;
+
+    use super::{is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts};
     use std::{
         collections::HashMap,
         time::{Duration, Instant},
@@ -796,5 +803,50 @@ mod tests {
             elapsed,
             elapsed / 10_000
         );
+    }
+
+    #[test]
+    fn watcher_forbidden_error_is_terminal() {
+        let err = watcher::Error::WatchError(Box::new(Status {
+            code: 403,
+            message: "forbidden".to_string(),
+            ..Status::default()
+        }));
+        assert!(is_forbidden_watcher_error(&err));
+    }
+
+    #[test]
+    fn watcher_non_forbidden_error_is_retryable() {
+        let err = watcher::Error::WatchError(Box::new(Status {
+            code: 500,
+            message: "internal server error".to_string(),
+            ..Status::default()
+        }));
+        assert!(!is_forbidden_watcher_error(&err));
+    }
+
+    #[test]
+    fn watcher_initial_list_forbidden_is_terminal() {
+        let err = watcher::Error::InitialListFailed(Error::Api(Box::new(Status {
+            code: 403,
+            message: "rbac denied".to_string(),
+            ..Status::default()
+        })));
+        assert!(is_forbidden_watcher_error(&err));
+    }
+
+    #[test]
+    fn watch_backoff_resets_after_healthy_stream_duration() {
+        let reset = next_watch_backoff(Duration::from_secs(8), Duration::from_secs(21));
+        assert_eq!(reset, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn watch_backoff_grows_and_caps_on_fast_failures() {
+        let mut current = Duration::from_millis(500);
+        for _ in 0..10 {
+            current = next_watch_backoff(current, Duration::from_secs(1));
+        }
+        assert_eq!(current, Duration::from_secs(30));
     }
 }

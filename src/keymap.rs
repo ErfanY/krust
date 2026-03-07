@@ -321,3 +321,82 @@ impl fmt::Display for Action {
         write!(f, "{s}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::{Action, Keymap};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    #[test]
+    fn default_keymap_matches_core_k9s_navigation_bindings() {
+        let keymap = Keymap::default();
+
+        assert!(keymap.is(
+            Action::MoveDown,
+            &key(KeyCode::Char('j'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::MoveUp,
+            &key(KeyCode::Char('k'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::FilterMode,
+            &key(KeyCode::Char('/'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::GotoTop,
+            &key(KeyCode::Char('g'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::GotoBottom,
+            &key(KeyCode::Char('G'), KeyModifiers::SHIFT)
+        ));
+        assert!(keymap.is(
+            Action::NextContext,
+            &key(KeyCode::Tab, KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::PrevContext,
+            &key(KeyCode::BackTab, KeyModifiers::SHIFT)
+        ));
+        assert!(keymap.is(
+            Action::ToEvents,
+            &key(KeyCode::Char('E'), KeyModifiers::SHIFT)
+        ));
+        assert!(keymap.is(
+            Action::ToLogs,
+            &key(KeyCode::Char('l'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::CycleNamespace,
+            &key(KeyCode::Char('n'), KeyModifiers::empty())
+        ));
+    }
+
+    #[test]
+    fn default_keymap_keeps_describe_and_delete_separate() {
+        let keymap = Keymap::default();
+
+        assert!(keymap.is(
+            Action::ToggleDescribe,
+            &key(KeyCode::Char('d'), KeyModifiers::empty())
+        ));
+        assert!(keymap.is(
+            Action::Delete,
+            &key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+        ));
+        assert!(!keymap.is(
+            Action::Delete,
+            &key(KeyCode::Char('d'), KeyModifiers::empty())
+        ));
+        assert!(!keymap.is(
+            Action::ToggleDescribe,
+            &key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+        ));
+    }
+}
