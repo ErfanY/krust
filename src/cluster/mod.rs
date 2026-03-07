@@ -1,6 +1,7 @@
 mod kube_provider;
 
 use async_trait::async_trait;
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::model::ResourceKey;
 
@@ -9,6 +10,32 @@ pub use kube_provider::{KubeProviderOptions, KubeResourceProvider};
 #[derive(Debug, Clone)]
 pub struct ActionResult {
     pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PodLogRequest {
+    pub context: String,
+    pub namespace: String,
+    pub pod: String,
+    pub container: Option<String>,
+    pub follow: bool,
+    pub tail_lines: Option<i64>,
+    pub since_seconds: Option<i64>,
+    pub previous: bool,
+    pub timestamps: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum PodLogEvent {
+    Line(String),
+    End,
+    Error(String),
+}
+
+#[derive(Debug)]
+pub struct PodLogStream {
+    pub rx: mpsc::Receiver<PodLogEvent>,
+    pub task: JoinHandle<()>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,6 +63,7 @@ pub trait ResourceProvider: Send + Sync {
         context: &str,
         kind: crate::model::ResourceKind,
     ) -> anyhow::Result<()>;
+    async fn stream_pod_logs(&self, request: PodLogRequest) -> anyhow::Result<PodLogStream>;
 }
 
 #[async_trait]

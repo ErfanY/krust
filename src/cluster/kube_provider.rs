@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
+use futures::{AsyncBufReadExt, StreamExt};
 use k8s_openapi::{
     NamespaceResourceScope,
     api::{
@@ -26,7 +26,7 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::DeleteParams,
+    api::{DeleteParams, LogParams},
     config::{KubeConfigOptions, Kubeconfig},
 };
 use kube_runtime::watcher::{self, Event};
@@ -36,7 +36,10 @@ use tracing::{error, warn};
 
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
-use super::{ActionError, ActionExecutor, ActionResult, ResourceProvider};
+use super::{
+    ActionError, ActionExecutor, ActionResult, PodLogEvent, PodLogRequest, PodLogStream,
+    ResourceProvider,
+};
 
 #[derive(Debug, Clone)]
 pub struct KubeProviderOptions {
@@ -211,6 +214,53 @@ impl ResourceProvider for KubeResourceProvider {
         let namespace = self.namespace_by_context.get(context).cloned().flatten();
         spawn_watch_for_kind(client, context.to_string(), kind, namespace, tx);
         Ok(())
+    }
+
+    async fn stream_pod_logs(&self, request: PodLogRequest) -> anyhow::Result<PodLogStream> {
+        let client = self.client_for_context(&request.context).await?;
+        let (tx, rx) = mpsc::channel(1024);
+
+        let task = tokio::spawn(async move {
+            let api: Api<Pod> = Api::namespaced(client, &request.namespace);
+            let params = LogParams {
+                container: request.container.clone(),
+                follow: request.follow,
+                limit_bytes: None,
+                pretty: false,
+                previous: request.previous,
+                since_seconds: request.since_seconds,
+                since_time: None,
+                tail_lines: request.tail_lines,
+                timestamps: request.timestamps,
+            };
+
+            let stream = match api.log_stream(&request.pod, &params).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    let _ = tx.send(PodLogEvent::Error(err.to_string())).await;
+                    return;
+                }
+            };
+
+            let mut lines = stream.lines();
+            while let Some(line) = lines.next().await {
+                match line {
+                    Ok(line) => {
+                        if tx.send(PodLogEvent::Line(line)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = tx.send(PodLogEvent::Error(err.to_string())).await;
+                        return;
+                    }
+                }
+            }
+
+            let _ = tx.send(PodLogEvent::End).await;
+        });
+
+        Ok(PodLogStream { rx, task })
     }
 }
 

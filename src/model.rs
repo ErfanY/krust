@@ -88,6 +88,17 @@ impl ResourceKind {
             ResourceKind::PodDisruptionBudgets => "pdb",
         }
     }
+
+    pub fn is_namespaced(self) -> bool {
+        !matches!(
+            self,
+            ResourceKind::PersistentVolumes
+                | ResourceKind::Nodes
+                | ResourceKind::Namespaces
+                | ResourceKind::ClusterRoles
+                | ResourceKind::ClusterRoleBindings
+        )
+    }
 }
 
 impl fmt::Display for ResourceKind {

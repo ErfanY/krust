@@ -78,8 +78,13 @@ cancel = "esc"
 
 - `tab` / `shift+tab`: switch context tabs
 - `j` / `k` (or arrows): move selection, or scroll when viewing boxed text panes
+- `Enter`: on `Namespaces` selects namespace and returns to previous resource kind (fallback `Pods`); on resource tables opens describe
+- `w` in content box: toggle wrap on/off
+- when wrap is off: use left/right arrows for horizontal scroll
 - `/`: open command field in filter mode (type pattern and press `Enter`)
+- filter mode is realtime while typing; `Esc` cancels and restores previous filter
 - `:`: open command field in command mode
+- `tab` in command mode: autocomplete commands (and `:ctx` / `:kind` arguments)
 - `[` / `]`: command history back/forward
 - `-`: rerun previous command
 - `ctrl+a`: open resource alias list
@@ -89,12 +94,13 @@ cancel = "esc"
 - `ctrl+k`: k9s-style kill shortcut (mapped to guarded delete flow)
 - `esc`: close command/overlay and return focus
 - mouse wheel: scrolls inside overlay/detail/table box (terminal scrollback is not used)
+- top panes include live pod/cluster utilization from Pod requests/limits and Node allocatable
 
 ## Command Field
 
 Examples in the command field:
 
-- `:ctx` show contexts list in a selectable box (`j/k`, arrows, mouse wheel, `Enter` to switch)
+- `:ctx` show contexts list in a selectable box (`j/k`, arrows, mouse wheel, `/` filter, `Enter` to switch)
 - `:ctx <context-name>` switch active context
 - `:ns [namespace|all]` with arg sets namespace scope, without arg opens Namespaces
 - `:all` (or `:0`) switch to all namespaces
@@ -105,6 +111,7 @@ Examples in the command field:
 - `:po kube-system`, `:po /api`, `:po @my-context`, `:deploy -l app=my-api` are supported
 - `:po --context <context> --namespace <ns>` and `:po -A` are supported
 - `/pod-xxx` apply table filter
+- `Tab` autocompletes command names and context/kind arguments
 
 ## Watched Resource Kinds
 

@@ -73,6 +73,14 @@ impl StateStore {
         self.errors.get(context).map(String::as_str)
     }
 
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.errors.len()
+    }
+
     fn upsert(&mut self, entity: ResourceEntity) {
         let key = entity.key.clone();
 
