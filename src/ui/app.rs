@@ -22,7 +22,6 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
 };
@@ -43,6 +42,12 @@ use super::highlight::{json_spans_for_line, yaml_spans_for_line};
 use super::pulse::{
     activity_icon, ascii_meter, fixed_width_cell, format_pulse_cells, format_signed_count,
     ratio_percent_value, value_delta,
+};
+#[cfg(test)]
+use super::render::detect_color_support_from_env;
+use super::render::{
+    Severity, UiTheme, classify_status_severity, color_support_label, detect_color_support,
+    severity_style, severity_tag, status_style_for_line, ui_theme_for,
 };
 #[cfg(test)]
 use super::search::search_match_lines_in_logs;
@@ -354,161 +359,6 @@ const LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOG_DEFAULT_TAIL_LINES: i64 = 2_000;
 const LOG_MAX_EVENTS_PER_DRAIN: usize = 1_024;
 const PULSE_TAG_WIDTH: usize = 8;
-
-#[derive(Clone, Copy)]
-struct UiTheme {
-    header: Style,
-    block: Style,
-    table_header: Style,
-    row_highlight: Style,
-    row_ok: Style,
-    row_warn: Style,
-    row_err: Style,
-    status_ok: Style,
-    status_warn: Style,
-    status_err: Style,
-    help: Style,
-    command_active: Style,
-    command_idle: Style,
-}
-
-fn detect_color_support() -> ColorSupport {
-    detect_color_support_from_env(
-        env::var("NO_COLOR").ok().as_deref(),
-        env::var("COLORTERM").ok().as_deref(),
-        env::var("TERM").ok().as_deref(),
-    )
-}
-
-fn detect_color_support_from_env(
-    no_color: Option<&str>,
-    colorterm: Option<&str>,
-    term: Option<&str>,
-) -> ColorSupport {
-    if no_color.is_some() {
-        return ColorSupport::NoColor;
-    }
-    let colorterm = colorterm.unwrap_or("").to_ascii_lowercase();
-    if colorterm.contains("truecolor") || colorterm.contains("24bit") {
-        return ColorSupport::TrueColor;
-    }
-    let term = term.unwrap_or("").to_ascii_lowercase();
-    if term.contains("256color") {
-        return ColorSupport::Ansi256;
-    }
-    if term == "dumb" || term.is_empty() {
-        return ColorSupport::NoColor;
-    }
-    ColorSupport::Basic
-}
-
-fn ui_theme_for(support: ColorSupport) -> UiTheme {
-    match support {
-        ColorSupport::TrueColor => UiTheme {
-            header: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 242, 204))
-                .add_modifier(Modifier::BOLD),
-            block: Style::default().fg(Color::Rgb(238, 244, 255)),
-            table_header: Style::default()
-                .fg(Color::Rgb(255, 247, 214))
-                .add_modifier(Modifier::BOLD),
-            row_highlight: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(186, 223, 255))
-                .add_modifier(Modifier::BOLD),
-            row_ok: Style::default().fg(Color::Rgb(219, 252, 219)),
-            row_warn: Style::default().fg(Color::Rgb(255, 233, 168)),
-            row_err: Style::default().fg(Color::Rgb(255, 184, 184)),
-            status_ok: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(214, 245, 214)),
-            status_warn: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 235, 179)),
-            status_err: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 204, 204))
-                .add_modifier(Modifier::BOLD),
-            help: Style::default().fg(Color::Rgb(192, 208, 235)),
-            command_active: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(229, 242, 255))
-                .add_modifier(Modifier::BOLD),
-            command_idle: Style::default().fg(Color::Rgb(161, 180, 214)),
-        },
-        ColorSupport::Ansi256 => UiTheme {
-            header: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Indexed(229))
-                .add_modifier(Modifier::BOLD),
-            block: Style::default().fg(Color::Indexed(254)),
-            table_header: Style::default()
-                .fg(Color::Indexed(230))
-                .add_modifier(Modifier::BOLD),
-            row_highlight: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Indexed(117))
-                .add_modifier(Modifier::BOLD),
-            row_ok: Style::default().fg(Color::Indexed(120)),
-            row_warn: Style::default().fg(Color::Indexed(220)),
-            row_err: Style::default().fg(Color::Indexed(210)),
-            status_ok: Style::default().fg(Color::Black).bg(Color::Indexed(120)),
-            status_warn: Style::default().fg(Color::Black).bg(Color::Indexed(220)),
-            status_err: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Indexed(210))
-                .add_modifier(Modifier::BOLD),
-            help: Style::default().fg(Color::Indexed(145)),
-            command_active: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Indexed(153))
-                .add_modifier(Modifier::BOLD),
-            command_idle: Style::default().fg(Color::Indexed(109)),
-        },
-        ColorSupport::Basic => UiTheme {
-            header: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-            block: Style::default().fg(Color::White),
-            table_header: Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            row_highlight: Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            row_ok: Style::default().fg(Color::Green),
-            row_warn: Style::default().fg(Color::Yellow),
-            row_err: Style::default().fg(Color::Red),
-            status_ok: Style::default().fg(Color::Black).bg(Color::Green),
-            status_warn: Style::default().fg(Color::Black).bg(Color::Yellow),
-            status_err: Style::default().fg(Color::White).bg(Color::Red),
-            help: Style::default().fg(Color::DarkGray),
-            command_active: Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            command_idle: Style::default().fg(Color::DarkGray),
-        },
-        ColorSupport::NoColor => UiTheme {
-            header: Style::default().add_modifier(Modifier::BOLD),
-            block: Style::default(),
-            table_header: Style::default().add_modifier(Modifier::BOLD),
-            row_highlight: Style::default().add_modifier(Modifier::REVERSED),
-            row_ok: Style::default(),
-            row_warn: Style::default().add_modifier(Modifier::DIM),
-            row_err: Style::default().add_modifier(Modifier::BOLD),
-            status_ok: Style::default(),
-            status_warn: Style::default().add_modifier(Modifier::DIM),
-            status_err: Style::default().add_modifier(Modifier::BOLD),
-            help: Style::default().add_modifier(Modifier::DIM),
-            command_active: Style::default().add_modifier(Modifier::BOLD),
-            command_idle: Style::default().add_modifier(Modifier::DIM),
-        },
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LogTarget {
@@ -4759,84 +4609,6 @@ fn health_icon(failed: usize, pending: usize) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Severity {
-    Ok,
-    Warn,
-    Err,
-}
-
-fn classify_status_severity(status: &str) -> Severity {
-    let lower = status.to_ascii_lowercase();
-    if lower.contains("error")
-        || lower.contains("fail")
-        || lower.contains("crash")
-        || lower.contains("oom")
-        || lower.contains("forbidden")
-        || lower.contains("denied")
-        || lower.contains("blocked")
-        || lower.contains("evicted")
-        || lower.contains("terminated")
-    {
-        return Severity::Err;
-    }
-    if lower.contains("pending")
-        || lower.contains("unknown")
-        || lower.contains("waiting")
-        || lower.contains("init")
-        || lower.contains("terminating")
-        || lower.contains("notready")
-    {
-        return Severity::Warn;
-    }
-    Severity::Ok
-}
-
-fn severity_tag(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Ok => "[OK]",
-        Severity::Warn => "[!!]",
-        Severity::Err => "[XX]",
-    }
-}
-
-fn severity_style(theme: &UiTheme, severity: Severity) -> Style {
-    match severity {
-        Severity::Ok => theme.row_ok,
-        Severity::Warn => theme.row_warn,
-        Severity::Err => theme.row_err,
-    }
-}
-
-fn color_support_label(support: ColorSupport) -> &'static str {
-    match support {
-        ColorSupport::NoColor => "mono",
-        ColorSupport::Basic => "basic",
-        ColorSupport::Ansi256 => "256",
-        ColorSupport::TrueColor => "truecolor",
-    }
-}
-
-fn status_style_for_line(theme: &UiTheme, status: &str) -> Style {
-    let lower = status.to_ascii_lowercase();
-    if lower.contains("error")
-        || lower.contains("failed")
-        || lower.contains("denied")
-        || lower.contains("forbidden")
-        || lower.contains("blocked")
-    {
-        return theme.status_err;
-    }
-    if lower.contains("warn")
-        || lower.contains("retry")
-        || lower.contains("pending")
-        || lower.contains("paused")
-    {
-        return theme.status_warn;
-    }
-    theme.status_ok
-}
-
 fn context_filtered_indices(contexts: &[String], filter: &str) -> Vec<usize> {
     list_filtered_indices(contexts, filter)
 }
@@ -5869,5 +5641,67 @@ mod tests {
         let (selected, offset) = sync_table_viewport(5, 3, 10, 0);
         assert_eq!(selected, 0);
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn detail_scroll_clamps_to_content_bounds_after_draw() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        app.current_tab_mut().pane = Pane::Describe;
+        app.current_tab_mut().detail_wrap = false;
+        app.current_tab_mut().detail_scroll = u16::MAX;
+        app.current_tab_mut().detail_hscroll = u16::MAX;
+
+        let _ = render_snapshot(&mut app, 120, 40);
+        let tab = app.current_tab();
+        assert_eq!(tab.detail_scroll, 0);
+        assert_eq!(tab.detail_hscroll, 0);
+    }
+
+    #[test]
+    fn logs_scroll_clamps_to_content_bounds_after_draw() {
+        let mut app = test_app();
+        app.current_tab_mut().pane = Pane::Logs;
+        app.logs.auto_scroll = false;
+        app.push_log_line("[default/pod-a/main] line-1".to_string());
+        app.push_log_line("[default/pod-a/main] line-2".to_string());
+        app.current_tab_mut().detail_wrap = false;
+        app.current_tab_mut().detail_scroll = u16::MAX;
+        app.current_tab_mut().detail_hscroll = u16::MAX;
+
+        let _ = render_snapshot(&mut app, 120, 40);
+        let tab = app.current_tab();
+        assert_eq!(tab.detail_scroll, 0);
+        assert_eq!(tab.detail_hscroll, 0);
+    }
+
+    #[test]
+    fn table_scroll_offset_tracks_selection_when_moving_up() {
+        let mut app = test_app();
+        for idx in 0..150 {
+            app.store.apply(StateDelta::Upsert(mk_entity(
+                "ctx-dev",
+                ResourceKind::Pods,
+                Some("default"),
+                &format!("pod-{idx:03}"),
+                "Running",
+            )));
+        }
+        app.current_tab_mut().pane = Pane::Table;
+        app.current_tab_mut().selected = 120;
+        app.current_tab_mut().table_offset = 118;
+        let _ = render_snapshot(&mut app, 120, 20);
+
+        app.move_selection(-110);
+        let _ = render_snapshot(&mut app, 120, 20);
+        let tab = app.current_tab();
+        assert_eq!(tab.selected, 10);
+        assert!(tab.table_offset <= tab.selected);
     }
 }
