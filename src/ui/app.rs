@@ -302,6 +302,7 @@ struct App {
     readonly: bool,
     theme: UiTheme,
     color_support: ColorSupport,
+    pulse_metrics_cache: Option<CachedPulseMetrics>,
     pulse_snapshot: Option<PulseSnapshot>,
     pulse_last_change_at: Instant,
     pulse_last_revision: u64,
@@ -346,6 +347,33 @@ struct PulseSnapshot {
     running: usize,
     pending: usize,
     failed: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PulseMetrics {
+    running: usize,
+    pending: usize,
+    failed: usize,
+    other: usize,
+    scope_pods: PodResourceTotals,
+    cluster_pods: PodResourceTotals,
+    node_caps: NodeCapacityTotals,
+    deployments: usize,
+    replicasets: usize,
+    statefulsets: usize,
+    daemonsets: usize,
+    services: usize,
+    ingresses: usize,
+    jobs: usize,
+    cronjobs: usize,
+    pods: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedPulseMetrics {
+    key: UtilScopeKey,
+    revision: u64,
+    metrics: PulseMetrics,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -604,6 +632,49 @@ impl App {
         (running, pending, failed, other)
     }
 
+    fn pulse_metrics_for_tab(&mut self, tab: &ContextTabState) -> PulseMetrics {
+        let cache_key = UtilScopeKey {
+            context: tab.context.clone(),
+            namespace: tab.namespace.clone(),
+        };
+        let revision = self.store.revision();
+        if let Some(cached) = &self.pulse_metrics_cache
+            && cached.revision == revision
+            && cached.key == cache_key
+        {
+            return cached.metrics;
+        }
+
+        let (running, pending, failed, other) = self.pod_phase_counts_for_tab(tab);
+        let scope_pods = self.pod_resource_totals(&tab.context, tab.namespace.as_deref());
+        let cluster_pods = self.pod_resource_totals(&tab.context, None);
+        let node_caps = self.node_capacity_totals(&tab.context);
+        let metrics = PulseMetrics {
+            running,
+            pending,
+            failed,
+            other,
+            scope_pods,
+            cluster_pods,
+            node_caps,
+            deployments: self.count_kind_for_tab(tab, ResourceKind::Deployments),
+            replicasets: self.count_kind_for_tab(tab, ResourceKind::ReplicaSets),
+            statefulsets: self.count_kind_for_tab(tab, ResourceKind::StatefulSets),
+            daemonsets: self.count_kind_for_tab(tab, ResourceKind::DaemonSets),
+            services: self.count_kind_for_tab(tab, ResourceKind::Services),
+            ingresses: self.count_kind_for_tab(tab, ResourceKind::Ingresses),
+            jobs: self.count_kind_for_tab(tab, ResourceKind::Jobs),
+            cronjobs: self.count_kind_for_tab(tab, ResourceKind::CronJobs),
+            pods: self.count_kind_for_tab(tab, ResourceKind::Pods),
+        };
+        self.pulse_metrics_cache = Some(CachedPulseMetrics {
+            key: cache_key,
+            revision,
+            metrics,
+        });
+        metrics
+    }
+
     fn active_filter_value(&self) -> String {
         if let Some(overlay) = &self.overlay {
             match overlay {
@@ -757,6 +828,7 @@ impl App {
             readonly,
             theme: ui_theme_for(color_support),
             color_support,
+            pulse_metrics_cache: None,
             pulse_snapshot: None,
             pulse_last_change_at: now,
             pulse_last_revision: 0,
@@ -2663,6 +2735,42 @@ mod tests {
         let _ = ui_theme_for(ColorSupport::Basic);
         let _ = ui_theme_for(ColorSupport::Ansi256);
         let _ = ui_theme_for(ColorSupport::TrueColor);
+    }
+
+    #[test]
+    fn pulse_metrics_cache_reuses_revision_and_invalidates_on_store_change() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        let tab = app.current_tab().clone();
+        let first = app.pulse_metrics_for_tab(&tab);
+        assert_eq!(first.pods, 1);
+
+        {
+            let cache = app
+                .pulse_metrics_cache
+                .as_mut()
+                .expect("pulse metrics cache after first compute");
+            cache.metrics.pods = 777;
+        }
+
+        let cached = app.pulse_metrics_for_tab(&tab);
+        assert_eq!(cached.pods, 777);
+
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-b",
+            "Running",
+        )));
+        let recomputed = app.pulse_metrics_for_tab(&tab);
+        assert_eq!(recomputed.pods, 2);
     }
 
     #[test]

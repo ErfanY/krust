@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+      - '*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to publish (for example: v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -67,6 +74,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
         with:
@@ -74,8 +84,44 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Create release and upload artifacts
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*.tar.gz
-          generate_release_notes: true
+      - name: Resolve release tag/version
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [[ -z "${TAG}" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 *.tar.gz > SHA256SUMS
+
+      - name: Generate Homebrew formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/generate_homebrew_formula.sh \
+            --version "${{ steps.meta.outputs.version }}" \
+            --checksums dist/SHA256SUMS \
+            --output dist/krust.rb
+
+      - name: Create or update release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/*.tar.gz dist/SHA256SUMS dist/krust.rb --clobber
+          else
+            gh release create "${TAG}" dist/*.tar.gz dist/SHA256SUMS dist/krust.rb --generate-notes --title "${TAG}"
+          fi

@@ -84,22 +84,26 @@ impl App {
             ));
         }
 
-        let (running, pending, failed, _other) = self.pod_phase_counts_for_tab(&active);
-        let scope_pods = self.pod_resource_totals(&active.context, active.namespace.as_deref());
-        let cluster_pods = self.pod_resource_totals(&active.context, None);
-        let node_caps = self.node_capacity_totals(&active.context);
+        let pulse_metrics = self.pulse_metrics_for_tab(&active);
+        let running = pulse_metrics.running;
+        let pending = pulse_metrics.pending;
+        let failed = pulse_metrics.failed;
+        let _other = pulse_metrics.other;
+        let scope_pods = pulse_metrics.scope_pods;
+        let cluster_pods = pulse_metrics.cluster_pods;
+        let node_caps = pulse_metrics.node_caps;
         let cpu_pct = percent(cluster_pods.cpu_request_m, node_caps.cpu_alloc_m);
         let mem_pct = percent(cluster_pods.mem_request_b, node_caps.mem_alloc_b);
         let pod_pct = percent(cluster_pods.pods as u64, node_caps.pod_alloc);
-        let deployments = self.count_kind_for_tab(&active, ResourceKind::Deployments);
-        let replicasets = self.count_kind_for_tab(&active, ResourceKind::ReplicaSets);
-        let statefulsets = self.count_kind_for_tab(&active, ResourceKind::StatefulSets);
-        let daemonsets = self.count_kind_for_tab(&active, ResourceKind::DaemonSets);
-        let services = self.count_kind_for_tab(&active, ResourceKind::Services);
-        let ingresses = self.count_kind_for_tab(&active, ResourceKind::Ingresses);
-        let jobs = self.count_kind_for_tab(&active, ResourceKind::Jobs);
-        let cronjobs = self.count_kind_for_tab(&active, ResourceKind::CronJobs);
-        let pods = self.count_kind_for_tab(&active, ResourceKind::Pods);
+        let deployments = pulse_metrics.deployments;
+        let replicasets = pulse_metrics.replicasets;
+        let statefulsets = pulse_metrics.statefulsets;
+        let daemonsets = pulse_metrics.daemonsets;
+        let services = pulse_metrics.services;
+        let ingresses = pulse_metrics.ingresses;
+        let jobs = pulse_metrics.jobs;
+        let cronjobs = pulse_metrics.cronjobs;
+        let pods = pulse_metrics.pods;
 
         let scope_label = active.namespace.as_deref().unwrap_or("all namespaces");
         let watch_error = self.store.error_for_context(&active.context);

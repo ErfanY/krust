@@ -84,6 +84,13 @@ sudo install krust-x86_64-unknown-linux-gnu/krust /usr/local/bin/krust
 cargo install --git https://github.com/ErfanY/krust.git --locked krust
 ```
 
+### Homebrew (tap-based)
+
+```bash
+brew tap ErfanY/krust
+brew install krust
+```
+
 ### Build locally
 
 ```bash

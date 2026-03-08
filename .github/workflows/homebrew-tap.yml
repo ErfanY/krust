@@ -1,0 +1,104 @@
+name: Homebrew Tap Sync
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sync (for example: v0.1.0)"
+        required: true
+        type: string
+      tap_repo:
+        description: "Tap repo (owner/name), defaults to ErfanY/homebrew-krust"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Update tap formula
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag }}"
+          if [[ -z "${TAG}" ]]; then
+            TAG="${{ github.event.release.tag_name }}"
+          fi
+          if [[ -z "${TAG}" ]]; then
+            echo "Unable to resolve release tag" >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          TAP_REPO="${{ github.event.inputs.tap_repo }}"
+          if [[ -z "${TAP_REPO}" ]]; then
+            TAP_REPO="ErfanY/homebrew-krust"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tap_repo=${TAP_REPO}" >> "${GITHUB_OUTPUT}"
+
+      - name: Download SHA256SUMS from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "SHA256SUMS" \
+            --dir dist
+
+      - name: Generate formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release/generate_homebrew_formula.sh \
+            --version "${{ steps.meta.outputs.version }}" \
+            --checksums dist/SHA256SUMS \
+            --output dist/krust.rb
+
+      - name: Push formula to tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_TOKEN}" ]]; then
+            echo "Missing HOMEBREW_TAP_GITHUB_TOKEN secret" >&2
+            exit 1
+          fi
+          TAP_REPO="${{ steps.meta.outputs.tap_repo }}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Formula
+          cp dist/krust.rb tap/Formula/krust.rb
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- Formula/krust.rb; then
+            echo "No tap update required"
+            exit 0
+          fi
+
+          git add Formula/krust.rb
+          git commit -m "krust ${VERSION}"
+          git push
