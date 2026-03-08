@@ -1,44 +1,136 @@
-# krs
+# krust
 
-High-performance Kubernetes terminal navigator in Rust.
+[![CI](https://github.com/ErfanY/krust/actions/workflows/ci.yml/badge.svg)](https://github.com/ErfanY/krust/actions/workflows/ci.yml)
+[![Release](https://github.com/ErfanY/krust/actions/workflows/release.yml/badge.svg)](https://github.com/ErfanY/krust/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Kubernetes 1.33+](https://img.shields.io/badge/Kubernetes-1.33%2B-326CE5?logo=kubernetes&logoColor=white)](https://kubernetes.io/)
 
-Built against `k8s-openapi` `v1_33` (targeting Kubernetes `1.33+` clusters).
+`krust` is a latency-first Kubernetes terminal navigator for operators who work across many clusters and large resource sets.
 
-## Current Status
+It is intentionally focused on fast core workflows (navigation, inspect, logs, safe edits/actions) with high k9s shortcut compatibility, while keeping API pressure and UI jitter under control.
 
-`krs` now includes a working foundation for the plan:
+Built with Rust (`tokio`, `kube`, `kube_runtime`, `ratatui`) and compiled against Kubernetes `1.33+` APIs (`k8s-openapi` `v1_33`).
 
-- Layered architecture: `cluster IO` -> `state cache` -> `view projector` -> `TUI renderer`
-- Multi-context tabs in one session
-- Lazy watch activation with active-context watch plans (inactive context watchers are paused)
-- Event-driven state deltas over bounded channels
-- Invalidation-based rendering with FPS cap
-- Kubernetes watch streams for a broad set of core resource kinds
-- k9s-style keyboard navigation, filter/sort, table + describe/events/logs panes
-- Safe mutation workflow with confirmation (`delete` implemented for Pods)
-- `config.toml` and `keymap.toml` loading
+## Why krust
 
-## CLI
+Most terminal Kubernetes tools become noisy or sluggish when context count and watch volume grow. `krust` is designed around a different default:
+
+- activate only the watch scope needed for what you are currently looking at
+- keep render work invalidation-driven with a frame cap
+- keep logs bounded and stream-focused
+- treat RBAC denials and API turbulence as normal operational states
+
+This is also why plugins are out of scope for v1: predictable latency and operational clarity come first.
+
+## Scope and Non-Goals
+
+What `krust` is:
+
+- keyboard-first multi-context Kubernetes navigator
+- read-heavy operations with guarded mutations
+- high-signal terminal UI for SRE/platform workflows
+
+What `krust` is not:
+
+- a plugin/script execution platform
+- a replacement for full GitOps pipelines or IDE workflows
+- a "watch everything everywhere" cluster crawler at startup
+
+## Feature Matrix
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Multi-context session | Implemented | Context tabs with fast switching and warm-context retention |
+| Namespace scoping | Implemented | Namespace picker and `all` namespace mode |
+| Core resource browser | Implemented | Pods, Deployments, RS, STS, DS, Services, Ingresses, ConfigMaps, Secrets, Jobs, CronJobs, PVC/PV, Nodes, Namespaces, Events, SA, Roles, RB/CR/CRB, NetPol, HPA, PDB |
+| Describe pane | Implemented | YAML/JSON view toggle with syntax highlighting |
+| Secret decode pane | Implemented | Decoded view + edit/apply with automatic base64 re-encode |
+| Logs pane | Implemented | Streaming with pause/tail/source filtering; pod multi-container and deploy/rs replica fan-out |
+| Edit/apply | Implemented | External editor flow from describe/decode panes |
+| Delete action | Implemented | Guarded delete path (currently Pods) |
+| k9s-style commands/aliases | Partial parity | Core resource commands and navigation implemented; plugin commands intentionally out of scope |
+| Plugin subsystem | Out of scope | Deliberately excluded for performance and simplicity |
+
+## Compatibility
+
+- OS: macOS, Linux
+- Kubernetes: `1.33+`
+- Auth: standard kubeconfig + exec auth providers
+- Terminal: basic color through truecolor; OSC52 clipboard fallback supported
+
+## Installation and Quick Start
+
+### Install from GitHub Releases (recommended)
+
+Prebuilt archives are published for:
+
+- `x86_64-unknown-linux-gnu`
+- `x86_64-apple-darwin`
+- `aarch64-apple-darwin`
+
+Example (Linux x86_64):
 
 ```bash
-krs
-krs --context dev-cluster
-krs --namespace payments
-krs --readonly
-krs --kubeconfig ~/.kube/config
-krs --all-contexts   # optional eager auth/client warmup across contexts
+curl -L -o krust.tar.gz \
+  https://github.com/ErfanY/krust/releases/latest/download/krust-x86_64-unknown-linux-gnu.tar.gz
+
+tar -xzf krust.tar.gz
+sudo install krust-x86_64-unknown-linux-gnu/krust /usr/local/bin/krust
 ```
 
-## Config
+### Install from source
 
-`~/.config/krs/config.toml`
+```bash
+cargo install --git https://github.com/ErfanY/krust.git --locked krust
+```
+
+### Build locally
+
+```bash
+cargo build --release
+```
+
+Binary path:
+
+```bash
+target/release/krust
+```
+
+### Run
+
+```bash
+krust
+krust --context <context-name>
+krust --namespace <namespace>
+krust --readonly
+krust --kubeconfig <path>
+krust --all-contexts
+```
+
+### CLI flags
+
+- `--context`: initial context
+- `--namespace`: initial namespace scope
+- `--readonly`: disable mutations
+- `--kubeconfig`: explicit kubeconfig path
+- `--all-contexts`: eager auth/client warmup across all contexts
+
+## Configuration
+
+Runtime/UI config path:
+
+- `~/.config/krust/config.toml`
+
+Keymap override path:
+
+- `~/.config/krust/keymap.toml`
+
+Example `config.toml`:
 
 ```toml
 [runtime]
 fps_limit = 60
 delta_channel_capacity = 2048
-namespace = "default"
-default_context = "dev-cluster"
 warm_contexts = 1
 warm_context_ttl_secs = 20
 
@@ -47,94 +139,116 @@ theme = "default"
 show_help = true
 ```
 
-## Keymap
+Defaults for initial context/namespace come from kubeconfig unless CLI flags override them.
 
-`~/.config/krs/keymap.toml`
+## Quick UX Reference
 
-```toml
-quit = "ctrl+c"
-next_context = "tab"
-prev_context = "shift+tab"
-next_kind = "alt+right"
-prev_kind = "alt+left"
-move_down = "j"
-move_up = "k"
-goto_top = "g"
-goto_bottom = "shift+g"
-filter_mode = "/"
-cycle_sort = "s"
-toggle_desc = "r"
-cycle_namespace = "n"
-toggle_help = "?"
-to_table = "t"
-toggle_describe = "d"
-to_events = "shift+e"
-to_logs = "l"
-delete = "ctrl+d"
-confirm = "y"
-cancel = "esc"
-```
-
-## Default Navigation
+### Core navigation
 
 - `tab` / `shift+tab`: switch context tabs
-- `j` / `k` (or arrows): move selection, or scroll when viewing boxed text panes
-- `Enter`: on `Namespaces` selects namespace and returns to previous resource kind (fallback `Pods`); on resource tables opens describe
-- `w` in content box: toggle wrap on/off
-- when wrap is off: use left/right arrows for horizontal scroll
-- `/`: open command field in filter mode (type pattern and press `Enter`)
-- filter mode is realtime while typing; `Esc` cancels and restores previous filter
-- `:`: open command field in command mode
-- `tab` in command mode: autocomplete commands (and `:ctx` / `:kind` arguments)
-- `[` / `]`: command history back/forward
-- `-`: rerun previous command
-- `ctrl+a`: open resource alias list
-- `d`: toggle describe pane
-- `v`: k9s-style view (opens detail view)
-- `ctrl+d`: delete selected resource (with confirmation)
-- `ctrl+k`: k9s-style kill shortcut (mapped to guarded delete flow)
-- `esc`: close command/overlay and return focus
-- mouse wheel: scrolls inside overlay/detail/table box (terminal scrollback is not used)
-- top panes include live pod/cluster utilization from Pod requests/limits and Node allocatable
+- `j` / `k` (or arrows): move in tables, scroll in detail panes
+- `Enter`: select namespace in namespace view, otherwise open describe
+- `d`: describe
+- `ctrl+d`: delete (guarded)
+- `x`: secret decode view toggle
+- `l`: logs pane
+- `s`: log tail toggle
+- `p`: pause/resume logs
+- `S`: log source selector
+- `c`: container selector
 
-## Command Field
+### Search and command bar
 
-Examples in the command field:
+- `/`: filter in table/overlay panes, search in detail/log panes
+- `?`: detail/search shortcut
+- `n` / `N`: next/previous search match in detail/log panes
+- `:`: command mode (`:ctx`, `:ns`, `:po`, `:kind`, `:edit`, `:fmt`, etc.)
+- `tab` in command mode: autocomplete
+- `ctrl+w` in command/filter mode: delete previous word
 
-- `:ctx` show contexts list in a selectable box (`j/k`, arrows, mouse wheel, `/` filter, `Enter` to switch)
-- `:ctx <context-name>` switch active context
-- `:ns [namespace|all]` with arg sets namespace scope, without arg opens Namespaces
-- `:all` (or `:0`) switch to all namespaces
-- `:kind <po|deploy|svc|...>` switch resource kind
-- `:po`, `:svc`, `:deploy`, `:ns`, ... k9s-style direct resource switches
-- `:resources` show shorthand resource aliases
-- `:clear` clear current filter
-- `:po kube-system`, `:po /api`, `:po @my-context`, `:deploy -l app=my-api` are supported
-- `:po --context <context> --namespace <ns>` and `:po -A` are supported
-- `/pod-xxx` apply table filter
-- `Tab` autocompletes command names and context/kind arguments
+### Detail viewing
 
-## Watched Resource Kinds
+- `w`: wrap toggle
+- left/right: horizontal scroll (wrap off)
+- `gg` / `G`: top/bottom
+- `ctrl+u` / `ctrl+d`: half-page up/down
+- `y`: copy current view
+- `:dump <path>`: write current view to file
 
-Pods, Deployments, ReplicaSets, StatefulSets, DaemonSets, Services, Ingresses, ConfigMaps,
-Secrets, Jobs, CronJobs, PVCs, PVs, Nodes, Namespaces, Events, ServiceAccounts, Roles,
-RoleBindings, ClusterRoles, ClusterRoleBindings, NetworkPolicies, HPAs, PDBs.
+### Format and edit
 
-## Architecture Notes
+- `:fmt yaml|json` or `:yaml` / `:json`
+- `e` or `:edit [yaml|json]`
 
-- `ResourceProvider` and `ActionExecutor` are stable internal interfaces.
-- `StateDelta` is the boundary from cluster runtime to UI state.
-- `ViewProjector` isolates table/detail projections from storage and rendering.
-- Watch loops reconnect with exponential backoff and emit contextual error deltas.
-- Context list is loaded from kubeconfig, but clients/watches are activated lazily on demand.
-- Watchers are reconciled to the active tab/pane scope (context + kind + namespace) to avoid fan-out.
-- One recently used context can be kept warm for fast tab switches (TTL-based).
-- `--all-contexts` enables eager client warmup across contexts.
-- `403 Forbidden` watchers are disabled per resource/context (no infinite retry flood).
+## Architecture Overview
 
-## Next Milestones
+`krust` uses a layered architecture to isolate cluster IO, state mutation, projection, and rendering.
 
-1. Add live pod logs streaming and resource-correlated event pane.
-2. Expand mutation actions (scale/restart/apply/edit/port-forward/exec) with RBAC-aware UX.
-3. Add integration tests against disposable clusters and load/perf benchmarks.
-4. Harden CRD discovery and generic resource browsing.
+```mermaid
+flowchart LR
+    A["Kubernetes API\n(list/watch/logs/actions)"] --> B["ResourceProvider\nwatch + stream + action adapters"]
+    B --> C["StateDelta channel\n(bounded)"]
+    C --> D["StateStore\nnormalized entities + indexes"]
+    D --> E["ViewProjector\nactive-view projection"]
+    E --> F["TUI Renderer\ninvalidated draws + FPS cap"]
+    F --> G["Operator Input\nkeys, commands, filters"]
+    G --> E
+    G --> B
+```
+
+Design details are documented in:
+
+- [`docs/architecture.md`](docs/architecture.md)
+- [`docs/performance.md`](docs/performance.md)
+
+## Performance Model (Operator-Facing)
+
+`krust` prioritizes consistent interactivity over maximum background data ingestion.
+
+- watch scope is reconciled to active context/pane needs
+- recently used contexts can stay warm with TTL
+- render loop is invalidation-driven with FPS cap
+- logs are ring-buffered with source filtering and bounded drain
+- forbidden RBAC watches are disabled for that context/resource (no retry floods)
+
+For deeper technical details and tuning guidance, see [`docs/performance.md`](docs/performance.md).
+
+## Safety Model
+
+- `--readonly` blocks mutating actions
+- destructive action path is confirmation-guarded
+- RBAC/action failures are surfaced with explicit status messaging
+- secret decode editing converts decoded values back to base64 automatically
+
+## Troubleshooting
+
+### `403 Forbidden` warnings for some resources
+
+This is usually expected RBAC scope mismatch. `krust` disables forbidden watchers for that resource/context to avoid reconnect storms.
+
+### Long startup with many contexts
+
+Default mode is lazy. If startup still feels heavy, avoid `--all-contexts` and keep `warm_contexts` low.
+
+### Clipboard copy issues
+
+`krust` uses platform-native commands first (`pbcopy` / `wl-copy` / `xclip` / `xsel`) and falls back to OSC52 where supported.
+
+### Auth works in shell but not in app environment
+
+Ensure your terminal session has the same kube auth env/credentials as your shell where `kubectl` succeeds.
+
+## Contributing
+
+Contribution guide, PR standards, and performance review expectations live in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+## Roadmap (Near Term)
+
+- wider mutation action set (scale/restart/etc.) with guardrails
+- richer event correlation for non-Event resources
+- expanded integration and load benchmarks
+- continued k9s command/keybinding compatibility tightening
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

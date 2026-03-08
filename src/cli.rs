@@ -4,7 +4,7 @@ use clap::Parser;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "krs",
+    name = "krust",
     version,
     about = "High-performance Kubernetes terminal navigator"
 )]

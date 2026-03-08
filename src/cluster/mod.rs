@@ -75,4 +75,9 @@ pub trait ResourceProvider: Send + Sync {
 #[async_trait]
 pub trait ActionExecutor: Send + Sync {
     async fn delete_resource(&self, key: &ResourceKey) -> Result<ActionResult, ActionError>;
+    async fn replace_resource(
+        &self,
+        key: &ResourceKey,
+        manifest: serde_json::Value,
+    ) -> Result<ActionResult, ActionError>;
 }

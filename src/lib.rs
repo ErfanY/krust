@@ -31,10 +31,6 @@ pub async fn run() -> anyhow::Result<()> {
             kubeconfig: cli.kubeconfig.clone(),
             context: cli.context.clone(),
             all_contexts: cli.all_contexts,
-            namespace: cli
-                .namespace
-                .clone()
-                .or(app_config.runtime.namespace.clone()),
             readonly: cli.readonly,
             warm_contexts: app_config.runtime.warm_contexts,
             warm_context_ttl_secs: app_config.runtime.warm_context_ttl_secs,
@@ -44,14 +40,24 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     let contexts = provider.context_names().to_vec();
+    let context_default_namespaces = contexts
+        .iter()
+        .map(|context| {
+            (
+                context.clone(),
+                provider.default_namespace_for_context(context.as_str()),
+            )
+        })
+        .collect();
     let initial_context = cli
         .context
-        .or(app_config.runtime.default_context)
         .or_else(|| provider.default_context().map(str::to_string))
         .or_else(|| contexts.first().cloned())
         .context("could not determine initial context")?;
 
-    let initial_namespace = cli.namespace.or(app_config.runtime.namespace);
+    let initial_namespace = cli
+        .namespace
+        .or_else(|| provider.default_namespace_for_context(&initial_context));
 
     let (tx, rx) = mpsc::channel(app_config.runtime.delta_channel_capacity);
     provider.start(tx).await?;
@@ -63,6 +69,7 @@ pub async fn run() -> anyhow::Result<()> {
         contexts,
         initial_context,
         initial_namespace,
+        context_default_namespaces,
         rx,
         action_executor,
         resource_provider,

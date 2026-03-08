@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# macOS Finder artifacts
+.DS_Store
+**/.DS_Store

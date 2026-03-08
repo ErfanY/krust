@@ -199,6 +199,7 @@ pub struct PendingConfirmation {
 pub enum Pane {
     Table,
     Describe,
+    SecretDecode,
     Events,
     Logs,
 }

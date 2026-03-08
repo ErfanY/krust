@@ -26,8 +26,9 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::{DeleteParams, LogParams},
+    api::{DeleteParams, LogParams, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
+    core::{ApiResource, DynamicObject, GroupVersionKind},
 };
 use kube_runtime::watcher::{self, Event};
 use serde::Serialize;
@@ -46,7 +47,6 @@ pub struct KubeProviderOptions {
     pub kubeconfig: Option<PathBuf>,
     pub context: Option<String>,
     pub all_contexts: bool,
-    pub namespace: Option<String>,
     pub readonly: bool,
     pub warm_contexts: usize,
     pub warm_context_ttl_secs: u64,
@@ -172,6 +172,15 @@ impl KubeResourceProvider {
         clients.insert(context.to_string(), client.clone());
         Ok(client)
     }
+
+    pub fn default_namespace_for_context(&self, context: &str) -> Option<String> {
+        self.kubeconfig
+            .contexts
+            .iter()
+            .find(|named| named.name == context)
+            .and_then(|named| named.context.as_ref())
+            .and_then(|ctx| ctx.namespace.clone())
+    }
 }
 
 #[async_trait]
@@ -239,10 +248,8 @@ impl ResourceProvider for KubeResourceProvider {
             } else {
                 warm_contexts.contains(&key.context)
             };
-            if !keep_existing {
-                if let Some(task) = watched.remove(&key) {
-                    task.abort();
-                }
+            if !keep_existing && let Some(task) = watched.remove(&key) {
+                task.abort();
             }
         }
 
@@ -367,6 +374,228 @@ impl ActionExecutor for KubeResourceProvider {
             ))),
         }
     }
+
+    async fn replace_resource(
+        &self,
+        key: &ResourceKey,
+        manifest: serde_json::Value,
+    ) -> Result<ActionResult, ActionError> {
+        if self.readonly {
+            return Err(ActionError::ReadOnly);
+        }
+
+        let client = self
+            .client_for_context(&key.context)
+            .await
+            .map_err(|err| ActionError::Failed(err.to_string()))?;
+
+        let spec = api_resource_spec_for_kind(key.kind).ok_or_else(|| {
+            ActionError::Unsupported(format!("replace {} is not implemented yet", key.kind))
+        })?;
+        let gvk = GroupVersionKind::gvk(spec.group, spec.version, spec.kind);
+        let mut ar = ApiResource::from_gvk(&gvk);
+        ar.plural = spec.plural.to_string();
+        let obj: DynamicObject = serde_json::from_value(manifest)
+            .map_err(|err| ActionError::Failed(format!("invalid manifest: {err}")))?;
+
+        if spec.namespaced {
+            let namespace = key.namespace.as_deref().unwrap_or("default");
+            let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
+            api.replace(&key.name, &PostParams::default(), &obj)
+                .await
+                .map_err(map_kube_error)?;
+        } else {
+            let api: Api<DynamicObject> = Api::all_with(client, &ar);
+            api.replace(&key.name, &PostParams::default(), &obj)
+                .await
+                .map_err(map_kube_error)?;
+        }
+
+        Ok(ActionResult {
+            message: format!("{} {} updated", key.kind.short_name(), key.name),
+        })
+    }
+}
+
+struct ApiResourceSpec {
+    group: &'static str,
+    version: &'static str,
+    kind: &'static str,
+    plural: &'static str,
+    namespaced: bool,
+}
+
+fn api_resource_spec_for_kind(kind: ResourceKind) -> Option<ApiResourceSpec> {
+    Some(match kind {
+        ResourceKind::Pods => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Pod",
+            plural: "pods",
+            namespaced: true,
+        },
+        ResourceKind::Deployments => ApiResourceSpec {
+            group: "apps",
+            version: "v1",
+            kind: "Deployment",
+            plural: "deployments",
+            namespaced: true,
+        },
+        ResourceKind::ReplicaSets => ApiResourceSpec {
+            group: "apps",
+            version: "v1",
+            kind: "ReplicaSet",
+            plural: "replicasets",
+            namespaced: true,
+        },
+        ResourceKind::StatefulSets => ApiResourceSpec {
+            group: "apps",
+            version: "v1",
+            kind: "StatefulSet",
+            plural: "statefulsets",
+            namespaced: true,
+        },
+        ResourceKind::DaemonSets => ApiResourceSpec {
+            group: "apps",
+            version: "v1",
+            kind: "DaemonSet",
+            plural: "daemonsets",
+            namespaced: true,
+        },
+        ResourceKind::Services => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Service",
+            plural: "services",
+            namespaced: true,
+        },
+        ResourceKind::Ingresses => ApiResourceSpec {
+            group: "networking.k8s.io",
+            version: "v1",
+            kind: "Ingress",
+            plural: "ingresses",
+            namespaced: true,
+        },
+        ResourceKind::ConfigMaps => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "ConfigMap",
+            plural: "configmaps",
+            namespaced: true,
+        },
+        ResourceKind::Secrets => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Secret",
+            plural: "secrets",
+            namespaced: true,
+        },
+        ResourceKind::Jobs => ApiResourceSpec {
+            group: "batch",
+            version: "v1",
+            kind: "Job",
+            plural: "jobs",
+            namespaced: true,
+        },
+        ResourceKind::CronJobs => ApiResourceSpec {
+            group: "batch",
+            version: "v1",
+            kind: "CronJob",
+            plural: "cronjobs",
+            namespaced: true,
+        },
+        ResourceKind::PersistentVolumeClaims => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "PersistentVolumeClaim",
+            plural: "persistentvolumeclaims",
+            namespaced: true,
+        },
+        ResourceKind::PersistentVolumes => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "PersistentVolume",
+            plural: "persistentvolumes",
+            namespaced: false,
+        },
+        ResourceKind::Nodes => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Node",
+            plural: "nodes",
+            namespaced: false,
+        },
+        ResourceKind::Namespaces => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Namespace",
+            plural: "namespaces",
+            namespaced: false,
+        },
+        ResourceKind::Events => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "Event",
+            plural: "events",
+            namespaced: true,
+        },
+        ResourceKind::ServiceAccounts => ApiResourceSpec {
+            group: "",
+            version: "v1",
+            kind: "ServiceAccount",
+            plural: "serviceaccounts",
+            namespaced: true,
+        },
+        ResourceKind::Roles => ApiResourceSpec {
+            group: "rbac.authorization.k8s.io",
+            version: "v1",
+            kind: "Role",
+            plural: "roles",
+            namespaced: true,
+        },
+        ResourceKind::RoleBindings => ApiResourceSpec {
+            group: "rbac.authorization.k8s.io",
+            version: "v1",
+            kind: "RoleBinding",
+            plural: "rolebindings",
+            namespaced: true,
+        },
+        ResourceKind::ClusterRoles => ApiResourceSpec {
+            group: "rbac.authorization.k8s.io",
+            version: "v1",
+            kind: "ClusterRole",
+            plural: "clusterroles",
+            namespaced: false,
+        },
+        ResourceKind::ClusterRoleBindings => ApiResourceSpec {
+            group: "rbac.authorization.k8s.io",
+            version: "v1",
+            kind: "ClusterRoleBinding",
+            plural: "clusterrolebindings",
+            namespaced: false,
+        },
+        ResourceKind::NetworkPolicies => ApiResourceSpec {
+            group: "networking.k8s.io",
+            version: "v1",
+            kind: "NetworkPolicy",
+            plural: "networkpolicies",
+            namespaced: true,
+        },
+        ResourceKind::HorizontalPodAutoscalers => ApiResourceSpec {
+            group: "autoscaling",
+            version: "v2",
+            kind: "HorizontalPodAutoscaler",
+            plural: "horizontalpodautoscalers",
+            namespaced: true,
+        },
+        ResourceKind::PodDisruptionBudgets => ApiResourceSpec {
+            group: "policy",
+            version: "v1",
+            kind: "PodDisruptionBudget",
+            plural: "poddisruptionbudgets",
+            namespaced: true,
+        },
+    })
 }
 
 fn load_kubeconfig(path: Option<&PathBuf>) -> anyhow::Result<Kubeconfig> {

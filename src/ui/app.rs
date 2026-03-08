@@ -1,6 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    env, io,
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    env, fs,
+    io::{self, Write},
+    path::PathBuf,
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -45,10 +48,13 @@ struct ContextTabState {
     namespace: Option<String>,
     filter: String,
     detail_filter: String,
+    detail_active_match_line: Option<usize>,
     selected: usize,
+    table_offset: usize,
     detail_scroll: u16,
     detail_hscroll: u16,
     detail_wrap: bool,
+    detail_format: DetailFormat,
     kind_idx: usize,
     last_non_namespace_kind_idx: usize,
     sort: SortColumn,
@@ -66,6 +72,33 @@ impl ContextTabState {
 enum CommandMode {
     Command,
     Filter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailFormat {
+    Yaml,
+    Json,
+}
+
+impl DetailFormat {
+    fn label(self) -> &'static str {
+        match self {
+            DetailFormat::Yaml => "yaml",
+            DetailFormat::Json => "json",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        self.label()
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        match token.to_ascii_lowercase().as_str() {
+            "yaml" | "yml" => Some(DetailFormat::Yaml),
+            "json" => Some(DetailFormat::Json),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -120,10 +153,12 @@ enum Overlay {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     contexts: Vec<String>,
     initial_context: String,
     initial_namespace: Option<String>,
+    context_default_namespaces: HashMap<String, Option<String>>,
     mut delta_rx: mpsc::Receiver<StateDelta>,
     action_executor: Arc<dyn ActionExecutor>,
     resource_provider: Arc<dyn ResourceProvider>,
@@ -146,6 +181,7 @@ pub async fn run(
         contexts,
         initial_context,
         initial_namespace,
+        context_default_namespaces,
         action_executor,
         resource_provider,
         keymap,
@@ -742,7 +778,11 @@ impl App {
         if tab.pane == Pane::Table {
             tab.filter = filter;
         } else {
+            let changed = tab.detail_filter != filter;
             tab.detail_filter = filter;
+            if changed {
+                tab.detail_active_match_line = None;
+            }
         }
     }
 
@@ -752,6 +792,30 @@ impl App {
         }
         self.set_active_filter_value(String::new());
         true
+    }
+
+    fn active_filter_label(&self) -> &'static str {
+        if let Some(overlay) = &self.overlay {
+            return match overlay {
+                Overlay::Contexts { .. }
+                | Overlay::Containers { .. }
+                | Overlay::LogSources { .. } => "Filter",
+                Overlay::Text { .. } => "Search",
+            };
+        }
+        if self.current_tab().pane == Pane::Table {
+            "Filter"
+        } else {
+            "Search"
+        }
+    }
+
+    fn filter_status_message(&self, value: &str) -> String {
+        if value.is_empty() {
+            format!("{} cleared", self.active_filter_label())
+        } else {
+            format!("{} set: {value}", self.active_filter_label())
+        }
     }
 
     fn pod_container_names_for_key(&self, pod_key: &ResourceKey) -> Vec<String> {
@@ -789,15 +853,15 @@ impl App {
         containers.sort();
         containers.dedup();
 
-        if let Some(target_container) = container_override {
-            if containers.iter().any(|name| name == target_container) {
-                return vec![LogTarget {
-                    context: pod_key.context.clone(),
-                    namespace,
-                    pod: pod_key.name.clone(),
-                    container: Some(target_container.to_string()),
-                }];
-            }
+        if let Some(target_container) = container_override
+            && containers.iter().any(|name| name == target_container)
+        {
+            return vec![LogTarget {
+                context: pod_key.context.clone(),
+                namespace,
+                pod: pod_key.name.clone(),
+                container: Some(target_container.to_string()),
+            }];
         }
 
         if containers.is_empty() {
@@ -1408,10 +1472,12 @@ impl App {
         matches
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new(
         contexts: Vec<String>,
         initial_context: String,
         initial_namespace: Option<String>,
+        context_default_namespaces: HashMap<String, Option<String>>,
         action_executor: Arc<dyn ActionExecutor>,
         resource_provider: Arc<dyn ResourceProvider>,
         keymap: Keymap,
@@ -1423,16 +1489,21 @@ impl App {
             .map(|context| ContextTabState {
                 context: context.clone(),
                 namespace: if context == &initial_context {
-                    initial_namespace.clone()
+                    initial_namespace
+                        .clone()
+                        .or_else(|| context_default_namespaces.get(context).cloned().flatten())
                 } else {
-                    None
+                    context_default_namespaces.get(context).cloned().flatten()
                 },
                 filter: String::new(),
                 detail_filter: String::new(),
+                detail_active_match_line: None,
                 selected: 0,
+                table_offset: 0,
                 detail_scroll: 0,
                 detail_hscroll: 0,
                 detail_wrap: true,
+                detail_format: DetailFormat::Yaml,
                 kind_idx: 0,
                 last_non_namespace_kind_idx: 0,
                 sort: SortColumn::Name,
@@ -1546,7 +1617,7 @@ impl App {
             {
                 let existing_filter = self.active_filter_value();
                 self.command_input = Some(CommandInput::new(CommandMode::Filter, existing_filter));
-                self.status_line = "Filter mode".to_string();
+                self.status_line = format!("{} mode", self.active_filter_label());
                 return Ok(false);
             }
         }
@@ -1558,6 +1629,15 @@ impl App {
         if key.code == KeyCode::Char(':') {
             self.command_input = Some(CommandInput::new(CommandMode::Command, String::new()));
             self.status_line = "Command mode".to_string();
+            return Ok(false);
+        }
+        if key.code == KeyCode::Char('y')
+            && key.modifiers.is_empty()
+            && self.pending_confirmation.is_none()
+            && self.in_detail_pane()
+            && self.overlay.is_none()
+        {
+            self.copy_current_view_to_clipboard();
             return Ok(false);
         }
         if key.code == KeyCode::Enter {
@@ -1618,13 +1698,19 @@ impl App {
             self.current_tab_mut().pane = Pane::Describe;
             self.current_tab_mut().detail_scroll = 0;
             self.current_tab_mut().detail_hscroll = 0;
+            self.current_tab_mut().detail_format = DetailFormat::Yaml;
             self.overlay = None;
-            self.status_line = "View opened".to_string();
+            self.status_line = "View opened (yaml)".to_string();
             self.ensure_active_watch().await;
             return Ok(false);
         }
         if key.modifiers.is_empty() && key.code == KeyCode::Char('e') {
-            self.status_line = "Edit action is not implemented yet".to_string();
+            self.edit_current_view(None).await;
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
+        if key.modifiers.is_empty() && key.code == KeyCode::Char('x') {
+            self.toggle_secret_decode();
             self.ensure_active_watch().await;
             return Ok(false);
         }
@@ -1720,7 +1806,7 @@ impl App {
         } else if self.keymap.is(Action::FilterMode, &key) {
             let existing_filter = self.active_filter_value();
             self.command_input = Some(CommandInput::new(CommandMode::Filter, existing_filter));
-            self.status_line = "Filter mode".to_string();
+            self.status_line = format!("{} mode", self.active_filter_label());
         } else if self.keymap.is(Action::CycleSort, &key) {
             if self.current_tab().pane == Pane::Logs {
                 self.logs.auto_scroll = !self.logs.auto_scroll;
@@ -1782,7 +1868,7 @@ impl App {
                 self.overlay = None;
                 self.status_line = "Closed view".to_string();
             } else if self.clear_active_filter_value() {
-                self.status_line = "Filter cleared".to_string();
+                self.status_line = self.filter_status_message("");
             } else {
                 self.status_line = "Nothing to cancel".to_string();
             }
@@ -1848,16 +1934,12 @@ impl App {
         match tab.pane {
             Pane::Table => None,
             Pane::Logs => Some(self.log_body_text()),
-            Pane::Describe | Pane::Events => {
+            Pane::Describe | Pane::SecretDecode | Pane::Events => {
                 let request = self.view_request_for_tab(&tab);
                 let vm = self.projected_view(&request);
                 let selected = tab.selected.min(vm.rows.len().saturating_sub(1));
-                let raw = self.detail_text(&vm.rows, selected, tab.pane);
-                if tab.detail_filter.trim().is_empty() {
-                    Some(raw)
-                } else {
-                    Some(filter_text_lines(&raw, &tab.detail_filter))
-                }
+                let raw = self.detail_text(&vm.rows, selected, tab.pane, tab.detail_format);
+                Some(raw)
             }
         }
     }
@@ -1895,23 +1977,18 @@ impl App {
             return;
         }
 
-        let current = self.current_tab().detail_scroll as usize;
-        let target = if forward {
-            matches
-                .iter()
-                .copied()
-                .find(|idx| *idx > current)
-                .unwrap_or(matches[0])
-        } else {
-            matches
-                .iter()
-                .copied()
-                .rev()
-                .find(|idx| *idx < current)
-                .unwrap_or(*matches.last().unwrap_or(&matches[0]))
+        let current_line = self
+            .current_tab()
+            .detail_active_match_line
+            .filter(|line| matches.contains(line))
+            .unwrap_or(self.current_tab().detail_scroll as usize);
+        let Some((target, match_pos)) = step_match_line(&matches, current_line, forward) else {
+            self.status_line = format!("No matches for '{}'", needle.trim());
+            return;
         };
-        let match_pos = matches.iter().position(|idx| *idx == target).unwrap_or(0) + 1;
-        self.current_tab_mut().detail_scroll = target.min(u16::MAX as usize) as u16;
+        let tab = self.current_tab_mut();
+        tab.detail_scroll = target.min(u16::MAX as usize) as u16;
+        tab.detail_active_match_line = Some(target);
         if self.current_tab().pane == Pane::Logs {
             self.logs.auto_scroll = false;
         }
@@ -1950,15 +2027,15 @@ impl App {
                 if let Some(input) = self.command_input.take() {
                     if matches!(input.mode, CommandMode::Filter) {
                         if self.clear_active_filter_value() {
-                            self.status_line = "Filter cleared".to_string();
+                            self.status_line = self.filter_status_message("");
                         } else {
-                            self.status_line = "Filter canceled".to_string();
+                            self.status_line = format!("{} canceled", self.active_filter_label());
                         }
                     } else {
                         self.status_line = "Command canceled".to_string();
                     }
                 }
-                return Ok(false);
+                Ok(false)
             }
             KeyCode::Backspace => {
                 if let Some(input) = &mut self.command_input {
@@ -1966,14 +2043,10 @@ impl App {
                     if matches!(input.mode, CommandMode::Filter) {
                         let filter = input.value.trim().to_string();
                         self.set_active_filter_value(filter.clone());
-                        self.status_line = if filter.is_empty() {
-                            "Filter cleared".to_string()
-                        } else {
-                            format!("Filter set: {filter}")
-                        };
+                        self.status_line = self.filter_status_message(&filter);
                     }
                 }
-                return Ok(false);
+                Ok(false)
             }
             KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(input) = &mut self.command_input {
@@ -1981,24 +2054,20 @@ impl App {
                     if matches!(input.mode, CommandMode::Filter) {
                         let filter = input.value.trim().to_string();
                         self.set_active_filter_value(filter.clone());
-                        self.status_line = if filter.is_empty() {
-                            "Filter cleared".to_string()
-                        } else {
-                            format!("Filter set: {filter}")
-                        };
+                        self.status_line = self.filter_status_message(&filter);
                     }
                 }
-                return Ok(false);
+                Ok(false)
             }
             KeyCode::Tab => {
                 self.autocomplete_command_input();
-                return Ok(false);
+                Ok(false)
             }
             KeyCode::Enter => {
                 let Some(input) = self.command_input.take() else {
                     return Ok(false);
                 };
-                return Ok(self.execute_command_input(input).await);
+                Ok(self.execute_command_input(input).await)
             }
             KeyCode::Char(ch) => {
                 if let Some(input) = &mut self.command_input {
@@ -2006,16 +2075,12 @@ impl App {
                     if matches!(input.mode, CommandMode::Filter) {
                         let filter = input.value.trim().to_string();
                         self.set_active_filter_value(filter.clone());
-                        self.status_line = if filter.is_empty() {
-                            "Filter cleared".to_string()
-                        } else {
-                            format!("Filter set: {filter}")
-                        };
+                        self.status_line = self.filter_status_message(&filter);
                     }
                 }
-                return Ok(false);
+                Ok(false)
             }
-            _ => return Ok(false),
+            _ => Ok(false),
         }
     }
 
@@ -2024,11 +2089,7 @@ impl App {
             CommandMode::Filter => {
                 let filter = input.value.trim().to_string();
                 self.set_active_filter_value(filter.clone());
-                self.status_line = if filter.is_empty() {
-                    "Filter cleared".to_string()
-                } else {
-                    format!("Filter set: {filter}")
-                };
+                self.status_line = self.filter_status_message(&filter);
                 false
             }
             CommandMode::Command => self.execute_colon_command(input.value.trim()).await,
@@ -2050,7 +2111,7 @@ impl App {
         match cmd.as_str() {
             "q" | "quit" | "exit" => true,
             "help" | "?" => {
-                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :c | :sources | :pause | :resume | :tail | :resources | :clear | :quit | :all".to_string();
+                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :fmt [yaml|json] | :c | :sources | :pause | :resume | :edit [yaml|json] | :tail | :copy | :dump <path> | :resources | :clear | :quit | :all".to_string();
                 false
             }
             "contexts" | "ctxs" => {
@@ -2121,7 +2182,39 @@ impl App {
                 } else {
                     self.current_tab_mut().detail_filter.clear();
                 }
-                self.status_line = "Filter cleared".to_string();
+                self.status_line = self.filter_status_message("");
+                false
+            }
+            "fmt" | "format" => {
+                if args.is_empty() {
+                    self.status_line = format!(
+                        "Detail format: {}",
+                        self.current_tab().detail_format.label()
+                    );
+                    return false;
+                }
+                let Some(format) = DetailFormat::parse(args[0]) else {
+                    self.status_line = "Usage: :fmt <yaml|json>".to_string();
+                    return false;
+                };
+                self.current_tab_mut().detail_format = format;
+                self.current_tab_mut().detail_scroll = 0;
+                self.current_tab_mut().detail_hscroll = 0;
+                self.status_line = format!("Detail format: {}", format.label());
+                false
+            }
+            "yaml" | "yml" => {
+                self.current_tab_mut().detail_format = DetailFormat::Yaml;
+                self.current_tab_mut().detail_scroll = 0;
+                self.current_tab_mut().detail_hscroll = 0;
+                self.status_line = "Detail format: yaml".to_string();
+                false
+            }
+            "json" => {
+                self.current_tab_mut().detail_format = DetailFormat::Json;
+                self.current_tab_mut().detail_scroll = 0;
+                self.current_tab_mut().detail_hscroll = 0;
+                self.status_line = "Detail format: json".to_string();
                 false
             }
             "c" | "container" | "containers" => {
@@ -2140,12 +2233,31 @@ impl App {
                 self.set_log_paused(false);
                 false
             }
+            "edit" => {
+                if let Some(token) = args.first() {
+                    let Some(format) = DetailFormat::parse(token) else {
+                        self.status_line = "Usage: :edit [yaml|json]".to_string();
+                        return false;
+                    };
+                    self.edit_current_view(Some(format)).await;
+                } else {
+                    self.edit_current_view(None).await;
+                }
+                false
+            }
             "tail" => {
                 self.jump_logs_to_latest();
                 false
             }
-            "pulse" | "pulses" | "pu" | "xray" | "popeye" | "pop" | "plugins" | "plugin"
-            | "screendump" | "sd" => {
+            "copy" | "yank" => {
+                self.copy_current_view_to_clipboard();
+                false
+            }
+            "dump" | "screendump" | "sd" => {
+                self.dump_current_view(args);
+                false
+            }
+            "pulse" | "pulses" | "pu" | "xray" | "popeye" | "pop" | "plugins" | "plugin" => {
                 self.status_line =
                     format!("Command ':{cmd}' is recognized but not implemented yet");
                 false
@@ -2225,6 +2337,15 @@ impl App {
                     .iter()
                     .filter(|alias| alias.starts_with(&prefix))
                     .map(|alias| (*alias).to_string())
+                    .collect();
+                self.apply_completion_for_argument(&command, candidates, &prefix);
+            }
+            "fmt" | "format" | "edit" => {
+                let prefix = arg_prefix.to_ascii_lowercase();
+                let candidates: Vec<String> = ["yaml", "yml", "json"]
+                    .iter()
+                    .filter(|fmt| fmt.starts_with(&prefix))
+                    .map(|fmt| (*fmt).to_string())
                     .collect();
                 self.apply_completion_for_argument(&command, candidates, &prefix);
             }
@@ -2327,9 +2448,7 @@ impl App {
     }
 
     fn history_step_forward(&mut self) -> Option<String> {
-        let Some(current) = self.history_cursor else {
-            return None;
-        };
+        let current = self.history_cursor?;
         if current + 1 >= self.command_history.len() {
             self.history_cursor = None;
             return None;
@@ -2382,15 +2501,7 @@ impl App {
                 } else {
                     Some(ns.to_string())
                 };
-            } else if arg == "-n" && idx + 1 < args.len() {
-                idx += 1;
-                let ns = args[idx];
-                self.current_tab_mut().namespace = if ns.eq_ignore_ascii_case("all") {
-                    None
-                } else {
-                    Some(ns.to_string())
-                };
-            } else if arg == "--namespace" && idx + 1 < args.len() {
+            } else if (arg == "-n" || arg == "--namespace") && idx + 1 < args.len() {
                 idx += 1;
                 let ns = args[idx];
                 self.current_tab_mut().namespace = if ns.eq_ignore_ascii_case("all") {
@@ -2493,7 +2604,8 @@ impl App {
             "pvc|claim, pv, no|node, ns|namespace, ev|event, sa, role, rb".to_string(),
             "crole, crb, netpol|np, hpa, pdb".to_string(),
             String::new(),
-            "Commands: :ctx :ns :kind :c :resources :clear :quit".to_string(),
+            "Commands: :ctx :ns :kind :fmt :c :sources :edit :copy :dump :resources :clear :quit"
+                .to_string(),
             String::new(),
             "Examples:".to_string(),
             ":po".to_string(),
@@ -2517,6 +2629,165 @@ impl App {
         self.status_line = "Resource aliases opened".to_string();
     }
 
+    fn current_view_text(&mut self) -> Option<String> {
+        if let Some(overlay) = &self.overlay {
+            return match overlay {
+                Overlay::Text { lines, .. } => Some(lines.join("\n")),
+                Overlay::Contexts {
+                    contexts,
+                    selected,
+                    filter,
+                    ..
+                } => {
+                    let filtered = context_filtered_indices(contexts, filter);
+                    let mut out = vec!["context".to_string()];
+                    for idx in filtered {
+                        let marker = if idx == *selected { "*" } else { " " };
+                        out.push(format!("{marker} {}", contexts[idx]));
+                    }
+                    Some(out.join("\n"))
+                }
+                Overlay::Containers {
+                    containers,
+                    selected,
+                    filter,
+                    ..
+                } => {
+                    let filtered = list_filtered_indices(containers, filter);
+                    let mut out = vec!["container".to_string()];
+                    for idx in filtered {
+                        let marker = if idx == *selected { "*" } else { " " };
+                        out.push(format!("{marker} {}", containers[idx]));
+                    }
+                    Some(out.join("\n"))
+                }
+                Overlay::LogSources {
+                    sources,
+                    selected,
+                    filter,
+                    ..
+                } => {
+                    let filtered = list_filtered_indices(sources, filter);
+                    let mut out = vec!["use\tsource".to_string()];
+                    for idx in filtered {
+                        let marker = if self.logs.hidden_sources.contains(&sources[idx]) {
+                            "off"
+                        } else {
+                            "on"
+                        };
+                        let active = if idx == *selected { "*" } else { " " };
+                        out.push(format!("{active}{marker}\t{}", sources[idx]));
+                    }
+                    Some(out.join("\n"))
+                }
+            };
+        }
+
+        let active = self.current_tab().clone();
+        match active.pane {
+            Pane::Table => {
+                let request = self.view_request_for_tab(&active);
+                let vm = self.projected_view(&request);
+                let mut lines = Vec::with_capacity(vm.rows.len().saturating_add(1));
+                lines.push("namespace\tname\tstatus\tage\tsummary".to_string());
+                for row in &vm.rows {
+                    lines.push(format!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        row.namespace, row.name, row.status, row.age, row.summary
+                    ));
+                }
+                Some(lines.join("\n"))
+            }
+            Pane::Describe | Pane::SecretDecode | Pane::Events => {
+                let request = self.view_request_for_tab(&active);
+                let vm = self.projected_view(&request);
+                let selected = active.selected.min(vm.rows.len().saturating_sub(1));
+                let raw = self.detail_text(&vm.rows, selected, active.pane, active.detail_format);
+                Some(raw)
+            }
+            Pane::Logs => {
+                let text = if self.logs.hidden_sources.is_empty() {
+                    self.log_joined_text().to_string()
+                } else {
+                    self.filtered_log_body_text()
+                };
+                if text.is_empty() {
+                    Some(self.log_body_text())
+                } else {
+                    Some(text)
+                }
+            }
+        }
+    }
+
+    fn copy_current_view_to_clipboard(&mut self) {
+        let Some(raw) = self.current_view_text() else {
+            self.status_line = "Nothing to copy".to_string();
+            return;
+        };
+        if raw.is_empty() {
+            self.status_line = "Nothing to copy".to_string();
+            return;
+        }
+
+        let (payload, truncated) = truncate_for_clipboard(&raw, 1_000_000);
+        match copy_to_native_clipboard(&payload) {
+            Ok(method) => {
+                self.status_line = if truncated {
+                    format!(
+                        "Copied to clipboard via {method} (truncated to {} bytes)",
+                        payload.len()
+                    )
+                } else {
+                    format!("Copied to clipboard via {method}")
+                };
+            }
+            Err(native_err) => {
+                let encoded = base64_encode(payload.as_bytes());
+                let osc52 = format!("\u{1b}]52;c;{encoded}\u{7}");
+                match io::stdout()
+                    .write_all(osc52.as_bytes())
+                    .and_then(|_| io::stdout().flush())
+                {
+                    Ok(_) => {
+                        self.status_line = if truncated {
+                            format!(
+                                "Copied via OSC52 (native unavailable: {native_err}; truncated to {} bytes)",
+                                payload.len()
+                            )
+                        } else {
+                            format!("Copied via OSC52 (native unavailable: {native_err})")
+                        };
+                    }
+                    Err(err) => {
+                        self.status_line =
+                            format!("Clipboard copy failed: native={native_err}; osc52={err}");
+                    }
+                }
+            }
+        };
+    }
+
+    fn dump_current_view(&mut self, args: &[&str]) {
+        let Some(path_raw) = args.first() else {
+            self.status_line = "Usage: :dump <path>".to_string();
+            return;
+        };
+        let Some(text) = self.current_view_text() else {
+            self.status_line = "Nothing to dump".to_string();
+            return;
+        };
+        let path = expand_user_path(path_raw);
+        match fs::write(&path, text) {
+            Ok(_) => {
+                self.status_line = format!("Dumped view to {}", path.display());
+            }
+            Err(err) => {
+                self.status_line = format!("Dump failed: {}", err);
+            }
+        }
+    }
+
     async fn handle_overlay_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -2526,7 +2797,7 @@ impl App {
             KeyCode::Char('/') => {
                 let existing_filter = self.active_filter_value();
                 self.command_input = Some(CommandInput::new(CommandMode::Filter, existing_filter));
-                self.status_line = "Filter mode".to_string();
+                self.status_line = format!("{} mode", self.active_filter_label());
             }
             KeyCode::Char('w') => {
                 if let Some(Overlay::Text { wrap, hscroll, .. }) = &mut self.overlay {
@@ -2620,17 +2891,16 @@ impl App {
                 if let Some(Overlay::LogSources {
                     selected, sources, ..
                 }) = &self.overlay
+                    && *selected < sources.len()
                 {
-                    if *selected < sources.len() {
-                        let source = sources[*selected].clone();
-                        if self.toggle_log_source(&source) {
-                            let hidden = self.logs.hidden_sources.contains(&source);
-                            self.status_line = if hidden {
-                                format!("Log source hidden: {source}")
-                            } else {
-                                format!("Log source shown: {source}")
-                            };
-                        }
+                    let source = sources[*selected].clone();
+                    if self.toggle_log_source(&source) {
+                        let hidden = self.logs.hidden_sources.contains(&source);
+                        self.status_line = if hidden {
+                            format!("Log source hidden: {source}")
+                        } else {
+                            format!("Log source shown: {source}")
+                        };
                     }
                 }
             }
@@ -2890,12 +3160,13 @@ impl App {
         let vm = self.projected_view(&request);
         let visible_rows = vm.rows.len();
         let max_selection = visible_rows.saturating_sub(1);
-        let selected = active.selected.min(max_selection);
+        let mut selected = active.selected.min(max_selection);
         self.current_tab_mut().selected = selected;
 
         let pane_label = match active.pane {
             Pane::Table => "table",
             Pane::Describe => "describe",
+            Pane::SecretDecode => "decode",
             Pane::Events => "events",
             Pane::Logs => "logs",
         };
@@ -3222,7 +3493,7 @@ impl App {
             .map(|(tag, body, _)| format!("{tag} {body}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | d describe | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
+        let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | y copy detail | d describe | x decode secret | e edit | :fmt yaml|json | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
         let help_height = if self.show_help {
             max_vertical_scroll_for_text(help_text, frame.area().width.max(1), 1, true) + 1
         } else {
@@ -3257,6 +3528,18 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(frame.area());
+
+        let mut table_offset = active.table_offset;
+        if active.pane == Pane::Table {
+            let viewport_rows = table_viewport_rows(chunks[2].height);
+            let (synced_selected, synced_offset) =
+                sync_table_viewport(selected, table_offset, viewport_rows, vm.rows.len());
+            selected = synced_selected;
+            table_offset = synced_offset;
+            let tab = self.current_tab_mut();
+            tab.selected = synced_selected;
+            tab.table_offset = synced_offset;
+        }
 
         let top_status = Paragraph::new(Line::from(top_line)).style(theme.header);
         frame.render_widget(top_status, chunks[0]);
@@ -3502,17 +3785,15 @@ impl App {
                     )))
                     .row_highlight_style(theme.row_highlight);
 
-                    let mut state =
-                        ratatui::widgets::TableState::default().with_selected(Some(selected));
+                    let mut state = ratatui::widgets::TableState::default()
+                        .with_selected(Some(selected))
+                        .with_offset(table_offset);
                     frame.render_stateful_widget(table, chunks[2], &mut state);
                 }
-                Pane::Describe | Pane::Events => {
-                    let raw_body = self.detail_text(&vm.rows, selected, active.pane);
-                    let body = if active.detail_filter.trim().is_empty() {
-                        raw_body
-                    } else {
-                        filter_text_lines(&raw_body, &active.detail_filter)
-                    };
+                Pane::Describe | Pane::SecretDecode | Pane::Events => {
+                    let raw_body =
+                        self.detail_text(&vm.rows, selected, active.pane, active.detail_format);
+                    let body = raw_body;
                     let content_width = chunks[2].width.saturating_sub(2);
                     let content_height = chunks[2].height.saturating_sub(2);
                     self.detail_page_step = (content_height / 2).max(1);
@@ -3536,27 +3817,40 @@ impl App {
                     };
                     let pane_title = match active.pane {
                         Pane::Describe => "Describe",
+                        Pane::SecretDecode => "Decode",
                         Pane::Events => "Events",
                         Pane::Logs => "Logs",
                         Pane::Table => "Table",
                     };
+                    let pane_title = format!("{pane_title} ({})", active.detail_format.label());
                     let search_query = active.detail_filter.trim();
                     let match_lines = search_match_lines(&body, search_query);
+                    let active_line = resolved_active_match_line(
+                        detail_scroll,
+                        &match_lines,
+                        active.detail_active_match_line,
+                    );
+                    {
+                        let tab = self.current_tab_mut();
+                        tab.detail_active_match_line = active_line;
+                    }
                     let total_lines = body.lines().count();
                     let title = detail_viewer_title(
-                        pane_title,
+                        &pane_title,
                         detail_wrap,
                         search_query,
                         &match_lines,
                         detail_scroll,
                         total_lines,
+                        active_line,
                     );
-                    let active_line = active_match_line(detail_scroll, &match_lines);
-                    let detail_text = if active.pane == Pane::Describe {
-                        highlighted_json_text(&body, search_query, self.color_support, active_line)
-                    } else {
-                        highlighted_text(&body, search_query, active_line)
-                    };
+                    let detail_text = highlighted_structured_text(
+                        &body,
+                        search_query,
+                        active.detail_format,
+                        self.color_support,
+                        active_line,
+                    );
                     let mut paragraph = Paragraph::new(detail_text)
                         .block(Block::default().borders(Borders::ALL).title(title))
                         .scroll((detail_scroll, detail_hscroll))
@@ -3621,6 +3915,15 @@ impl App {
                     }
                     let search_query = active.detail_filter.trim();
                     let match_lines = self.log_search_match_lines(search_query);
+                    let active_line = resolved_active_match_line(
+                        detail_scroll,
+                        match_lines.as_slice(),
+                        active.detail_active_match_line,
+                    );
+                    {
+                        let tab = self.current_tab_mut();
+                        tab.detail_active_match_line = active_line;
+                    }
                     let total_lines = logs_line_count.max(1);
                     let title = format!(
                         "{} | {}",
@@ -3631,10 +3934,10 @@ impl App {
                             search_query,
                             match_lines.as_slice(),
                             detail_scroll,
-                            total_lines
+                            total_lines,
+                            active_line
                         )
                     );
-                    let active_line = active_match_line(detail_scroll, match_lines.as_slice());
                     if detail_wrap {
                         let body = if logs_line_count > 0 {
                             if self.logs.hidden_sources.is_empty() {
@@ -3743,7 +4046,13 @@ impl App {
         );
     }
 
-    fn detail_text(&self, rows: &[crate::view::ViewRow], selected: usize, pane: Pane) -> String {
+    fn detail_text(
+        &self,
+        rows: &[crate::view::ViewRow],
+        selected: usize,
+        pane: Pane,
+        format: DetailFormat,
+    ) -> String {
         let Some(row) = rows.get(selected) else {
             return "No resource selected".to_string();
         };
@@ -3752,12 +4061,25 @@ impl App {
         };
 
         match pane {
-            Pane::Describe => {
-                serde_json::to_string_pretty(&entity.raw).unwrap_or_else(|_| "{}".to_string())
+            Pane::Describe => match format {
+                DetailFormat::Yaml => to_pretty_yaml(&entity.raw),
+                DetailFormat::Json => to_pretty_json(&entity.raw),
+            },
+            Pane::SecretDecode => {
+                if row.key.kind != ResourceKind::Secrets {
+                    return "Decode pane is available for Secret resources only".to_string();
+                }
+                match format {
+                    DetailFormat::Yaml => decoded_secret_text(&entity.raw),
+                    DetailFormat::Json => decoded_secret_json_text(&entity.raw),
+                }
             }
             Pane::Events => {
                 if row.key.kind == ResourceKind::Events {
-                    serde_json::to_string_pretty(&entity.raw).unwrap_or_else(|_| "{}".to_string())
+                    match format {
+                        DetailFormat::Yaml => to_pretty_yaml(&entity.raw),
+                        DetailFormat::Json => to_pretty_json(&entity.raw),
+                    }
                 } else {
                     "Events pane currently supports Event resources directly; resource-scoped event correlation is planned in next milestone.".to_string()
                 }
@@ -3789,6 +4111,147 @@ impl App {
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
         self.overlay = None;
+    }
+
+    fn toggle_secret_decode(&mut self) {
+        if self.current_tab().pane == Pane::SecretDecode {
+            let tab = self.current_tab_mut();
+            tab.pane = Pane::Describe;
+            tab.detail_scroll = 0;
+            tab.detail_hscroll = 0;
+            self.overlay = None;
+            self.status_line = "Decode: off".to_string();
+            return;
+        }
+
+        let Some(row) = self.selected_row() else {
+            self.status_line = "No resource selected".to_string();
+            return;
+        };
+        if row.key.kind != ResourceKind::Secrets {
+            self.status_line = "Decode is only available for Secret resources".to_string();
+            return;
+        }
+
+        let tab = self.current_tab_mut();
+        tab.pane = Pane::SecretDecode;
+        tab.detail_scroll = 0;
+        tab.detail_hscroll = 0;
+        self.overlay = None;
+        self.status_line = format!(
+            "Decode: {} {}",
+            row.key.namespace.as_deref().unwrap_or("default"),
+            row.key.name
+        );
+    }
+
+    async fn edit_current_view(&mut self, format_override: Option<DetailFormat>) {
+        let pane = self.current_tab().pane;
+        if !matches!(pane, Pane::Describe | Pane::SecretDecode) {
+            self.status_line = "Edit is available in Describe/Decode panes".to_string();
+            return;
+        }
+
+        let detail_format = format_override.unwrap_or(self.current_tab().detail_format);
+        if format_override.is_some() {
+            self.current_tab_mut().detail_format = detail_format;
+        }
+
+        let active = self.current_tab().clone();
+        let request = self.view_request_for_tab(&active);
+        let vm = self.projected_view(&request);
+        let selected = active.selected.min(vm.rows.len().saturating_sub(1));
+        let Some(row) = vm.rows.get(selected) else {
+            self.status_line = "No resource selected".to_string();
+            return;
+        };
+        let Some(entity) = self.store.get(&row.key) else {
+            self.status_line = "Resource details unavailable".to_string();
+            return;
+        };
+        let key = row.key.clone();
+        let original = entity.raw.clone();
+
+        let initial_text = match pane {
+            Pane::Describe => match detail_format {
+                DetailFormat::Yaml => to_pretty_yaml(&original),
+                DetailFormat::Json => to_pretty_json(&original),
+            },
+            Pane::SecretDecode => {
+                if key.kind != ResourceKind::Secrets {
+                    self.status_line =
+                        "Decode edit is only available for Secret resources".to_string();
+                    return;
+                }
+                match detail_format {
+                    DetailFormat::Yaml => decoded_secret_text(&original),
+                    DetailFormat::Json => decoded_secret_json_text(&original),
+                }
+            }
+            _ => {
+                self.status_line = "Edit is available in Describe/Decode panes".to_string();
+                return;
+            }
+        };
+
+        let edited_text = match run_external_editor(&initial_text, detail_format.extension()) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                self.status_line = "Edit canceled".to_string();
+                return;
+            }
+            Err(err) => {
+                self.status_line = format!("Editor failed: {err}");
+                return;
+            }
+        };
+
+        if edited_text == initial_text {
+            self.status_line = "No changes to apply".to_string();
+            return;
+        }
+
+        let manifest = match (pane, detail_format) {
+            (Pane::Describe, DetailFormat::Yaml) => match parse_yaml_to_json(&edited_text) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    self.status_line = format!("Invalid YAML: {err}");
+                    return;
+                }
+            },
+            (Pane::Describe, DetailFormat::Json) => match parse_json_to_json(&edited_text) {
+                Ok(manifest) => manifest,
+                Err(err) => {
+                    self.status_line = format!("Invalid JSON: {err}");
+                    return;
+                }
+            },
+            (Pane::SecretDecode, DetailFormat::Yaml) => {
+                match apply_decoded_secret_yaml(&original, &edited_text) {
+                    Ok(manifest) => manifest,
+                    Err(err) => {
+                        self.status_line = format!("Invalid decoded secret YAML: {err}");
+                        return;
+                    }
+                }
+            }
+            (Pane::SecretDecode, DetailFormat::Json) => {
+                match apply_decoded_secret_json(&original, &edited_text) {
+                    Ok(manifest) => manifest,
+                    Err(err) => {
+                        self.status_line = format!("Invalid decoded secret JSON: {err}");
+                        return;
+                    }
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        let result = self.action_executor.replace_resource(&key, manifest).await;
+        self.status_line = match result {
+            Ok(outcome) => outcome.message,
+            Err(error) => render_action_error(error, &key),
+        };
     }
 
     fn next_context(&mut self) {
@@ -4051,6 +4514,11 @@ fn command_names() -> &'static [&'static str] {
         "aliases",
         "clear",
         "clear-filter",
+        "fmt",
+        "format",
+        "yaml",
+        "yml",
+        "json",
         "c",
         "container",
         "containers",
@@ -4058,7 +4526,11 @@ fn command_names() -> &'static [&'static str] {
         "src",
         "pause",
         "resume",
+        "edit",
         "tail",
+        "copy",
+        "yank",
+        "dump",
         "help",
         "?",
         "quit",
@@ -4174,6 +4646,392 @@ fn common_prefix(values: &[String]) -> String {
     prefix
 }
 
+fn expand_user_path(raw: &str) -> PathBuf {
+    if let Some(stripped) = raw.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    PathBuf::from(raw)
+}
+
+fn run_clipboard_command(program: &str, args: &[&str], text: &str) -> io::Result<()> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{program} exited with status {status}"
+        )))
+    }
+}
+
+fn copy_to_native_clipboard(text: &str) -> Result<&'static str, String> {
+    #[cfg(target_os = "macos")]
+    {
+        run_clipboard_command("pbcopy", &[], text)
+            .map(|_| "pbcopy")
+            .map_err(|err| err.to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut errors = Vec::new();
+        if env::var_os("WAYLAND_DISPLAY").is_some() {
+            match run_clipboard_command("wl-copy", &[], text) {
+                Ok(()) => return Ok("wl-copy"),
+                Err(err) => errors.push(format!("wl-copy: {err}")),
+            }
+        }
+        match run_clipboard_command("xclip", &["-selection", "clipboard"], text) {
+            Ok(()) => return Ok("xclip"),
+            Err(err) => errors.push(format!("xclip: {err}")),
+        }
+        match run_clipboard_command("xsel", &["--clipboard", "--input"], text) {
+            Ok(()) => return Ok("xsel"),
+            Err(err) => errors.push(format!("xsel: {err}")),
+        }
+        return Err(errors.join("; "));
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = text;
+        Err("native clipboard backend is not configured for this platform".to_string())
+    }
+}
+
+fn truncate_for_clipboard(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    let mut end = max_bytes.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    (text[..end].to_string(), true)
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if data.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i + 3 <= data.len() {
+        let chunk = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((chunk >> 6) & 0x3f) as usize] as char);
+        out.push(ALPHABET[(chunk & 0x3f) as usize] as char);
+        i += 3;
+    }
+
+    let rem = data.len() - i;
+    if rem == 1 {
+        let chunk = (data[i] as u32) << 16;
+        out.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let chunk = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        out.push(ALPHABET[((chunk >> 18) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((chunk >> 12) & 0x3f) as usize] as char);
+        out.push(ALPHABET[((chunk >> 6) & 0x3f) as usize] as char);
+        out.push('=');
+    }
+
+    out
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    let mut cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    if cleaned.is_empty() {
+        return Ok(Vec::new());
+    }
+    if cleaned.len() % 4 == 1 {
+        return Err("invalid base64 length".to_string());
+    }
+    while !cleaned.len().is_multiple_of(4) {
+        cleaned.push(b'=');
+    }
+
+    let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
+    let mut idx = 0usize;
+    while idx < cleaned.len() {
+        let c0 = cleaned[idx];
+        let c1 = cleaned[idx + 1];
+        let c2 = cleaned[idx + 2];
+        let c3 = cleaned[idx + 3];
+        idx += 4;
+
+        let v0 = base64_value(c0).ok_or_else(|| "invalid base64 character".to_string())?;
+        let v1 = base64_value(c1).ok_or_else(|| "invalid base64 character".to_string())?;
+        let v2 = if c2 == b'=' {
+            0
+        } else {
+            base64_value(c2).ok_or_else(|| "invalid base64 character".to_string())?
+        };
+        let v3 = if c3 == b'=' {
+            0
+        } else {
+            base64_value(c3).ok_or_else(|| "invalid base64 character".to_string())?
+        };
+
+        let chunk = ((v0 as u32) << 18) | ((v1 as u32) << 12) | ((v2 as u32) << 6) | v3 as u32;
+        out.push(((chunk >> 16) & 0xff) as u8);
+        if c2 != b'=' {
+            out.push(((chunk >> 8) & 0xff) as u8);
+        }
+        if c3 != b'=' {
+            out.push((chunk & 0xff) as u8);
+        }
+    }
+
+    Ok(out)
+}
+
+fn is_mostly_printable_text(text: &str) -> bool {
+    let mut total = 0usize;
+    let mut printable = 0usize;
+    for ch in text.chars() {
+        total += 1;
+        if ch == '\n' || ch == '\r' || ch == '\t' || !ch.is_control() {
+            printable += 1;
+        }
+    }
+    if total == 0 {
+        return true;
+    }
+    printable * 100 / total >= 95
+}
+
+fn format_decoded_secret_value(bytes: &[u8]) -> String {
+    if let Ok(text) = std::str::from_utf8(bytes)
+        && is_mostly_printable_text(text)
+    {
+        let trimmed = text.trim();
+        if !trimmed.is_empty()
+            && ((trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']')))
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed)
+            && let Ok(pretty) = serde_json::to_string_pretty(&json)
+        {
+            return pretty;
+        }
+        return text.to_string();
+    }
+
+    let preview_len = bytes.len().min(32);
+    let preview = bytes
+        .iter()
+        .take(preview_len)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    if bytes.len() > preview_len {
+        format!("[binary {} bytes] hex-preview={}...", bytes.len(), preview)
+    } else {
+        format!("[binary {} bytes] hex-preview={}", bytes.len(), preview)
+    }
+}
+
+fn to_pretty_yaml(value: &serde_json::Value) -> String {
+    serde_yaml::to_string(value).unwrap_or_else(|_| "--- {}\n".to_string())
+}
+
+fn to_pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}\n".to_string())
+}
+
+fn decoded_secret_data_map(raw: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Some(data) = raw.get("data").and_then(serde_json::Value::as_object) {
+        for (key, value) in data {
+            let encoded = value.as_str().unwrap_or_default();
+            let rendered = match base64_decode(encoded) {
+                Ok(decoded) => format_decoded_secret_value(&decoded),
+                Err(err) => format!("<decode error: {err}>"),
+            };
+            out.insert(key.clone(), rendered);
+        }
+    }
+    out
+}
+
+fn decoded_secret_text(raw: &serde_json::Value) -> String {
+    let decoded = decoded_secret_data_map(raw);
+    serde_yaml::to_string(&decoded).unwrap_or_else(|_| "--- {}\n".to_string())
+}
+
+fn decoded_secret_json_text(raw: &serde_json::Value) -> String {
+    let decoded = decoded_secret_data_map(raw);
+    serde_json::to_string_pretty(&decoded).unwrap_or_else(|_| "{}\n".to_string())
+}
+
+fn yaml_value_to_secret_string(value: &serde_yaml::Value) -> Result<String, String> {
+    match value {
+        serde_yaml::Value::Null => Ok(String::new()),
+        serde_yaml::Value::Bool(v) => Ok(v.to_string()),
+        serde_yaml::Value::Number(v) => Ok(v.to_string()),
+        serde_yaml::Value::String(v) => Ok(v.clone()),
+        serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) => {
+            serde_yaml::to_string(value)
+                .map(|s| s.trim_end().to_string())
+                .map_err(|err| err.to_string())
+        }
+        _ => Err("unsupported YAML value type".to_string()),
+    }
+}
+
+fn parse_yaml_to_json(text: &str) -> Result<serde_json::Value, String> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(text).map_err(|err| err.to_string())?;
+    serde_json::to_value(yaml).map_err(|err| err.to_string())
+}
+
+fn parse_json_to_json(text: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(text).map_err(|err| err.to_string())
+}
+
+fn apply_decoded_secret_yaml(
+    original: &serde_json::Value,
+    edited: &str,
+) -> Result<serde_json::Value, String> {
+    let yaml: serde_yaml::Value = serde_yaml::from_str(edited).map_err(|err| err.to_string())?;
+    let mapping = yaml
+        .as_mapping()
+        .ok_or_else(|| "decoded secret edit must be a YAML mapping".to_string())?;
+
+    let mut data = serde_json::Map::new();
+    for (key, value) in mapping {
+        let key_str = key
+            .as_str()
+            .ok_or_else(|| "all decoded secret keys must be strings".to_string())?;
+        let raw_value = yaml_value_to_secret_string(value)?;
+        data.insert(
+            key_str.to_string(),
+            serde_json::Value::String(base64_encode(raw_value.as_bytes())),
+        );
+    }
+
+    let mut out = original.clone();
+    if !out.is_object() {
+        return Err("secret manifest is not an object".to_string());
+    }
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("data".to_string(), serde_json::Value::Object(data));
+        obj.remove("stringData");
+    }
+    Ok(out)
+}
+
+fn json_value_to_secret_string(value: &serde_json::Value) -> Result<String, String> {
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::Bool(v) => Ok(v.to_string()),
+        serde_json::Value::Number(v) => Ok(v.to_string()),
+        serde_json::Value::String(v) => Ok(v.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            serde_json::to_string_pretty(value).map_err(|err| err.to_string())
+        }
+    }
+}
+
+fn apply_decoded_secret_json(
+    original: &serde_json::Value,
+    edited: &str,
+) -> Result<serde_json::Value, String> {
+    let json: serde_json::Value = serde_json::from_str(edited).map_err(|err| err.to_string())?;
+    let mapping = json
+        .as_object()
+        .ok_or_else(|| "decoded secret edit must be a JSON object".to_string())?;
+
+    let mut data = serde_json::Map::new();
+    for (key, value) in mapping {
+        let raw_value = json_value_to_secret_string(value)?;
+        data.insert(
+            key.to_string(),
+            serde_json::Value::String(base64_encode(raw_value.as_bytes())),
+        );
+    }
+
+    let mut out = original.clone();
+    if !out.is_object() {
+        return Err("secret manifest is not an object".to_string());
+    }
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("data".to_string(), serde_json::Value::Object(data));
+        obj.remove("stringData");
+    }
+    Ok(out)
+}
+
+fn run_external_editor(initial_text: &str, extension: &str) -> Result<Option<String>, String> {
+    let editor = env::var("VISUAL")
+        .or_else(|_| env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let mut path = env::temp_dir();
+    let now_nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let nonce = format!("krust-edit-{}-{now_nanos}.{extension}", std::process::id());
+    path.push(nonce);
+
+    fs::write(&path, initial_text).map_err(|err| err.to_string())?;
+
+    let leave_result = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    if let Err(err) = leave_result {
+        let _ = fs::remove_file(&path);
+        return Err(err.to_string());
+    }
+
+    let status = Command::new(&editor).arg(&path).status();
+
+    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+    let _ = enable_raw_mode();
+
+    let result = match status {
+        Ok(status) if status.success() => fs::read_to_string(&path)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+        Ok(status) => Err(format!("editor exited with status {status}")),
+        Err(err) => Err(err.to_string()),
+    };
+
+    let _ = fs::remove_file(&path);
+    result
+}
+
 fn list_filtered_indices(values: &[String], filter: &str) -> Vec<usize> {
     let needle = filter.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -4190,22 +5048,6 @@ fn list_filtered_indices(values: &[String], filter: &str) -> Vec<usize> {
             }
         })
         .collect()
-}
-
-fn filter_text_lines(text: &str, filter: &str) -> String {
-    let needle = filter.trim().to_ascii_lowercase();
-    if needle.is_empty() {
-        return text.to_string();
-    }
-
-    let matched: Vec<&str> = text
-        .lines()
-        .filter(|line| line.to_ascii_lowercase().contains(&needle))
-        .collect();
-    if matched.is_empty() {
-        return format!("No matches for '{}'", filter.trim());
-    }
-    matched.join("\n")
 }
 
 fn search_match_lines(text: &str, query: &str) -> Vec<usize> {
@@ -4307,6 +5149,66 @@ fn active_match_line(scroll: u16, match_lines: &[usize]) -> Option<usize> {
     )
 }
 
+fn resolved_active_match_line(
+    scroll: u16,
+    match_lines: &[usize],
+    preferred_line: Option<usize>,
+) -> Option<usize> {
+    if match_lines.is_empty() {
+        return None;
+    }
+    if let Some(line) = preferred_line
+        && match_lines.contains(&line)
+    {
+        return Some(line);
+    }
+    active_match_line(scroll, match_lines)
+}
+
+fn step_match_line(
+    match_lines: &[usize],
+    current_line: usize,
+    forward: bool,
+) -> Option<(usize, usize)> {
+    if match_lines.is_empty() {
+        return None;
+    }
+
+    if forward {
+        if let Some(pos) = match_lines.iter().position(|line| *line == current_line) {
+            let next = (pos + 1) % match_lines.len();
+            return Some((match_lines[next], next + 1));
+        }
+        if let Some((idx, line)) = match_lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| **line > current_line)
+        {
+            return Some((*line, idx + 1));
+        }
+        Some((match_lines[0], 1))
+    } else {
+        if let Some(pos) = match_lines.iter().position(|line| *line == current_line) {
+            let prev = if pos == 0 {
+                match_lines.len() - 1
+            } else {
+                pos - 1
+            };
+            return Some((match_lines[prev], prev + 1));
+        }
+        if let Some((idx, line)) = match_lines
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, line)| **line < current_line)
+        {
+            return Some((*line, idx + 1));
+        }
+        let last = match_lines.len() - 1;
+        Some((match_lines[last], last + 1))
+    }
+}
+
 fn highlighted_text(text: &str, query: &str, active_line: Option<usize>) -> Text<'static> {
     let needle = query.trim().to_ascii_lowercase();
     if needle.is_empty() {
@@ -4340,6 +5242,19 @@ fn highlighted_text(text: &str, query: &str, active_line: Option<usize>) -> Text
         out.push(Line::from(spans));
     }
     Text::from(out)
+}
+
+fn highlighted_structured_text(
+    text: &str,
+    query: &str,
+    format: DetailFormat,
+    support: ColorSupport,
+    active_line: Option<usize>,
+) -> Text<'static> {
+    match format {
+        DetailFormat::Yaml => highlighted_yaml_text(text, query, support, active_line),
+        DetailFormat::Json => highlighted_json_text(text, query, support, active_line),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4576,6 +5491,324 @@ fn highlighted_json_text(
     Text::from(out)
 }
 
+#[derive(Clone, Copy)]
+enum YamlTokenKind {
+    Key,
+    String,
+    Number,
+    Bool,
+    Null,
+    Comment,
+    Punct,
+    Plain,
+}
+
+fn yaml_token_style(kind: YamlTokenKind, support: ColorSupport) -> Style {
+    match support {
+        ColorSupport::NoColor => match kind {
+            YamlTokenKind::Key => Style::default().add_modifier(Modifier::BOLD),
+            YamlTokenKind::Comment => Style::default().add_modifier(Modifier::DIM),
+            _ => Style::default(),
+        },
+        ColorSupport::Basic => match kind {
+            YamlTokenKind::Key => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            YamlTokenKind::String => Style::default().fg(Color::Green),
+            YamlTokenKind::Number => Style::default().fg(Color::Magenta),
+            YamlTokenKind::Bool | YamlTokenKind::Null => Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+            YamlTokenKind::Comment => Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+            YamlTokenKind::Punct => Style::default().fg(Color::DarkGray),
+            YamlTokenKind::Plain => Style::default(),
+        },
+        ColorSupport::Ansi256 | ColorSupport::TrueColor => match kind {
+            YamlTokenKind::Key => Style::default()
+                .fg(Color::Indexed(117))
+                .add_modifier(Modifier::BOLD),
+            YamlTokenKind::String => Style::default().fg(Color::Indexed(114)),
+            YamlTokenKind::Number => Style::default().fg(Color::Indexed(213)),
+            YamlTokenKind::Bool => Style::default()
+                .fg(Color::Indexed(220))
+                .add_modifier(Modifier::BOLD),
+            YamlTokenKind::Null => Style::default().fg(Color::Indexed(180)),
+            YamlTokenKind::Comment => Style::default()
+                .fg(Color::Indexed(244))
+                .add_modifier(Modifier::DIM),
+            YamlTokenKind::Punct => Style::default().fg(Color::Indexed(245)),
+            YamlTokenKind::Plain => Style::default(),
+        },
+    }
+}
+
+fn find_yaml_comment_index(line: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut prev: Option<char> = None;
+    for (idx, ch) in line.char_indices() {
+        if in_double && escaped {
+            escaped = false;
+            prev = Some(ch);
+            continue;
+        }
+        if ch == '\\' && in_double {
+            escaped = true;
+            prev = Some(ch);
+            continue;
+        }
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            prev = Some(ch);
+            continue;
+        }
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            prev = Some(ch);
+            continue;
+        }
+        if ch == '#' && !in_single && !in_double {
+            let starts_comment = idx == 0 || prev.map(|c| c.is_whitespace()).unwrap_or(true);
+            if starts_comment {
+                return Some(idx);
+            }
+        }
+        prev = Some(ch);
+    }
+    None
+}
+
+fn is_yaml_scalar_boundary(line: &str, index: usize) -> bool {
+    line.get(index..)
+        .and_then(|rest| rest.chars().next())
+        .map(|ch| ch.is_whitespace() || matches!(ch, ',' | ']' | '}' | ':' | '#'))
+        .unwrap_or(true)
+}
+
+fn is_yaml_number_token(token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() {
+        return false;
+    }
+    if token.starts_with("0x") || token.starts_with("0o") || token.starts_with("0b") {
+        return token.len() > 2;
+    }
+    if token == "-" || token == "+" {
+        return false;
+    }
+    let mut dots = 0usize;
+    let mut digits = 0usize;
+    for (idx, ch) in token.chars().enumerate() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+            continue;
+        }
+        if (ch == '-' || ch == '+') && idx == 0 {
+            continue;
+        }
+        if ch == '.' {
+            dots += 1;
+            if dots > 1 {
+                return false;
+            }
+            continue;
+        }
+        return false;
+    }
+    digits > 0
+}
+
+fn is_yaml_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/')
+}
+
+fn yaml_spans_for_line(line: &str, support: ColorSupport) -> Vec<(String, Style)> {
+    let (code, comment) = if let Some(comment_start) = find_yaml_comment_index(line) {
+        (&line[..comment_start], Some(&line[comment_start..]))
+    } else {
+        (line, None)
+    };
+
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < code.len() {
+        let Some(ch) = code[idx..].chars().next() else {
+            break;
+        };
+
+        if ch.is_whitespace() {
+            let start = idx;
+            idx = idx.saturating_add(ch.len_utf8());
+            while idx < code.len() {
+                let Some(next) = code[idx..].chars().next() else {
+                    break;
+                };
+                if !next.is_whitespace() {
+                    break;
+                }
+                idx = idx.saturating_add(next.len_utf8());
+            }
+            out.push((
+                code.get(start..idx).unwrap_or("").to_string(),
+                yaml_token_style(YamlTokenKind::Plain, support),
+            ));
+            continue;
+        }
+
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            let start = idx;
+            idx = idx.saturating_add(ch.len_utf8());
+            let mut escaped = false;
+            while idx < code.len() {
+                let Some(next) = code[idx..].chars().next() else {
+                    break;
+                };
+                if quote == '"' && escaped {
+                    escaped = false;
+                    idx = idx.saturating_add(next.len_utf8());
+                    continue;
+                }
+                if quote == '"' && next == '\\' {
+                    escaped = true;
+                    idx = idx.saturating_add(next.len_utf8());
+                    continue;
+                }
+                idx = idx.saturating_add(next.len_utf8());
+                if next == quote {
+                    break;
+                }
+            }
+            out.push((
+                code.get(start..idx).unwrap_or("").to_string(),
+                yaml_token_style(YamlTokenKind::String, support),
+            ));
+            continue;
+        }
+
+        if matches!(ch, '[' | ']' | '{' | '}' | ',' | '?') {
+            out.push((
+                ch.to_string(),
+                yaml_token_style(YamlTokenKind::Punct, support),
+            ));
+            idx = idx.saturating_add(ch.len_utf8());
+            continue;
+        }
+
+        if ch == '-' {
+            let next = code[idx + ch.len_utf8()..].chars().next();
+            if next.is_some_and(char::is_whitespace) {
+                out.push((
+                    "-".to_string(),
+                    yaml_token_style(YamlTokenKind::Punct, support),
+                ));
+                idx = idx.saturating_add(ch.len_utf8());
+                continue;
+            }
+        }
+
+        if is_yaml_word_char(ch) {
+            let start = idx;
+            idx = idx.saturating_add(ch.len_utf8());
+            while idx < code.len() {
+                let Some(next) = code[idx..].chars().next() else {
+                    break;
+                };
+                if !is_yaml_word_char(next) {
+                    break;
+                }
+                idx = idx.saturating_add(next.len_utf8());
+            }
+            let token = code.get(start..idx).unwrap_or("");
+
+            let mut probe = idx;
+            while probe < code.len() {
+                let Some(ws) = code[probe..].chars().next() else {
+                    break;
+                };
+                if ws.is_whitespace() {
+                    probe = probe.saturating_add(ws.len_utf8());
+                } else {
+                    break;
+                }
+            }
+            if code[probe..].starts_with(':') {
+                out.push((
+                    token.to_string(),
+                    yaml_token_style(YamlTokenKind::Key, support),
+                ));
+                if probe > idx {
+                    out.push((
+                        code.get(idx..probe).unwrap_or("").to_string(),
+                        yaml_token_style(YamlTokenKind::Plain, support),
+                    ));
+                }
+                out.push((
+                    ":".to_string(),
+                    yaml_token_style(YamlTokenKind::Punct, support),
+                ));
+                idx = probe + 1;
+                continue;
+            }
+
+            let lower = token.to_ascii_lowercase();
+            let kind = if (lower == "true" || lower == "false" || lower == "yes" || lower == "no")
+                && is_yaml_scalar_boundary(code, idx)
+            {
+                YamlTokenKind::Bool
+            } else if (lower == "null" || lower == "~") && is_yaml_scalar_boundary(code, idx) {
+                YamlTokenKind::Null
+            } else if is_yaml_number_token(token) {
+                YamlTokenKind::Number
+            } else {
+                YamlTokenKind::Plain
+            };
+            out.push((token.to_string(), yaml_token_style(kind, support)));
+            continue;
+        }
+
+        out.push((
+            ch.to_string(),
+            yaml_token_style(YamlTokenKind::Plain, support),
+        ));
+        idx = idx.saturating_add(ch.len_utf8());
+    }
+
+    if let Some(comment) = comment {
+        out.push((
+            comment.to_string(),
+            yaml_token_style(YamlTokenKind::Comment, support),
+        ));
+    }
+
+    out
+}
+
+fn highlighted_yaml_text(
+    text: &str,
+    query: &str,
+    support: ColorSupport,
+    active_line: Option<usize>,
+) -> Text<'static> {
+    let needle = query.trim().to_ascii_lowercase();
+    let mut out = Vec::new();
+    for (line_idx, line) in text.lines().enumerate() {
+        let mut spans = Vec::new();
+        let highlight_style = search_match_highlight_style(active_line == Some(line_idx));
+        for (segment, style) in yaml_spans_for_line(line, support) {
+            push_query_highlighted_span(&mut spans, &segment, style, &needle, highlight_style);
+        }
+        if spans.is_empty() {
+            spans.push(Span::raw(String::new()));
+        }
+        out.push(Line::from(spans));
+    }
+    Text::from(out)
+}
+
 fn detail_viewer_title(
     pane_title: &str,
     wrap: bool,
@@ -4583,18 +5816,24 @@ fn detail_viewer_title(
     match_lines: &[usize],
     scroll: u16,
     total_lines: usize,
+    active_line: Option<usize>,
 ) -> String {
     let search = if search_query.trim().is_empty() {
         "search:-".to_string()
     } else if match_lines.is_empty() {
         format!("search:/{} 0/0", search_query.trim())
     } else {
-        let current_line = scroll as usize;
-        let current_idx = match_lines
-            .iter()
-            .position(|line| *line >= current_line)
-            .unwrap_or(match_lines.len() - 1)
-            + 1;
+        let current_idx = active_line
+            .and_then(|line| match_lines.iter().position(|candidate| *candidate == line))
+            .map(|idx| idx + 1)
+            .or_else(|| {
+                let current_line = scroll as usize;
+                match_lines
+                    .iter()
+                    .position(|line| *line >= current_line)
+                    .map(|idx| idx + 1)
+            })
+            .unwrap_or(match_lines.len());
         format!(
             "search:/{} {}/{}",
             search_query.trim(),
@@ -4714,6 +5953,7 @@ fn pane_icon(pane: Pane) -> &'static str {
     match pane {
         Pane::Table => "[TB]",
         Pane::Describe => "[DS]",
+        Pane::SecretDecode => "[SX]",
         Pane::Events => "[EV]",
         Pane::Logs => "[LG]",
     }
@@ -5099,6 +6339,36 @@ fn delete_previous_word(value: &mut String) {
     }
 }
 
+fn table_viewport_rows(table_height: u16) -> usize {
+    table_height.saturating_sub(3) as usize
+}
+
+fn sync_table_viewport(
+    selected: usize,
+    offset: usize,
+    viewport_rows: usize,
+    total_rows: usize,
+) -> (usize, usize) {
+    if total_rows == 0 || viewport_rows == 0 {
+        return (0, 0);
+    }
+
+    let selected = selected.min(total_rows.saturating_sub(1));
+    let max_offset = total_rows.saturating_sub(viewport_rows);
+    let mut offset = offset.min(max_offset);
+
+    if selected < offset {
+        offset = selected;
+    } else {
+        let visible_end_exclusive = offset.saturating_add(viewport_rows);
+        if selected >= visible_end_exclusive {
+            offset = selected.saturating_add(1).saturating_sub(viewport_rows);
+        }
+    }
+
+    (selected, offset.min(max_offset))
+}
+
 fn max_vertical_scroll_for_text(
     text: &str,
     viewport_width: u16,
@@ -5246,10 +6516,20 @@ fn parse_resource_alias(token: &str) -> ResourceAlias {
     }
 }
 
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::{HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
         sync::Arc,
         time::Instant,
     };
@@ -5260,11 +6540,14 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        App, ColorSupport, ResourceAlias, classify_status_severity, color_support_label,
-        command_names, detect_color_support_from_env, highlighted_json_text, highlighted_text,
-        is_auth_refresh_log_error, is_retryable_log_error, is_visible_log_line,
-        json_spans_for_line, next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
-        resource_alias_names, search_match_lines_in_logs, severity_tag, slice_chars, ui_theme_for,
+        App, ColorSupport, ResourceAlias, base64_decode, base64_encode, classify_status_severity,
+        color_support_label, command_names, decoded_secret_text, detect_color_support_from_env,
+        highlighted_json_text, highlighted_text, highlighted_yaml_text, is_auth_refresh_log_error,
+        is_retryable_log_error, is_visible_log_line, json_spans_for_line,
+        next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
+        resolved_active_match_line, resource_alias_names, search_match_lines_in_logs, severity_tag,
+        slice_chars, step_match_line, sync_table_viewport, table_viewport_rows,
+        truncate_for_clipboard, ui_theme_for, yaml_spans_for_line,
     };
     use crate::{
         cluster::{
@@ -5313,6 +6596,14 @@ mod tests {
         async fn delete_resource(&self, _key: &ResourceKey) -> Result<ActionResult, ActionError> {
             Err(ActionError::Unsupported("noop".to_string()))
         }
+
+        async fn replace_resource(
+            &self,
+            _key: &ResourceKey,
+            _manifest: serde_json::Value,
+        ) -> Result<ActionResult, ActionError> {
+            Err(ActionError::Unsupported("noop".to_string()))
+        }
     }
 
     fn mk_entity(
@@ -5341,6 +6632,7 @@ mod tests {
             contexts,
             "ctx-dev".to_string(),
             Some("default".to_string()),
+            HashMap::new(),
             Arc::new(NoopExecutor),
             Arc::new(NoopProvider {
                 contexts: vec!["ctx-dev".to_string()],
@@ -5430,6 +6722,11 @@ mod tests {
             "all",
             "0",
             "kind",
+            "fmt",
+            "format",
+            "yaml",
+            "yml",
+            "json",
             "resources",
             "res",
             "aliases",
@@ -5442,7 +6739,11 @@ mod tests {
             "src",
             "pause",
             "resume",
+            "edit",
             "tail",
+            "copy",
+            "yank",
+            "dump",
             "pulse",
             "pulses",
             "pu",
@@ -5565,6 +6866,46 @@ mod tests {
     }
 
     #[test]
+    fn yaml_syntax_highlighter_marks_key_number_bool_and_comment_tokens() {
+        let spans = yaml_spans_for_line("cpu: 123\nenabled: true # ok", ColorSupport::Basic);
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "cpu" && style.fg == Some(Color::Cyan))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "123" && style.fg == Some(Color::Magenta))
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(text, style)| text == "true" && style.fg == Some(Color::Yellow))
+        );
+    }
+
+    #[test]
+    fn yaml_syntax_highlighter_keeps_search_highlight() {
+        let rendered = highlighted_yaml_text(
+            "kind: Pod\nname: demo # marker",
+            "demo",
+            ColorSupport::Basic,
+            Some(1),
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .any(|line| line.spans.iter().any(|span| {
+                    span.content.contains("demo")
+                        && (span.style.bg == Some(Color::Yellow)
+                            || span.style.bg == Some(Color::Cyan))
+                }))
+        );
+    }
+
+    #[test]
     fn active_search_match_uses_distinct_highlight_color() {
         let rendered = highlighted_text("alpha\ndemo\nomega demo", "demo", Some(1));
         let mut saw_active = false;
@@ -5583,6 +6924,62 @@ mod tests {
         }
         assert!(saw_active);
         assert!(saw_regular);
+    }
+
+    #[test]
+    fn base64_encode_matches_known_values() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_decode_handles_standard_and_urlsafe_forms() {
+        assert_eq!(base64_decode("Zm9v").expect("decode"), b"foo");
+        assert_eq!(base64_decode("Zm9vYg==").expect("decode"), b"foob");
+        assert!(base64_decode("%%%").is_err());
+    }
+
+    #[test]
+    fn decoded_secret_text_decodes_data_entries() {
+        let raw = serde_json::json!({
+            "metadata": { "namespace": "default", "name": "demo" },
+            "type": "Opaque",
+            "data": {
+                "username": "YWRtaW4=",
+                "password": "czNjcjN0"
+            }
+        });
+        let out = decoded_secret_text(&raw);
+        let parsed: BTreeMap<String, String> =
+            serde_yaml::from_str(&out).expect("decoded secret output yaml");
+        assert_eq!(parsed.get("username"), Some(&"admin".to_string()));
+        assert_eq!(parsed.get("password"), Some(&"s3cr3t".to_string()));
+    }
+
+    #[test]
+    fn clipboard_truncate_preserves_utf8_boundary() {
+        let (out, truncated) = truncate_for_clipboard("abc\u{1f680}def", 5);
+        assert!(truncated);
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn step_match_line_moves_cursor_and_wraps() {
+        let matches = vec![3, 8, 13];
+        assert_eq!(step_match_line(&matches, 3, true), Some((8, 2)));
+        assert_eq!(step_match_line(&matches, 13, true), Some((3, 1)));
+        assert_eq!(step_match_line(&matches, 8, false), Some((3, 1)));
+        assert_eq!(step_match_line(&matches, 3, false), Some((13, 3)));
+    }
+
+    #[test]
+    fn resolved_active_match_line_prefers_explicit_cursor_if_present() {
+        let matches = vec![5, 15, 25];
+        assert_eq!(resolved_active_match_line(0, &matches, Some(15)), Some(15));
+        assert_eq!(resolved_active_match_line(14, &matches, None), Some(15));
     }
 
     #[test]
@@ -5680,8 +7077,26 @@ mod tests {
         app.current_tab_mut().detail_filter = "metadata".to_string();
 
         let snap = render_snapshot(&mut app, 120, 32);
-        assert!(snap.contains("Describe | NORMAL"));
+        assert!(snap.contains("Describe (yaml) | NORMAL"));
         assert!(snap.contains("search:/metadata"));
+    }
+
+    #[test]
+    fn detail_search_keeps_full_body_visible() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        app.current_tab_mut().pane = Pane::Describe;
+        app.current_tab_mut().detail_filter = "metadata".to_string();
+
+        let body = app.current_view_text().expect("detail body");
+        assert!(body.contains("metadata"));
+        assert!(body.contains("status"));
     }
 
     #[test]
@@ -5737,14 +7152,40 @@ mod tests {
             elapsed / 2_000
         );
     }
-}
 
-struct TerminalGuard;
+    #[test]
+    fn table_viewport_rows_accounts_for_header_and_borders() {
+        assert_eq!(table_viewport_rows(0), 0);
+        assert_eq!(table_viewport_rows(2), 0);
+        assert_eq!(table_viewport_rows(3), 0);
+        assert_eq!(table_viewport_rows(6), 3);
+    }
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let mut stdout = io::stdout();
-        let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+    #[test]
+    fn table_viewport_sync_scrolls_down_when_selection_leaves_bottom() {
+        let (selected, offset) = sync_table_viewport(15, 0, 10, 100);
+        assert_eq!(selected, 15);
+        assert_eq!(offset, 6);
+    }
+
+    #[test]
+    fn table_viewport_sync_scrolls_up_when_selection_leaves_top() {
+        let (selected, offset) = sync_table_viewport(89, 90, 10, 100);
+        assert_eq!(selected, 89);
+        assert_eq!(offset, 89);
+    }
+
+    #[test]
+    fn table_viewport_sync_keeps_selection_moving_inside_viewport() {
+        let (selected, offset) = sync_table_viewport(98, 90, 10, 100);
+        assert_eq!(selected, 98);
+        assert_eq!(offset, 90);
+    }
+
+    #[test]
+    fn table_viewport_sync_handles_empty_data() {
+        let (selected, offset) = sync_table_viewport(5, 3, 10, 0);
+        assert_eq!(selected, 0);
+        assert_eq!(offset, 0);
     }
 }

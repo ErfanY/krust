@@ -3,20 +3,11 @@ use std::{fs, path::PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct AppConfig {
     pub runtime: RuntimeConfig,
     pub ui: UiConfig,
-}
-
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            runtime: RuntimeConfig::default(),
-            ui: UiConfig::default(),
-        }
-    }
 }
 
 impl AppConfig {
@@ -39,8 +30,6 @@ impl AppConfig {
 pub struct RuntimeConfig {
     pub fps_limit: u16,
     pub delta_channel_capacity: usize,
-    pub namespace: Option<String>,
-    pub default_context: Option<String>,
     pub warm_contexts: usize,
     pub warm_context_ttl_secs: u64,
 }
@@ -50,8 +39,6 @@ impl Default for RuntimeConfig {
         Self {
             fps_limit: 60,
             delta_channel_capacity: 2048,
-            namespace: None,
-            default_context: None,
             warm_contexts: 1,
             warm_context_ttl_secs: 20,
         }
@@ -76,14 +63,14 @@ impl Default for UiConfig {
 
 pub fn default_config_path() -> PathBuf {
     let mut base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.push("krs");
+    base.push("krust");
     base.push("config.toml");
     base
 }
 
 pub fn default_keymap_path() -> PathBuf {
     let mut base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.push("krs");
+    base.push("krust");
     base.push("keymap.toml");
     base
 }

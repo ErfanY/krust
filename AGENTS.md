@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## Project Intent
-`krs` is a latency-first, power-user Kubernetes TUI for very large environments:
+`krust` is a latency-first, power-user Kubernetes TUI for very large environments:
 - many contexts/clusters
 - many resources per cluster
 - frequent churn
