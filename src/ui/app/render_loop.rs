@@ -346,9 +346,9 @@ impl App {
             .map(|(tag, body, _)| format!("{tag} {body}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let help_text = "ctrl+c quit | : command | / ? filter/search | n/N next/prev | gg/G top/bottom | ctrl+d/u half-page | [ ] history | - repeat | ctrl+a aliases | tab switch-ctx | j/k move/scroll | left/right h-scroll (wrap off) | w wrap toggle | y copy detail | d describe | x decode secret | e edit | :fmt yaml|json | l logs(stream) | s tail on/off | p pause/resume logs | S sources | L latest | c container picker | ctrl+d delete(table) | ctrl+k kill";
+        let help_text = self.context_help_text(&active);
         let help_height = if self.show_help {
-            max_vertical_scroll_for_text(help_text, frame.area().width.max(1), 1, true) + 1
+            max_vertical_scroll_for_text(help_text.as_str(), frame.area().width.max(1), 1, true) + 1
         } else {
             0
         };
@@ -897,5 +897,134 @@ impl App {
             Paragraph::new(command_line).style(command_style),
             chunks[command_idx],
         );
+    }
+
+    fn context_help_text(&self, active: &ContextTabState) -> String {
+        if let Some(input) = &self.command_input {
+            return match input.mode {
+                CommandMode::Command => [
+                    "mode:command",
+                    "type command",
+                    "Tab autocomplete",
+                    "Enter execute",
+                    "ctrl+w del-word",
+                    "Backspace del-char",
+                    "Esc cancel",
+                ]
+                .join(" | "),
+                CommandMode::Filter => [
+                    "mode:filter/search",
+                    "type to update live",
+                    "n/N next/prev match",
+                    "Tab autocomplete",
+                    "Enter keep",
+                    "Esc clear+cancel",
+                    "ctrl+w del-word",
+                ]
+                .join(" | "),
+            };
+        }
+
+        if let Some(overlay) = &self.overlay {
+            return match overlay {
+                Overlay::Contexts { .. } => [
+                    "overlay:contexts",
+                    "j/k or up/down move",
+                    "Enter switch",
+                    "/ filter",
+                    "Esc close",
+                ]
+                .join(" | "),
+                Overlay::Containers { .. } => [
+                    "overlay:containers",
+                    "j/k or up/down move",
+                    "Enter select",
+                    "/ filter",
+                    "Esc close",
+                ]
+                .join(" | "),
+                Overlay::LogSources { .. } => [
+                    "overlay:log-sources",
+                    "j/k or up/down move",
+                    "Enter/Space toggle",
+                    "a enable all",
+                    "/ filter",
+                    "Esc close",
+                ]
+                .join(" | "),
+                Overlay::Text { .. } => [
+                    "overlay:text",
+                    "j/k or up/down scroll",
+                    "w wrap",
+                    "left/right h-scroll",
+                    "Esc close",
+                ]
+                .join(" | "),
+            };
+        }
+
+        let mut items = vec![
+            "ctrl+c quit",
+            ": command",
+            "/ search/filter",
+            "tab switch-ctx",
+            "[ ] history",
+            "- repeat",
+            "ctrl+a aliases",
+        ];
+
+        match active.pane {
+            Pane::Table => {
+                items.extend([
+                    "j/k move",
+                    "gg/G top/bottom",
+                    "ctrl+d/u page",
+                    "Enter describe/select-ns",
+                    "d describe",
+                    "l logs",
+                    "c containers",
+                    "ctrl+d delete",
+                    "ctrl+k kill",
+                ]);
+            }
+            Pane::Describe | Pane::SecretDecode | Pane::Events => {
+                items.extend([
+                    "j/k scroll",
+                    "gg/G top/bottom",
+                    "ctrl+d/u page",
+                    "n/N next/prev",
+                    "w wrap",
+                    "left/right h-scroll",
+                    "y copy",
+                    "d table/describe toggle",
+                ]);
+                if matches!(active.pane, Pane::Describe | Pane::SecretDecode) {
+                    items.extend(["e edit", ":fmt yaml|json"]);
+                }
+                if active.kind() == ResourceKind::Secrets {
+                    items.push("x decode toggle");
+                }
+                items.push("l logs");
+            }
+            Pane::Logs => {
+                items.extend([
+                    "j/k scroll",
+                    "gg/G top/bottom",
+                    "ctrl+d/u page",
+                    "n/N next/prev",
+                    "w wrap",
+                    "left/right h-scroll",
+                    "y copy",
+                    "s tail on/off",
+                    "p pause/resume",
+                    "S sources",
+                    "L latest",
+                    "c containers",
+                    "d describe",
+                ]);
+            }
+        }
+
+        items.join(" | ")
     }
 }

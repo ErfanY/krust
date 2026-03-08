@@ -271,7 +271,9 @@ impl App {
             }
         };
 
-        let edited_text = match run_external_editor(&initial_text, detail_format.extension()) {
+        let editor_result = run_external_editor(&initial_text, detail_format.extension());
+        self.needs_terminal_reset = true;
+        let edited_text = match editor_result {
             Ok(Some(text)) => text,
             Ok(None) => {
                 self.status_line = "Edit canceled".to_string();

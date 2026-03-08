@@ -11,12 +11,16 @@ use std::{
 use anyhow::Context;
 use chrono::Local;
 use crossterm::{
+    cursor::MoveTo,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
         KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -229,6 +233,15 @@ pub async fn run(
     let mut dirty = true;
 
     loop {
+        if app.needs_terminal_reset {
+            terminal
+                .clear()
+                .context("failed to clear terminal after editor exit")?;
+            app.needs_terminal_reset = false;
+            dirty = true;
+            last_render = Instant::now() - frame_budget;
+        }
+
         while let Ok(delta) = delta_rx.try_recv() {
             app.store.apply(delta);
             dirty = true;
@@ -310,6 +323,7 @@ struct App {
     show_help: bool,
     detail_page_step: u16,
     pending_detail_g: bool,
+    needs_terminal_reset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -836,6 +850,7 @@ impl App {
             show_help,
             detail_page_step: 10,
             pending_detail_g: false,
+            needs_terminal_reset: false,
         }
     }
 
@@ -1724,17 +1739,15 @@ fn run_external_editor(initial_text: &str, extension: &str) -> Result<Option<Str
 
     fs::write(&path, initial_text).map_err(|err| err.to_string())?;
 
-    let leave_result = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-    let _ = disable_raw_mode();
-    if let Err(err) = leave_result {
+    if let Err(err) = suspend_tui_for_editor() {
         let _ = fs::remove_file(&path);
-        return Err(err.to_string());
+        return Err(format!("failed to suspend terminal for editor: {err}"));
     }
 
     let status = Command::new(&editor).arg(&path).status();
 
-    let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
-    let _ = enable_raw_mode();
+    let restore_result = resume_tui_after_editor();
+    drain_pending_input_events();
 
     let result = match status {
         Ok(status) if status.success() => fs::read_to_string(&path)
@@ -1745,7 +1758,34 @@ fn run_external_editor(initial_text: &str, extension: &str) -> Result<Option<Str
     };
 
     let _ = fs::remove_file(&path);
+    restore_result?;
     result
+}
+
+fn suspend_tui_for_editor() -> Result<(), String> {
+    disable_raw_mode().map_err(|err| err.to_string())?;
+    let mut stdout = io::stdout();
+    execute!(stdout, DisableMouseCapture, LeaveAlternateScreen).map_err(|err| err.to_string())
+}
+
+fn resume_tui_after_editor() -> Result<(), String> {
+    enable_raw_mode().map_err(|err| err.to_string())?;
+    let mut stdout = io::stdout();
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )
+    .map_err(|err| err.to_string())?;
+    stdout.flush().map_err(|err| err.to_string())
+}
+
+fn drain_pending_input_events() {
+    while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
 }
 
 fn list_filtered_indices(values: &[String], filter: &str) -> Vec<usize> {

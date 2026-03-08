@@ -817,11 +817,7 @@ where
 
 fn extract_status(kind: ResourceKind, raw: &serde_json::Value) -> String {
     match kind {
-        ResourceKind::Pods => raw
-            .pointer("/status/phase")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Unknown")
-            .to_string(),
+        ResourceKind::Pods => extract_pod_status(raw),
         ResourceKind::Deployments => {
             let ready = raw
                 .pointer("/status/readyReplicas")
@@ -848,6 +844,44 @@ fn extract_status(kind: ResourceKind, raw: &serde_json::Value) -> String {
             .unwrap_or("-")
             .to_string(),
     }
+}
+
+fn extract_pod_status(raw: &serde_json::Value) -> String {
+    if raw
+        .pointer("/metadata/deletionTimestamp")
+        .and_then(serde_json::Value::as_str)
+        .is_some()
+    {
+        return "Terminating".to_string();
+    }
+
+    if let Some(reason) = raw
+        .pointer("/status/containerStatuses")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|statuses| {
+            statuses.iter().find_map(|status| {
+                status
+                    .pointer("/state/waiting/reason")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        status
+                            .pointer("/state/terminated/reason")
+                            .and_then(serde_json::Value::as_str)
+                    })
+            })
+        })
+    {
+        return reason.to_string();
+    }
+
+    raw.pointer("/status/reason")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            raw.pointer("/status/phase")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("Unknown")
+        .to_string()
 }
 
 fn extract_summary(kind: ResourceKind, raw: &serde_json::Value) -> String {
@@ -966,10 +1000,11 @@ fn spawn_watch_for_kind(
 mod tests {
     use kube::{Error, error::Status};
     use kube_runtime::watcher;
+    use serde_json::json;
 
     use super::{
-        ActionError, KubeResourceProvider, api_resource_spec_for_kind, is_forbidden_watcher_error,
-        next_watch_backoff, select_warm_contexts,
+        ActionError, KubeResourceProvider, api_resource_spec_for_kind, extract_status,
+        is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts,
     };
     use crate::{
         cluster::ActionExecutor,
@@ -1110,6 +1145,37 @@ mod tests {
                 kind
             );
         }
+    }
+
+    #[test]
+    fn pod_status_prefers_terminating_when_deletion_timestamp_present() {
+        let raw = json!({
+            "metadata": { "deletionTimestamp": "2026-03-08T14:12:00Z" },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    { "state": { "waiting": { "reason": "CrashLoopBackOff" } } }
+                ]
+            }
+        });
+
+        let status = extract_status(ResourceKind::Pods, &raw);
+        assert_eq!(status, "Terminating");
+    }
+
+    #[test]
+    fn pod_status_uses_container_waiting_reason_when_available() {
+        let raw = json!({
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    { "state": { "waiting": { "reason": "ImagePullBackOff" } } }
+                ]
+            }
+        });
+
+        let status = extract_status(ResourceKind::Pods, &raw);
+        assert_eq!(status, "ImagePullBackOff");
     }
 
     fn readonly_provider() -> KubeResourceProvider {
