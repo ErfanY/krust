@@ -21,7 +21,7 @@ concurrency:
 jobs:
   preflight:
     name: Preflight release eligibility
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       release_enabled: ${{ steps.eval.outputs.release_enabled }}
 
@@ -65,7 +65,7 @@ jobs:
     name: Validate + compute version
     needs: preflight
     if: ${{ needs.preflight.outputs.release_enabled == 'true' && (github.event_name != 'push' || (!contains(github.event.head_commit.message, '[skip ci]') && github.actor != 'github-actions[bot]')) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
@@ -227,11 +227,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
 
     steps:
@@ -273,7 +273,7 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [prepare, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout release tag
@@ -320,7 +320,7 @@ jobs:
   verify-release-assets:
     name: Verify release assets
     needs: [prepare, publish]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Verify required assets exist on release
@@ -352,7 +352,7 @@ jobs:
   sync-homebrew-tap:
     name: Sync Homebrew tap
     needs: [prepare, publish, verify-release-assets]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout release tag
@@ -415,7 +415,7 @@ jobs:
   update-status:
     name: Update status page
     needs: [prepare, publish, verify-release-assets, sync-homebrew-tap]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout main
