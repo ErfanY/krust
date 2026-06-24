@@ -663,7 +663,6 @@ impl App {
                             )
                         })
                         .collect();
-
                     let table = Table::new(
                         rows,
                         [
@@ -675,8 +674,30 @@ impl App {
                         ],
                     )
                     .header(
-                        Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"])
-                            .style(theme.table_header),
+                        Row::new(vec![
+                            label_with_sort_marking(
+                                "Namespace".to_string(),
+                                SortColumn::Namespace,
+                                &active.sort,
+                            ),
+                            label_with_sort_marking(
+                                "Name".to_string(),
+                                SortColumn::Name,
+                                &active.sort,
+                            ),
+                            label_with_sort_marking(
+                                "Status".to_string(),
+                                SortColumn::Status,
+                                &active.sort,
+                            ),
+                            label_with_sort_marking(
+                                "Age".to_string(),
+                                SortColumn::Age,
+                                &active.sort,
+                            ),
+                            "Summary".to_string(),
+                        ])
+                        .style(theme.table_header),
                     )
                     .block(Block::default().borders(Borders::ALL).title(format!(
                         "[KIND] {} ({})",
@@ -1108,5 +1129,13 @@ impl App {
         }
 
         items.join(" | ")
+    }
+}
+
+fn label_with_sort_marking(s: String, column: SortColumn, current: &SortColumn) -> String {
+    if column == *current {
+        format!("{}*", s)
+    } else {
+        s
     }
 }
