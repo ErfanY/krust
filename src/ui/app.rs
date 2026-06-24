@@ -317,6 +317,8 @@ pub async fn run_bench(
     iters: usize,
     settle_secs: u64,
     context_count: usize,
+    soak_secs: u64,
+    soak_sample_secs: u64,
 ) -> anyhow::Result<()> {
     let mut app = App::new(
         contexts,
@@ -329,8 +331,15 @@ pub async fn run_bench(
         readonly,
         false,
     );
-    app.run_bench(delta_rx, iters.max(1), settle_secs, context_count.max(1))
-        .await;
+    app.run_bench(
+        delta_rx,
+        iters.max(1),
+        settle_secs,
+        context_count.max(1),
+        soak_secs,
+        soak_sample_secs.max(1),
+    )
+    .await;
     Ok(())
 }
 

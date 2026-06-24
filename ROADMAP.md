@@ -181,14 +181,21 @@ Root problem: full object JSON kept for every entity.
 ---
 
 ## Phase 5 — Hardening & release
+- [~] **5.1 Soak test** — reusable soak harness (`--soak-secs N [--soak-sample-secs S]`,
+  `src/ui/app/bench.rs`) runs the real watch→store pipeline under live churn, sampling
+  RSS / entity-count / fd-count for leaks. Representative run (210s, 3 rollout-restarts/s on
+  100-replica deploys): **RSS 64→62 MB (−3.6%, stable), fds flat at 16, no leak**; entity count
+  tracks the churning workload without affecting RSS (lean entities). Multi-hour run still TODO for
+  the final gate, but the harness + this run validate the bounds hold under sustained churn.
+- [~] **5.2 Reconnect-storm & mixed-RBAC soak** — partial: the 5.1 soak exercised periodic watcher
+  relists (every ~20s) under load with flat fds + RSS (no reconnect/fd leak). Still TODO: explicit
+  forced-reconnect storm and a mixed-RBAC (some 403) context.
 - [~] **5.0 UX consistency (labels/keybindings/help)** — ongoing pass to keep each view's help,
   labels, and key hints accurate. Done so far: per-pane help corrected (table no longer claims
   detail-only `ctrl+d/u` paging or `gg`; added namespace/sort/reverse/events/help/close hints);
   help is now **keymap-aware** (`Keymap::hint`, reflects remapped bindings); operator-guide +
   README reconciled (incl. `:api`/dynamic browse). Tests: keymap hint + per-pane help accuracy.
   Remaining: revisit when new views/commands land (e.g. interactive dynamic-list overlay).
-- [ ] **5.1 Soak test** — 20 ctx × 10k pods × churn for hours; watch RSS / fd / tokio-task growth.
-- [ ] **5.2 Reconnect-storm & mixed-RBAC soak** — verify bounded backoff, no leaks, 403 stays terminal.
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.
 - [ ] **5.4 Docs refresh** — architecture/performance/operator guides updated to new model.
