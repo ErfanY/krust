@@ -39,8 +39,9 @@ use tracing::{error, warn};
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
-    ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, PodLogEvent,
-    PodLogRequest, PodLogStream, ResourceProvider, WatchTarget, extract::extracted_for,
+    ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, NodeUsage,
+    PodLogEvent, PodLogRequest, PodLogStream, ResourceProvider, WatchTarget,
+    extract::{extracted_for, usage_from_metrics},
 };
 
 /// Bounded one-shot dynamic list size (Phase 4.1 read-only browse).
@@ -419,6 +420,27 @@ impl ResourceProvider for KubeResourceProvider {
             (false, _) => Api::all_with(client, ar),
         };
         Ok(serde_json::to_value(api.get(name).await?)?)
+    }
+
+    async fn node_metrics(&self, context: &str) -> anyhow::Result<Vec<NodeUsage>> {
+        let client = self.client_for_context(context).await?;
+        let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
+        let mut ar = ApiResource::from_gvk(&gvk);
+        ar.plural = "nodes".to_string();
+        let api: Api<DynamicObject> = Api::all_with(client, &ar);
+        let list = api.list(&ListParams::default()).await?;
+        let rows = list
+            .into_iter()
+            .filter_map(|obj| {
+                let usage = obj.data.get("usage")?;
+                let (cpu_used_m, mem_used_b) = usage_from_metrics(usage)?;
+                Some(NodeUsage {
+                    cpu_used_m,
+                    mem_used_b,
+                })
+            })
+            .collect();
+        Ok(rows)
     }
 }
 

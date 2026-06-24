@@ -61,4 +61,8 @@ pub struct Cli {
     /// With --discover: also list (and describe the first object of) this resource (plural or kind).
     #[arg(long, hide = true)]
     pub discover_resource: Option<String>,
+
+    /// Print live cluster usage from metrics.k8s.io for the initial context, then exit (4.2 check).
+    #[arg(long, hide = true, default_value_t = false)]
+    pub metrics: bool,
 }

@@ -41,6 +41,13 @@ impl DiscoveredResource {
     }
 }
 
+/// Actual resource usage for one node, from `metrics.k8s.io` (Phase 4.2).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeUsage {
+    pub cpu_used_m: u64,
+    pub mem_used_b: u64,
+}
+
 /// A generic row from a one-shot dynamic list (no curated columns).
 #[derive(Debug, Clone)]
 pub struct DynamicRow {
@@ -137,6 +144,10 @@ pub trait ResourceProvider: Send + Sync {
         namespace: Option<&str>,
         name: &str,
     ) -> anyhow::Result<serde_json::Value>;
+
+    /// Per-node actual usage from `metrics.k8s.io` (Phase 4.2). Errors if the metrics API is not
+    /// served (no metrics-server); callers degrade gracefully.
+    async fn node_metrics(&self, context: &str) -> anyhow::Result<Vec<NodeUsage>>;
 }
 
 #[async_trait]

@@ -162,8 +162,13 @@ Root problem: full object JSON kept for every entity.
     (Interactive selectable dynamic-list overlay deferred to 4.1c polish.)
   - [ ] **4.1b dynamic watches + KindId/ResourceKey refactor** (fold 24 typed watches into the dynamic path).
   - [ ] **4.1c navigation/UX** (discovered kinds in kind-cycle / resource picker, short names from discovery).
-- [ ] **4.2 Metrics integration** — `metrics.k8s.io` for real pod/node CPU+mem (top-style).
-  Current numbers are from spec requests/limits, not usage.
+- [~] **4.2 Metrics integration** — DONE (node-level). `ResourceProvider::node_metrics` reads live
+  usage from `metrics.k8s.io` (via `Api<DynamicObject>`); App caches it per active context (15s TTL,
+  lazy) and the pulse shows a `[USE]` row: real cpu/mem used vs allocatable + util%, with severity.
+  Degrades gracefully to the request/limit rows when no metrics-server (cache → None). Hidden
+  `--metrics` probe for verification. **Verified: real metrics-server cluster (45 nodes → 15.0 cores
+  / 537 GiB actual usage) and graceful 404 fallback on the kwok lab.** Unit test on real unit formats
+  (nanocores/Ki). Deferred: per-pod usage column (needs pod-metrics fetch + table column work).
 - [ ] **4.3 Resource-correlated events** — selecting a pod shows its events; today Events pane
   only renders Event objects directly (detail_pane.rs:170 "planned").
 - [ ] **4.4 Rendered describe** — kubectl-style human `describe` output alongside YAML/JSON.

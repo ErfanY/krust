@@ -183,6 +183,23 @@ fn mem(resources: &serde_json::Map<String, Value>, field: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Parse a `metrics.k8s.io` usage object (`{cpu, memory}`) into (millicores, bytes). Used for both
+/// NodeMetrics (`/usage`) and summed PodMetrics container usage. Returns None if neither is present.
+pub(crate) fn usage_from_metrics(usage: &Value) -> Option<(u64, u64)> {
+    let cpu = usage
+        .get("cpu")
+        .and_then(Value::as_str)
+        .map(parse_cpu_millicores);
+    let mem = usage
+        .get("memory")
+        .and_then(Value::as_str)
+        .map(parse_bytes_quantity);
+    match (cpu, mem) {
+        (None, None) => None,
+        (c, m) => Some((c.unwrap_or(0), m.unwrap_or(0))),
+    }
+}
+
 pub(crate) fn parse_cpu_millicores(value: &str) -> u64 {
     let value = value.trim();
     if value.is_empty() {
@@ -267,6 +284,16 @@ mod tests {
         let r = e.pod_resources.expect("pod resources");
         assert_eq!(r.cpu_request_m, 150);
         assert_eq!(r.mem_request_b, (64 + 32) * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_real_metrics_usage_units() {
+        // formats seen on a real cluster: nanocores + Ki memory
+        let usage = json!({ "cpu": "429753714n", "memory": "10872076Ki" });
+        let (cpu_m, mem_b) = usage_from_metrics(&usage).expect("usage parses");
+        assert_eq!(cpu_m, 430); // ~0.43 cores
+        assert_eq!(mem_b, 10872076u64 * 1024); // ~10.4 GiB
+        assert!(usage_from_metrics(&json!({})).is_none());
     }
 
     #[test]
