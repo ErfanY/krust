@@ -171,6 +171,9 @@ Root problem: full object JSON kept for every entity.
   "metrics-server n/a" when absent). **Verified on a real cluster: 45 nodes / 821 pods reporting
   real usage; graceful 404 fallback on kwok.** Unit tests: real unit formats, pod columns render +
   unavailable note.
+  - **Right-sizing:** Pods CPU/MEM cells show `‹used› R‹%req› L‹%limit›` (e.g. `1.50c R150 L75`) —
+    actual usage plus utilization vs request and limit; cell yellow ≥100% request, red ≥90% limit.
+    `pod_usage_cell` helper; unit-tested.
 - [ ] **4.3 Resource-correlated events** — selecting a pod shows its events; today Events pane
   only renders Event objects directly (detail_pane.rs:170 "planned").
 - [ ] **4.4 Rendered describe** — kubectl-style human `describe` output alongside YAML/JSON.
