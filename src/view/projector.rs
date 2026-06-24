@@ -125,7 +125,7 @@ mod tests {
             age: Some(Utc::now() - Duration::minutes(5)),
             labels: vec![],
             summary: format!("{name}-summary"),
-            raw: serde_json::json!({ "name": name }),
+            extracted: Default::default(),
         }));
     }
 

@@ -163,7 +163,7 @@ mod tests {
             age: Some(Utc::now()),
             labels: vec![("app".to_string(), "demo".to_string())],
             summary: "test".to_string(),
-            raw: serde_json::json!({"name": name}),
+            extracted: Default::default(),
         }
     }
 

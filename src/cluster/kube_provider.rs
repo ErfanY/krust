@@ -39,7 +39,7 @@ use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
     ActionError, ActionExecutor, ActionResult, PodLogEvent, PodLogRequest, PodLogStream,
-    ResourceProvider, WatchTarget,
+    ResourceProvider, WatchTarget, extract::extracted_for,
 };
 
 #[derive(Debug, Clone)]
@@ -315,6 +315,26 @@ impl ResourceProvider for KubeResourceProvider {
         });
 
         Ok(PodLogStream { rx, task })
+    }
+
+    async fn get_object(&self, key: &ResourceKey) -> anyhow::Result<serde_json::Value> {
+        let client = self.client_for_context(&key.context).await?;
+        let spec = api_resource_spec_for_kind(key.kind)
+            .with_context(|| format!("no API mapping for {}", key.kind))?;
+        let gvk = GroupVersionKind::gvk(spec.group, spec.version, spec.kind);
+        let mut ar = ApiResource::from_gvk(&gvk);
+        ar.plural = spec.plural.to_string();
+
+        let obj: DynamicObject = if spec.namespaced {
+            let namespace = key.namespace.as_deref().unwrap_or("default");
+            let api: Api<DynamicObject> = Api::namespaced_with(client, namespace, &ar);
+            api.get(&key.name).await?
+        } else {
+            let api: Api<DynamicObject> = Api::all_with(client, &ar);
+            api.get(&key.name).await?
+        };
+
+        Ok(serde_json::to_value(obj)?)
     }
 }
 
@@ -804,6 +824,8 @@ where
 
     let status = extract_status(kind, &raw);
     let summary = extract_summary(kind, &raw);
+    // Extract the few scalar fields the all-rows hot paths need, then drop the full JSON.
+    let extracted = extracted_for(kind, &raw);
 
     Some(ResourceEntity {
         key,
@@ -811,7 +833,7 @@ where
         age,
         labels,
         summary,
-        raw,
+        extracted,
     })
 }
 

@@ -73,6 +73,7 @@ use crate::{
     view::{SimpleViewProjector, ViewModel, ViewProjector, ViewRequest},
 };
 
+mod bench;
 mod command_mode;
 mod detail_pane;
 mod logs;
@@ -293,6 +294,37 @@ pub async fn run(
     }
 }
 
+/// Headless performance benchmark entry point. Boots the same data plane as `run` (provider,
+/// watchers, store) against the initial context scoped to all-namespace Pods, lets it sync, then
+/// measures the real project/render/aggregate hot paths and prints a report. No terminal setup.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_bench(
+    contexts: Vec<String>,
+    initial_context: String,
+    context_default_namespaces: HashMap<String, Option<String>>,
+    delta_rx: mpsc::Receiver<StateDelta>,
+    action_executor: Arc<dyn ActionExecutor>,
+    resource_provider: Arc<dyn ResourceProvider>,
+    keymap: Keymap,
+    readonly: bool,
+    iters: usize,
+    settle_secs: u64,
+) -> anyhow::Result<()> {
+    let mut app = App::new(
+        contexts,
+        initial_context,
+        None,
+        context_default_namespaces,
+        action_executor,
+        resource_provider,
+        keymap,
+        readonly,
+        false,
+    );
+    app.run_bench(delta_rx, iters.max(1), settle_secs).await;
+    Ok(())
+}
+
 struct App {
     store: StateStore,
     tabs: Vec<ContextTabState>,
@@ -324,6 +356,16 @@ struct App {
     detail_page_step: u16,
     pending_detail_g: bool,
     needs_terminal_reset: bool,
+    detail_cache: Option<DetailObject>,
+}
+
+/// On-demand full object for the active detail/describe/decode/edit view. Single-slot: holds the
+/// last opened resource only (selection is stable while scrolling a detail pane).
+#[derive(Debug, Clone)]
+struct DetailObject {
+    key: ResourceKey,
+    value: serde_json::Value,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -568,11 +610,12 @@ impl App {
             ..PodResourceTotals::default()
         };
         for pod in pods {
-            let (cpu_req, cpu_lim, mem_req, mem_lim) = pod_resources_from_raw(&pod.raw);
-            totals.cpu_request_m = totals.cpu_request_m.saturating_add(cpu_req);
-            totals.cpu_limit_m = totals.cpu_limit_m.saturating_add(cpu_lim);
-            totals.mem_request_b = totals.mem_request_b.saturating_add(mem_req);
-            totals.mem_limit_b = totals.mem_limit_b.saturating_add(mem_lim);
+            if let Some(res) = &pod.extracted.pod_resources {
+                totals.cpu_request_m = totals.cpu_request_m.saturating_add(res.cpu_request_m);
+                totals.cpu_limit_m = totals.cpu_limit_m.saturating_add(res.cpu_limit_m);
+                totals.mem_request_b = totals.mem_request_b.saturating_add(res.mem_request_b);
+                totals.mem_limit_b = totals.mem_limit_b.saturating_add(res.mem_limit_b);
+            }
         }
 
         self.pod_util_cache.insert(
@@ -598,17 +641,18 @@ impl App {
             ..NodeCapacityTotals::default()
         };
         for node in nodes {
-            let (ready, unschedulable, cpu_alloc_m, mem_alloc_b, pod_alloc) =
-                node_capacity_from_raw(&node.raw);
-            if ready {
+            let Some(cap) = &node.extracted.node_capacity else {
+                continue;
+            };
+            if cap.ready {
                 totals.nodes_ready += 1;
             }
-            if unschedulable {
+            if cap.unschedulable {
                 totals.nodes_unschedulable += 1;
             }
-            totals.cpu_alloc_m = totals.cpu_alloc_m.saturating_add(cpu_alloc_m);
-            totals.mem_alloc_b = totals.mem_alloc_b.saturating_add(mem_alloc_b);
-            totals.pod_alloc = totals.pod_alloc.saturating_add(pod_alloc);
+            totals.cpu_alloc_m = totals.cpu_alloc_m.saturating_add(cap.cpu_alloc_m);
+            totals.mem_alloc_b = totals.mem_alloc_b.saturating_add(cap.mem_alloc_b);
+            totals.pod_alloc = totals.pod_alloc.saturating_add(cap.pod_alloc);
         }
 
         self.node_util_cache.insert(
@@ -851,6 +895,7 @@ impl App {
             detail_page_step: 10,
             pending_detail_g: false,
             needs_terminal_reset: false,
+            detail_cache: None,
         }
     }
 
@@ -1609,6 +1654,37 @@ impl App {
         {
             self.status_line = format!("watch setup error: {err}");
         }
+        self.maybe_load_detail().await;
+    }
+
+    /// Fetch the full object for the selected row on demand when a detail pane is active and the
+    /// cache does not already hold it. Single-slot; selection is stable while scrolling a detail
+    /// pane, so this fires only on pane entry or selection change.
+    async fn maybe_load_detail(&mut self) {
+        let pane = self.current_tab().pane;
+        if !matches!(pane, Pane::Describe | Pane::SecretDecode | Pane::Events) {
+            return;
+        }
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if self.detail_cache.as_ref().map(|d| &d.key) == Some(&row.key) {
+            return;
+        }
+        let provider = self.resource_provider.clone();
+        let key = row.key.clone();
+        self.detail_cache = Some(match provider.get_object(&key).await {
+            Ok(value) => DetailObject {
+                key,
+                value,
+                error: None,
+            },
+            Err(err) => DetailObject {
+                key,
+                value: serde_json::Value::Null,
+                error: Some(err.to_string()),
+            },
+        });
     }
 }
 
@@ -1908,189 +1984,6 @@ fn context_filtered_indices(contexts: &[String], filter: &str) -> Vec<usize> {
     list_filtered_indices(contexts, filter)
 }
 
-fn pod_resources_from_raw(raw: &serde_json::Value) -> (u64, u64, u64, u64) {
-    let spec = raw.get("spec").and_then(serde_json::Value::as_object);
-
-    let mut cpu_req_sum = 0u64;
-    let mut cpu_lim_sum = 0u64;
-    let mut mem_req_sum = 0u64;
-    let mut mem_lim_sum = 0u64;
-    let mut init_cpu_req_max = 0u64;
-    let mut init_cpu_lim_max = 0u64;
-    let mut init_mem_req_max = 0u64;
-    let mut init_mem_lim_max = 0u64;
-
-    if let Some(spec) = spec {
-        if let Some(containers) = spec.get("containers").and_then(serde_json::Value::as_array) {
-            for c in containers {
-                let resources = c.get("resources").and_then(serde_json::Value::as_object);
-                if let Some(resources) = resources {
-                    cpu_req_sum = cpu_req_sum.saturating_add(extract_cpu(resources, "requests"));
-                    cpu_lim_sum = cpu_lim_sum.saturating_add(extract_cpu(resources, "limits"));
-                    mem_req_sum = mem_req_sum.saturating_add(extract_mem(resources, "requests"));
-                    mem_lim_sum = mem_lim_sum.saturating_add(extract_mem(resources, "limits"));
-                }
-            }
-        }
-
-        if let Some(containers) = spec
-            .get("initContainers")
-            .and_then(serde_json::Value::as_array)
-        {
-            for c in containers {
-                let resources = c.get("resources").and_then(serde_json::Value::as_object);
-                if let Some(resources) = resources {
-                    init_cpu_req_max = init_cpu_req_max.max(extract_cpu(resources, "requests"));
-                    init_cpu_lim_max = init_cpu_lim_max.max(extract_cpu(resources, "limits"));
-                    init_mem_req_max = init_mem_req_max.max(extract_mem(resources, "requests"));
-                    init_mem_lim_max = init_mem_lim_max.max(extract_mem(resources, "limits"));
-                }
-            }
-        }
-
-        if let Some(overhead) = spec.get("overhead").and_then(serde_json::Value::as_object) {
-            if let Some(cpu) = overhead.get("cpu").and_then(serde_json::Value::as_str) {
-                let v = parse_cpu_millicores(cpu);
-                cpu_req_sum = cpu_req_sum.saturating_add(v);
-                cpu_lim_sum = cpu_lim_sum.saturating_add(v);
-            }
-            if let Some(mem) = overhead.get("memory").and_then(serde_json::Value::as_str) {
-                let v = parse_bytes_quantity(mem);
-                mem_req_sum = mem_req_sum.saturating_add(v);
-                mem_lim_sum = mem_lim_sum.saturating_add(v);
-            }
-        }
-    }
-
-    (
-        cpu_req_sum.saturating_add(init_cpu_req_max),
-        cpu_lim_sum.saturating_add(init_cpu_lim_max),
-        mem_req_sum.saturating_add(init_mem_req_max),
-        mem_lim_sum.saturating_add(init_mem_lim_max),
-    )
-}
-
-fn node_capacity_from_raw(raw: &serde_json::Value) -> (bool, bool, u64, u64, u64) {
-    let unschedulable = raw
-        .pointer("/spec/unschedulable")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    let ready = raw
-        .pointer("/status/conditions")
-        .and_then(serde_json::Value::as_array)
-        .and_then(|conditions| {
-            conditions.iter().find_map(|cond| {
-                let cond_type = cond.get("type").and_then(serde_json::Value::as_str)?;
-                if cond_type != "Ready" {
-                    return None;
-                }
-                cond.get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|status| status.eq_ignore_ascii_case("true"))
-            })
-        })
-        .unwrap_or(false);
-
-    let cpu_alloc_m = raw
-        .pointer("/status/allocatable/cpu")
-        .and_then(serde_json::Value::as_str)
-        .map(parse_cpu_millicores)
-        .unwrap_or(0);
-    let mem_alloc_b = raw
-        .pointer("/status/allocatable/memory")
-        .and_then(serde_json::Value::as_str)
-        .map(parse_bytes_quantity)
-        .unwrap_or(0);
-    let pod_alloc = raw
-        .pointer("/status/allocatable/pods")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-
-    (ready, unschedulable, cpu_alloc_m, mem_alloc_b, pod_alloc)
-}
-
-fn extract_cpu(resources: &serde_json::Map<String, serde_json::Value>, field: &str) -> u64 {
-    resources
-        .get(field)
-        .and_then(serde_json::Value::as_object)
-        .and_then(|m| m.get("cpu"))
-        .and_then(serde_json::Value::as_str)
-        .map(parse_cpu_millicores)
-        .unwrap_or(0)
-}
-
-fn extract_mem(resources: &serde_json::Map<String, serde_json::Value>, field: &str) -> u64 {
-    resources
-        .get(field)
-        .and_then(serde_json::Value::as_object)
-        .and_then(|m| m.get("memory"))
-        .and_then(serde_json::Value::as_str)
-        .map(parse_bytes_quantity)
-        .unwrap_or(0)
-}
-
-fn parse_cpu_millicores(value: &str) -> u64 {
-    let value = value.trim();
-    if value.is_empty() {
-        return 0;
-    }
-    if let Some(v) = value.strip_suffix('n') {
-        return parse_decimal_to_u64(v, 1.0 / 1_000_000.0);
-    }
-    if let Some(v) = value.strip_suffix('u') {
-        return parse_decimal_to_u64(v, 1.0 / 1000.0);
-    }
-    if let Some(v) = value.strip_suffix('m') {
-        return parse_decimal_to_u64(v, 1.0);
-    }
-    parse_decimal_to_u64(value, 1000.0)
-}
-
-fn parse_bytes_quantity(value: &str) -> u64 {
-    let value = value.trim();
-    if value.is_empty() {
-        return 0;
-    }
-    let split = value
-        .char_indices()
-        .find(|(_, ch)| !ch.is_ascii_digit() && *ch != '.' && *ch != '-' && *ch != '+')
-        .map(|(idx, _)| idx)
-        .unwrap_or(value.len());
-    let (num, suffix) = value.split_at(split);
-
-    let multiplier = match suffix {
-        "" => 1.0,
-        "n" => 1.0 / 1_000_000_000.0,
-        "u" => 1.0 / 1_000_000.0,
-        "m" => 1.0 / 1000.0,
-        "Ki" => 1024.0,
-        "Mi" => 1024.0_f64.powi(2),
-        "Gi" => 1024.0_f64.powi(3),
-        "Ti" => 1024.0_f64.powi(4),
-        "Pi" => 1024.0_f64.powi(5),
-        "Ei" => 1024.0_f64.powi(6),
-        "K" => 1000.0,
-        "M" => 1000.0_f64.powi(2),
-        "G" => 1000.0_f64.powi(3),
-        "T" => 1000.0_f64.powi(4),
-        "P" => 1000.0_f64.powi(5),
-        "E" => 1000.0_f64.powi(6),
-        _ => 1.0,
-    };
-    parse_decimal_to_u64(num, multiplier)
-}
-
-fn parse_decimal_to_u64(value: &str, multiplier: f64) -> u64 {
-    value
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .map(|v| (v * multiplier).max(0.0).round() as u64)
-        .unwrap_or(0)
-}
-
 fn format_millicpu(value: u64) -> String {
     if value >= 1000 {
         let cores = value as f64 / 1000.0;
@@ -2119,18 +2012,6 @@ fn percent(numerator: u64, denominator: u64) -> String {
     }
     let pct = (numerator as f64 / denominator as f64) * 100.0;
     format!("{pct:.0}%")
-}
-
-fn owner_reference_matches(raw: &serde_json::Value, owner_kind: &str, owner_name: &str) -> bool {
-    raw.pointer("/metadata/ownerReferences")
-        .and_then(serde_json::Value::as_array)
-        .map(|owners| {
-            owners.iter().any(|owner| {
-                owner.get("kind").and_then(serde_json::Value::as_str) == Some(owner_kind)
-                    && owner.get("name").and_then(serde_json::Value::as_str) == Some(owner_name)
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn log_target_name(target: &LogTarget) -> String {
@@ -2276,6 +2157,18 @@ impl Drop for TerminalGuard {
 }
 
 #[cfg(test)]
+impl App {
+    /// Inject the on-demand detail object directly (tests have no live provider to fetch from).
+    fn seed_detail_cache_for_test(&mut self, key: ResourceKey, value: serde_json::Value) {
+        self.detail_cache = Some(DetailObject {
+            key,
+            value,
+            error: None,
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -2336,6 +2229,10 @@ mod tests {
         async fn stream_pod_logs(&self, _request: PodLogRequest) -> anyhow::Result<PodLogStream> {
             anyhow::bail!("noop log stream provider")
         }
+
+        async fn get_object(&self, _key: &ResourceKey) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
     }
 
     struct NoopExecutor;
@@ -2368,10 +2265,7 @@ mod tests {
             age: Some(Utc::now()),
             labels: vec![("app".to_string(), "demo".to_string())],
             summary: "snapshot".to_string(),
-            raw: serde_json::json!({
-                "metadata": { "name": name, "namespace": namespace.unwrap_or("default") },
-                "status": { "phase": status }
-            }),
+            extracted: Default::default(),
         }
     }
 
@@ -2878,6 +2772,14 @@ mod tests {
         )));
         app.current_tab_mut().pane = Pane::Describe;
         app.current_tab_mut().detail_filter = "metadata".to_string();
+        let key = app.selected_row().expect("selected row").key;
+        app.seed_detail_cache_for_test(
+            key,
+            serde_json::json!({
+                "metadata": { "name": "pod-a", "namespace": "default" },
+                "status": { "phase": "Running" }
+            }),
+        );
 
         let body = app.current_view_text().expect("detail body");
         assert!(body.contains("metadata"));

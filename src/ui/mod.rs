@@ -6,4 +6,4 @@ mod pulse;
 mod render;
 mod search;
 
-pub use app::run;
+pub use app::{run, run_bench};

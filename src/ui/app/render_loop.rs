@@ -73,14 +73,14 @@ impl App {
         if active.kind() == ResourceKind::Pods
             && let Some(row) = vm.rows.get(selected)
             && let Some(entity) = self.store.get(&row.key)
+            && let Some(res) = &entity.extracted.pod_resources
         {
-            let (cpu_req, cpu_lim, mem_req, mem_lim) = pod_resources_from_raw(&entity.raw);
             top_line.push_str(&format!(
                 "  [SEL-RES] cpu {}/{} mem {}/{}",
-                format_millicpu(cpu_req),
-                format_millicpu(cpu_lim),
-                format_bytes(mem_req),
-                format_bytes(mem_lim)
+                format_millicpu(res.cpu_request_m),
+                format_millicpu(res.cpu_limit_m),
+                format_bytes(res.mem_request_b),
+                format_bytes(res.mem_limit_b)
             ));
         }
 

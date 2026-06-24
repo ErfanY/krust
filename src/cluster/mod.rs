@@ -1,3 +1,4 @@
+mod extract;
 mod kube_provider;
 
 use async_trait::async_trait;
@@ -70,6 +71,9 @@ pub trait ResourceProvider: Send + Sync {
         targets: &[WatchTarget],
     ) -> anyhow::Result<()>;
     async fn stream_pod_logs(&self, request: PodLogRequest) -> anyhow::Result<PodLogStream>;
+    /// Fetch the full object for a single resource on demand (for detail/describe/decode/edit).
+    /// Not retained per row — see the lean entity model (docs/design/phase-1.1-lean-entity-model.md).
+    async fn get_object(&self, key: &ResourceKey) -> anyhow::Result<serde_json::Value>;
 }
 
 #[async_trait]
