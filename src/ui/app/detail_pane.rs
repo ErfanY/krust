@@ -38,8 +38,9 @@ impl App {
             Pane::Describe | Pane::SecretDecode | Pane::Events => {
                 let request = self.view_request_for_tab(&tab);
                 let vm = self.projected_view(&request);
-                let selected = tab.selected.min(vm.rows.len().saturating_sub(1));
-                let raw = self.detail_text(&vm.rows, selected, tab.pane, tab.detail_format);
+                let selected = tab.selected.min(vm.len().saturating_sub(1));
+                let key = vm.key(selected).cloned();
+                let raw = self.detail_text(key.as_ref(), tab.pane, tab.detail_format);
                 Some(raw)
             }
         }
@@ -134,23 +135,22 @@ impl App {
 
     pub(super) fn detail_text(
         &self,
-        rows: &[crate::view::ViewRow],
-        selected: usize,
+        key: Option<&ResourceKey>,
         pane: Pane,
         format: DetailFormat,
     ) -> String {
-        let Some(row) = rows.get(selected) else {
+        let Some(key) = key else {
             return "No resource selected".to_string();
         };
         // The full object is fetched on demand (lean entity model) and held in detail_cache.
-        let Some(detail) = self.detail_cache.as_ref().filter(|d| d.key == row.key) else {
-            return format!("Loading {} {} …", row.key.kind.short_name(), row.key.name);
+        let Some(detail) = self.detail_cache.as_ref().filter(|d| &d.key == key) else {
+            return format!("Loading {} {} …", key.kind.short_name(), key.name);
         };
         if let Some(err) = &detail.error {
             return format!(
                 "Failed to load {} {}: {err}",
-                row.key.kind.short_name(),
-                row.key.name
+                key.kind.short_name(),
+                key.name
             );
         }
         let raw = &detail.value;
@@ -161,7 +161,7 @@ impl App {
                 DetailFormat::Json => to_pretty_json(raw),
             },
             Pane::SecretDecode => {
-                if row.key.kind != ResourceKind::Secrets {
+                if key.kind != ResourceKind::Secrets {
                     return "Decode pane is available for Secret resources only".to_string();
                 }
                 match format {
@@ -170,7 +170,7 @@ impl App {
                 }
             }
             Pane::Events => {
-                if row.key.kind == ResourceKind::Events {
+                if key.kind == ResourceKind::Events {
                     match format {
                         DetailFormat::Yaml => to_pretty_yaml(raw),
                         DetailFormat::Json => to_pretty_json(raw),
@@ -246,12 +246,11 @@ impl App {
         let active = self.current_tab().clone();
         let request = self.view_request_for_tab(&active);
         let vm = self.projected_view(&request);
-        let selected = active.selected.min(vm.rows.len().saturating_sub(1));
-        let Some(row) = vm.rows.get(selected) else {
+        let selected = active.selected.min(vm.len().saturating_sub(1));
+        let Some(key) = vm.key(selected).cloned() else {
             self.status_line = "No resource selected".to_string();
             return;
         };
-        let key = row.key.clone();
         // Reuse the on-demand detail object if it is for this row; otherwise fetch it now.
         let cached = self
             .detail_cache

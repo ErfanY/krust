@@ -70,7 +70,7 @@ use crate::{
         StateDelta,
     },
     state::StateStore,
-    view::{SimpleViewProjector, ViewModel, ViewProjector, ViewRequest},
+    view::{SimpleViewProjector, ViewModel, ViewProjector, ViewRequest, materialize_row},
 };
 
 mod bench;
@@ -580,8 +580,9 @@ impl App {
         let active = self.current_tab().clone();
         let request = self.view_request_for_tab(&active);
         let vm = self.projected_view(&request);
-        let selected = active.selected.min(vm.rows.len().saturating_sub(1));
-        vm.rows.get(selected).cloned()
+        let selected = active.selected.min(vm.len().saturating_sub(1));
+        let key = vm.key(selected)?.clone();
+        materialize_row(&self.store, &key)
     }
 
     fn count_kind_for_tab(&self, tab: &ContextTabState, kind: ResourceKind) -> usize {
@@ -1312,21 +1313,25 @@ impl App {
             Pane::Table => {
                 let request = self.view_request_for_tab(&active);
                 let vm = self.projected_view(&request);
-                let mut lines = Vec::with_capacity(vm.rows.len().saturating_add(1));
+                let mut lines = Vec::with_capacity(vm.len().saturating_add(1));
                 lines.push("namespace\tname\tstatus\tage\tsummary".to_string());
-                for row in &vm.rows {
-                    lines.push(format!(
-                        "{}\t{}\t{}\t{}\t{}",
-                        row.namespace, row.name, row.status, row.age, row.summary
-                    ));
+                // Copy/dump materializes the full list (user-initiated, not a hot path).
+                for key in &vm.order {
+                    if let Some(row) = materialize_row(&self.store, key) {
+                        lines.push(format!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            row.namespace, row.name, row.status, row.age, row.summary
+                        ));
+                    }
                 }
                 Some(lines.join("\n"))
             }
             Pane::Describe | Pane::SecretDecode | Pane::Events => {
                 let request = self.view_request_for_tab(&active);
                 let vm = self.projected_view(&request);
-                let selected = active.selected.min(vm.rows.len().saturating_sub(1));
-                let raw = self.detail_text(&vm.rows, selected, active.pane, active.detail_format);
+                let selected = active.selected.min(vm.len().saturating_sub(1));
+                let key = vm.key(selected).cloned();
+                let raw = self.detail_text(key.as_ref(), active.pane, active.detail_format);
                 Some(raw)
             }
             Pane::Logs => {
@@ -1534,17 +1539,18 @@ impl App {
         let selected = active.selected;
         let request = self.view_request_for_tab(&active);
         let vm = self.projected_view(&request);
-        let Some(row) = vm.rows.get(selected.min(vm.rows.len().saturating_sub(1))) else {
+        let Some(key) = vm.key(selected.min(vm.len().saturating_sub(1))).cloned() else {
             self.status_line = "No resource selected".to_string();
             return;
         };
 
+        let name = key.name.clone();
         self.pending_confirmation = Some(PendingConfirmation {
             created_at: Instant::now(),
             ttl: Duration::from_secs(15),
-            kind: ConfirmationKind::Delete(row.key.clone()),
+            kind: ConfirmationKind::Delete(key),
         });
-        self.status_line = format!("Delete {}? press y to confirm", row.key.name);
+        self.status_line = format!("Delete {name}? press y to confirm");
     }
 
     async fn confirm_action(&mut self) {

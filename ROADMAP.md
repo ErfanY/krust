@@ -65,6 +65,17 @@ initial sync:              2.10s       (≈unchanged; per-event to_value remains
 **New per-frame-under-churn ≈ 0.36 + 1.92 + 5.92 ≈ 8.2ms** (was 15.5ms). Headroom restored; the
 remaining frame cost is now projection+render (Phase 2.1) and the ingest `to_value` (Phase 1.2).
 
+### After Phase 2.1 (viewport windowing) — same conditions
+```
+RSS @10k pods 1 ctx:       64.8 MB  (was 85.5; cache holds keys not full ViewRows)
+frame render (cached):     p50 0.47ms (was 5.92ms; 12.5x) — materializes only ~visible rows
+projection (recompute):    p50 1.20ms (was 1.92ms; no per-row display-string build)
+pulse aggregate:           p50 0.35ms (unchanged)
+```
+**Per-frame-under-churn ≈ 0.35 + 1.20 + 0.47 ≈ 2.0ms** (was 8.2ms, originally 15.5ms). Remaining
+frame cost: projection recompute (sort+key-clone, O(n); could go incremental later) and the ingest
+`to_value` on the watch path (Phase 1.2).
+
 ---
 
 ## Phase 1 — Memory & data model (root cost; unblocks Phases 2 & 3)
@@ -87,9 +98,11 @@ Root problem: full object JSON kept for every entity.
 ---
 
 ## Phase 2 — Compute & render hot paths
-- [ ] **2.1 Viewport-windowed projection/render** — `project` clones every matching row
-  (projector.rs:72) and the table renderer builds a `Row` for all of them
-  (render_loop.rs:603) though ~40 are visible. Materialize only visible+margin; O(visible).
+- [x] **2.1 Viewport-windowed projection/render** — DONE. `ViewModel` now holds ordered keys
+  (`order: Vec<ResourceKey>`), not full rows; display rows materialize on demand via
+  `view::materialize_row` only for the visible window in the table render (render_loop.rs) and for
+  the selected row elsewhere. **Measured (10k pods): frame render 5.92ms -> 0.47ms (12.5x);
+  projection 1.92ms -> 1.20ms; RSS 85.5MB -> 64.8MB.** 71 tests pass.
 - [ ] **2.2 Incremental Pulse aggregates** — `pod_resource_totals(ctx,None)` (app.rs:554)
   walks every pod's raw JSON parsing CPU/mem strings; revision-keyed cache thrashes under
   churn. Maintain phase counts + resource sums incrementally in `StateStore` on delta apply,
