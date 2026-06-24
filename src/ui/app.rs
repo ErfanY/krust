@@ -2869,6 +2869,35 @@ mod tests {
     }
 
     #[test]
+    fn table_help_matches_actual_table_bindings() {
+        let app = test_app();
+        let tab = app.current_tab().clone();
+        let help = app.context_help_text(&tab);
+        // present + correct
+        assert!(help.contains("g/G top/bot"), "{help}");
+        assert!(help.contains("n namespace"), "{help}");
+        assert!(help.contains("s sort"), "{help}");
+        assert!(help.contains("r reverse"), "{help}");
+        assert!(help.contains("E events"), "{help}");
+        assert!(help.contains("ctrl+d delete"), "{help}");
+        // paging is detail-only; must NOT be advertised in the table (ctrl+d is delete here)
+        assert!(!help.contains("half-page"), "{help}");
+        assert!(!help.contains("gg/G"), "{help}");
+    }
+
+    #[test]
+    fn detail_help_advertises_close_table_and_edit() {
+        let mut app = test_app();
+        app.current_tab_mut().pane = Pane::Describe;
+        let tab = app.current_tab().clone();
+        let help = app.context_help_text(&tab);
+        assert!(help.contains("esc close"), "{help}");
+        assert!(help.contains("t table"), "{help}");
+        assert!(help.contains("e edit"), "{help}");
+        assert!(help.contains("gg/G top/bottom"), "{help}");
+    }
+
+    #[test]
     fn snapshot_describe_pane_has_viewer_state_line() {
         let mut app = test_app();
         app.store.apply(StateDelta::Upsert(mk_entity(

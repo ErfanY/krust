@@ -46,8 +46,8 @@ impl Keymap {
         Self::try_from(raw)
     }
 
-    pub fn is(&self, action: Action, key: &KeyEvent) -> bool {
-        let binding = match action {
+    fn binding(&self, action: Action) -> &Binding {
+        match action {
             Action::Quit => &self.quit,
             Action::NextContext => &self.next_context,
             Action::PrevContext => &self.prev_context,
@@ -69,8 +69,17 @@ impl Keymap {
             Action::Delete => &self.delete,
             Action::Confirm => &self.confirm,
             Action::Cancel => &self.cancel,
-        };
-        binding.matches(key)
+        }
+    }
+
+    pub fn is(&self, action: Action, key: &KeyEvent) -> bool {
+        self.binding(action).matches(key)
+    }
+
+    /// Human-readable key hint for an action, reflecting the active (possibly remapped) binding.
+    /// Used to keep on-screen help accurate when the keymap is customized.
+    pub fn hint(&self, action: Action) -> String {
+        self.binding(action).display()
     }
 }
 
@@ -171,6 +180,37 @@ impl Binding {
     fn matches(&self, key: &KeyEvent) -> bool {
         let normalized = normalize_event(*key);
         self.code == normalized.code && self.modifiers == normalized.modifiers
+    }
+
+    /// Render the binding as a short hint, e.g. `j`, `G`, `ctrl+d`, `shift+tab`, `up`.
+    fn display(&self) -> String {
+        if self.code == KeyCode::BackTab {
+            return "shift+tab".to_string();
+        }
+        let code = match self.code {
+            KeyCode::Char(c) if self.modifiers.contains(KeyModifiers::SHIFT) => {
+                c.to_ascii_uppercase().to_string()
+            }
+            KeyCode::Char(' ') => "space".to_string(),
+            KeyCode::Char(c) => c.to_string(),
+            KeyCode::Tab => "tab".to_string(),
+            KeyCode::Enter => "enter".to_string(),
+            KeyCode::Esc => "esc".to_string(),
+            KeyCode::Up => "up".to_string(),
+            KeyCode::Down => "down".to_string(),
+            KeyCode::Left => "left".to_string(),
+            KeyCode::Right => "right".to_string(),
+            KeyCode::Backspace => "backspace".to_string(),
+            other => format!("{other:?}").to_lowercase(),
+        };
+        let mut prefix = String::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            prefix.push_str("ctrl+");
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            prefix.push_str("alt+");
+        }
+        format!("{prefix}{code}")
     }
 }
 
@@ -326,7 +366,7 @@ impl fmt::Display for Action {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{Action, Keymap};
+    use super::{Action, Keymap, RawKeymap};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, modifiers)
@@ -376,6 +416,31 @@ mod tests {
             Action::CycleNamespace,
             &key(KeyCode::Char('n'), KeyModifiers::empty())
         ));
+    }
+
+    #[test]
+    fn hints_reflect_bindings_for_on_screen_help() {
+        let keymap = Keymap::default();
+        assert_eq!(keymap.hint(Action::Quit), "ctrl+c");
+        assert_eq!(keymap.hint(Action::MoveDown), "j");
+        assert_eq!(keymap.hint(Action::MoveUp), "k");
+        assert_eq!(keymap.hint(Action::GotoTop), "g");
+        assert_eq!(keymap.hint(Action::GotoBottom), "G");
+        assert_eq!(keymap.hint(Action::PrevContext), "shift+tab");
+        assert_eq!(keymap.hint(Action::NextContext), "tab");
+        assert_eq!(keymap.hint(Action::Delete), "ctrl+d");
+        assert_eq!(keymap.hint(Action::Cancel), "esc");
+        assert_eq!(keymap.hint(Action::ToEvents), "E");
+    }
+
+    #[test]
+    fn hints_follow_a_remapped_binding() {
+        let raw = RawKeymap {
+            move_down: "down".to_string(),
+            ..RawKeymap::default()
+        };
+        let keymap = Keymap::try_from(raw).expect("valid keymap");
+        assert_eq!(keymap.hint(Action::MoveDown), "down");
     }
 
     #[test]
