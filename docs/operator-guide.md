@@ -62,6 +62,14 @@ krust --all-contexts
 
 All of the above are remappable via `keymap.toml`; the on-screen help line reflects your active bindings.
 
+## Metrics
+
+If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage:
+- the **Pods table** gains **CPU** and **MEM** columns (actual usage per pod, summed across containers)
+- the **Cluster Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%
+
+Without a metrics-server these degrade gracefully (columns show `-`, the table title notes `metrics-server n/a`, and the pulse falls back to request/limit-based numbers).
+
 ## Logs and Runtime Inspect
 
 - `l`: open logs pane

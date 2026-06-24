@@ -380,7 +380,11 @@ struct App {
     /// Live cluster usage from metrics.k8s.io (Phase 4.2), refreshed lazily for the active context.
     /// `None` means metrics-server isn't available — the pulse falls back to request-based numbers.
     metrics: Option<ClusterMetrics>,
-    metrics_fetched: Option<(String, Instant)>,
+    /// Per-pod live usage `(namespace, name) -> (cpu_millicores, mem_bytes)` for the active scope,
+    /// shown as CPU/MEM columns in the Pods table. Empty when no metrics-server.
+    pod_metrics: HashMap<(String, String), (u64, u64)>,
+    /// (context, namespace-scope, fetched-at) guarding the 15s metrics refresh.
+    metrics_fetched: Option<(String, Option<String>, Instant)>,
 }
 
 /// Cluster-wide actual usage summed from node metrics (Phase 4.2).
@@ -938,6 +942,7 @@ impl App {
             detail_cache: None,
             discovery_cache: HashMap::new(),
             metrics: None,
+            pod_metrics: HashMap::new(),
             metrics_fetched: None,
         }
     }
@@ -1706,32 +1711,48 @@ impl App {
         self.maybe_refresh_metrics().await;
     }
 
-    /// Refresh live cluster usage (metrics.k8s.io) for the active context, at most every 15s.
-    /// On any error/absence (no metrics-server) the cache clears and the pulse degrades to
-    /// request-based numbers — never blocks or errors the UI.
+    /// Refresh live usage (metrics.k8s.io) for the active context+namespace, at most every 15s:
+    /// cluster totals (node metrics) for the pulse and per-pod usage for the table columns. On any
+    /// error/absence (no metrics-server) the caches clear and the UI degrades — never blocks.
     async fn maybe_refresh_metrics(&mut self) {
         let context = self.current_tab().context.clone();
+        let namespace = self.current_tab().namespace.clone();
         let stale = match &self.metrics_fetched {
-            Some((ctx, at)) => ctx != &context || at.elapsed() > Duration::from_secs(15),
+            Some((ctx, ns, at)) => {
+                ctx != &context || ns != &namespace || at.elapsed() > Duration::from_secs(15)
+            }
             None => true,
         };
         if !stale {
             return;
         }
         let provider = self.resource_provider.clone();
+
         self.metrics = match provider.node_metrics(&context).await {
-            Ok(nodes) if !nodes.is_empty() => {
-                let cpu_used_m = nodes.iter().map(|n| n.cpu_used_m).sum();
-                let mem_used_b = nodes.iter().map(|n| n.mem_used_b).sum();
-                Some(ClusterMetrics {
-                    cpu_used_m,
-                    mem_used_b,
-                    nodes_reporting: nodes.len(),
-                })
-            }
+            Ok(nodes) if !nodes.is_empty() => Some(ClusterMetrics {
+                cpu_used_m: nodes.iter().map(|n| n.cpu_used_m).sum(),
+                mem_used_b: nodes.iter().map(|n| n.mem_used_b).sum(),
+                nodes_reporting: nodes.len(),
+            }),
             _ => None,
         };
-        self.metrics_fetched = Some((context, Instant::now()));
+
+        self.pod_metrics = match provider.pod_metrics(&context, namespace.as_deref()).await {
+            Ok(pods) => pods
+                .into_iter()
+                .map(|p| ((p.namespace, p.name), (p.cpu_used_m, p.mem_used_b)))
+                .collect(),
+            Err(_) => HashMap::new(),
+        };
+
+        self.metrics_fetched = Some((context, namespace, Instant::now()));
+    }
+
+    /// Live usage `(cpu_millicores, mem_bytes)` for a pod, if metrics are available.
+    fn pod_usage(&self, namespace: Option<&str>, name: &str) -> Option<(u64, u64)> {
+        self.pod_metrics
+            .get(&(namespace.unwrap_or_default().to_string(), name.to_string()))
+            .copied()
     }
 
     /// Fetch the full object for the selected row on demand when a detail pane is active and the
@@ -2260,6 +2281,12 @@ impl App {
             error: None,
         });
     }
+
+    /// Inject per-pod usage directly (tests don't run the async metrics refresh).
+    fn seed_pod_metrics_for_test(&mut self, namespace: &str, name: &str, cpu_m: u64, mem_b: u64) {
+        self.pod_metrics
+            .insert((namespace.to_string(), name.to_string()), (cpu_m, mem_b));
+    }
 }
 
 #[cfg(test)]
@@ -2385,6 +2412,19 @@ mod tests {
             _context: &str,
         ) -> anyhow::Result<Vec<crate::cluster::NodeUsage>> {
             Ok(Vec::new())
+        }
+
+        async fn pod_metrics(
+            &self,
+            _context: &str,
+            _namespace: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::cluster::PodUsage>> {
+            Ok(vec![crate::cluster::PodUsage {
+                namespace: "default".to_string(),
+                name: "pod-ok".to_string(),
+                cpu_used_m: 250,
+                mem_used_b: 64 * 1024 * 1024,
+            }])
         }
     }
 
@@ -2860,6 +2900,39 @@ mod tests {
         )));
         let recomputed = app.pulse_metrics_for_tab(&tab);
         assert_eq!(recomputed.pods, 2);
+    }
+
+    #[test]
+    fn pods_table_renders_live_cpu_mem_columns() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        app.seed_pod_metrics_for_test("default", "pod-a", 1500, 256 * 1024 * 1024);
+
+        let snap = render_snapshot(&mut app, 140, 20);
+        assert!(snap.contains("CPU") && snap.contains("MEM"), "{snap}");
+        assert!(snap.contains("1.50c"), "expected cpu usage column: {snap}");
+        assert!(snap.contains("256Mi"), "expected mem usage column: {snap}");
+    }
+
+    #[test]
+    fn pods_table_notes_when_metrics_unavailable() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+        // no seeded pod_metrics → CPU/MEM are "-" and the title flags it
+        let snap = render_snapshot(&mut app, 140, 20);
+        assert!(snap.contains("metrics-server n/a"), "{snap}");
     }
 
     #[test]

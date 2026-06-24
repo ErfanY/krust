@@ -642,6 +642,8 @@ impl App {
             match active.pane {
                 Pane::Table => {
                     // Materialize only the visible window — O(viewport), not O(total rows).
+                    // Pods get live CPU/MEM usage columns (metrics.k8s.io) instead of Summary.
+                    let pods_view = active.kind() == ResourceKind::Pods;
                     let viewport_rows = table_viewport_rows(chunks[2].height);
                     let start = table_offset;
                     let end = start.saturating_add(viewport_rows).min(vm.len());
@@ -651,39 +653,71 @@ impl App {
                             let row = materialize_row(&self.store, key)?;
                             let sev = classify_status_severity(&row.status);
                             let status = format!("{} {}", severity_tag(sev), row.status);
-                            Some(
-                                Row::new(vec![
+                            let cells = if pods_view {
+                                let (cpu, mem) =
+                                    match self.pod_usage(key.namespace.as_deref(), &key.name) {
+                                        Some((c, m)) => (format_millicpu(c), format_bytes(m)),
+                                        None => ("-".to_string(), "-".to_string()),
+                                    };
+                                vec![
+                                    Cell::from(row.namespace),
+                                    Cell::from(row.name),
+                                    Cell::from(status),
+                                    Cell::from(cpu),
+                                    Cell::from(mem),
+                                    Cell::from(row.age),
+                                ]
+                            } else {
+                                vec![
                                     Cell::from(row.namespace),
                                     Cell::from(row.name),
                                     Cell::from(status),
                                     Cell::from(row.age),
                                     Cell::from(row.summary),
-                                ])
-                                .style(severity_style(&theme, sev)),
-                            )
+                                ]
+                            };
+                            Some(Row::new(cells).style(severity_style(&theme, sev)))
                         })
                         .collect();
 
-                    let table = Table::new(
-                        rows,
-                        [
-                            Constraint::Length(18),
-                            Constraint::Length(38),
-                            Constraint::Length(20),
-                            Constraint::Length(10),
-                            Constraint::Min(10),
-                        ],
-                    )
-                    .header(
-                        Row::new(vec!["Namespace", "Name", "Status", "Age", "Summary"])
-                            .style(theme.table_header),
-                    )
-                    .block(Block::default().borders(Borders::ALL).title(format!(
-                        "[KIND] {} ({})",
-                        active.kind(),
-                        vm.len()
-                    )))
-                    .row_highlight_style(theme.row_highlight);
+                    let (header, widths): (Vec<&str>, Vec<Constraint>) = if pods_view {
+                        (
+                            vec!["Namespace", "Name", "Status", "CPU", "MEM", "Age"],
+                            vec![
+                                Constraint::Length(18),
+                                Constraint::Min(20),
+                                Constraint::Length(20),
+                                Constraint::Length(9),
+                                Constraint::Length(10),
+                                Constraint::Length(8),
+                            ],
+                        )
+                    } else {
+                        (
+                            vec!["Namespace", "Name", "Status", "Age", "Summary"],
+                            vec![
+                                Constraint::Length(18),
+                                Constraint::Length(38),
+                                Constraint::Length(20),
+                                Constraint::Length(10),
+                                Constraint::Min(10),
+                            ],
+                        )
+                    };
+                    let metrics_note = if pods_view && self.pod_metrics.is_empty() {
+                        "  (CPU/MEM: metrics-server n/a)"
+                    } else {
+                        ""
+                    };
+                    let table = Table::new(rows, widths)
+                        .header(Row::new(header).style(theme.table_header))
+                        .block(Block::default().borders(Borders::ALL).title(format!(
+                            "[KIND] {} ({}){}",
+                            active.kind(),
+                            vm.len(),
+                            metrics_note
+                        )))
+                        .row_highlight_style(theme.row_highlight);
 
                     // Rows are pre-sliced to the window, so the widget offset is 0 and the
                     // selection is window-relative.

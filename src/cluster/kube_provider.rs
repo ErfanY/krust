@@ -40,7 +40,7 @@ use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
     ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, NodeUsage,
-    PodLogEvent, PodLogRequest, PodLogStream, ResourceProvider, WatchTarget,
+    PodLogEvent, PodLogRequest, PodLogStream, PodUsage, ResourceProvider, WatchTarget,
     extract::{extracted_for, usage_from_metrics},
 };
 
@@ -435,6 +435,45 @@ impl ResourceProvider for KubeResourceProvider {
                 let usage = obj.data.get("usage")?;
                 let (cpu_used_m, mem_used_b) = usage_from_metrics(usage)?;
                 Some(NodeUsage {
+                    cpu_used_m,
+                    mem_used_b,
+                })
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    async fn pod_metrics(
+        &self,
+        context: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<PodUsage>> {
+        let client = self.client_for_context(context).await?;
+        let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
+        let mut ar = ApiResource::from_gvk(&gvk);
+        ar.plural = "pods".to_string();
+        let api: Api<DynamicObject> = match namespace {
+            Some(ns) => Api::namespaced_with(client, ns, &ar),
+            None => Api::all_with(client, &ar),
+        };
+        let list = api.list(&ListParams::default()).await?;
+        let rows = list
+            .into_iter()
+            .filter_map(|obj| {
+                let namespace = obj.namespace()?;
+                let name = obj.name_any();
+                // Sum usage across the pod's containers.
+                let containers = obj.data.get("containers").and_then(|v| v.as_array())?;
+                let (mut cpu_used_m, mut mem_used_b) = (0u64, 0u64);
+                for container in containers {
+                    if let Some(usage) = container.get("usage").and_then(usage_from_metrics) {
+                        cpu_used_m = cpu_used_m.saturating_add(usage.0);
+                        mem_used_b = mem_used_b.saturating_add(usage.1);
+                    }
+                }
+                Some(PodUsage {
+                    namespace,
+                    name,
                     cpu_used_m,
                     mem_used_b,
                 })
