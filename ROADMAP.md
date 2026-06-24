@@ -127,15 +127,19 @@ Root problem: full object JSON kept for every entity.
   while disconnected). No blank window during a 10k-pod relist. Unit test
   `relist_keeps_data_visible_and_sweeps_only_gone_objects`; bench confirms no perf/RSS regression
   (sync 2.03s, RSS 64.6MB). 72 tests pass.
-- [ ] **3.2 Delta backpressure/coalescing** — single shared `mpsc` (cap 2048) for all
-  watchers (lib.rs:62). Define policy under simultaneous initial-lists: per-context lanes
-  and/or coalescing so a big relist doesn't delay input/other contexts.
-- [ ] **3.3 Log fan-out cap** — Deployment logs open a stream per replica pod × container
-  (`deployment_pod_keys`/`pod_log_targets`, logs.rs:98-188). Cap concurrent streams, warn,
-  allow explicit expand.
-- [ ] **3.4 Watcher ceiling + auth refresh** — cap total concurrent watchers across warm
-  contexts; ensure 401/auth-refresh handling for watch streams (logs already classify it,
-  app.rs:1827) is matched for resource watchers.
+- [x] **3.2 Delta backpressure/coalescing** — DONE (bounded drain). The main loop drained *all*
+  available deltas per cycle; a 10k initial-list flood could run before input/render was checked.
+  Now capped at `DELTA_MAX_PER_CYCLE` (4096) per cycle; the bounded channel back-pressures producers
+  so nothing is lost and the rest drains next cycle, keeping input responsive during floods.
+  (Per-context lanes/coalescing not needed — the bound + back-pressure is sufficient at measured scale.)
+- [x] **3.3 Log fan-out cap** — DONE. Multi-pod log selections (ReplicaSet/Deployment) cap at
+  `LOG_MAX_STREAMS` (50) concurrent streams via `capped_multi_pod_selection`; scope label notes
+  "N of M streams, capped". Tests `caps_concurrent_streams_and_marks_scope`, `does_not_cap_under_limit`.
+- [x] **3.4 Watcher ceiling + auth refresh** — ASSESSED, no change needed. Watcher count is already
+  bounded by the warm-context policy (active context + `warm_contexts` inactive only; default 1 →
+  ~2 contexts × few kinds). 401/token-expiry on watch streams is handled by kube's auth refresh on
+  reconnect + the existing bounded backoff (`run_watch_loop`). A redundant hard cap would risk
+  dropping the active context's essential watchers for no gain.
 
 ---
 

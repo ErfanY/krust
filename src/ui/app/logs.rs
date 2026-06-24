@@ -135,38 +135,16 @@ impl App {
                 for pod_key in self.replica_set_pod_keys(&row.key) {
                     targets.extend(self.pod_log_targets(&pod_key, None));
                 }
-                targets = normalize_log_targets(targets);
-                if targets.is_empty() {
-                    return None;
-                }
-                Some(LogSelection {
-                    scope: format!(
-                        "rs {}/{} ({} streams)",
-                        row.key.namespace.unwrap_or_else(|| "default".to_string()),
-                        row.key.name,
-                        targets.len()
-                    ),
-                    targets,
-                })
+                let ns = row.key.namespace.unwrap_or_else(|| "default".to_string());
+                capped_multi_pod_selection("rs", &ns, &row.key.name, targets)
             }
             ResourceKind::Deployments => {
                 let mut targets = Vec::new();
                 for pod_key in self.deployment_pod_keys(&row.key) {
                     targets.extend(self.pod_log_targets(&pod_key, None));
                 }
-                targets = normalize_log_targets(targets);
-                if targets.is_empty() {
-                    return None;
-                }
-                Some(LogSelection {
-                    scope: format!(
-                        "deploy {}/{} ({} streams)",
-                        row.key.namespace.unwrap_or_else(|| "default".to_string()),
-                        row.key.name,
-                        targets.len()
-                    ),
-                    targets,
-                })
+                let ns = row.key.namespace.unwrap_or_else(|| "default".to_string());
+                capped_multi_pod_selection("deploy", &ns, &row.key.name, targets)
             }
             _ => None,
         }
@@ -642,5 +620,70 @@ impl App {
         self.logs.search_cache_source_filter_version = self.logs.source_filter_version;
         self.logs.search_cache_matches = matches.clone();
         matches
+    }
+}
+
+/// Build a multi-pod log selection, capping the number of concurrent streams to LOG_MAX_STREAMS.
+/// Beyond the cap the scope label notes "N of M streams, capped" so the operator knows it's partial.
+fn capped_multi_pod_selection(
+    prefix: &str,
+    namespace: &str,
+    name: &str,
+    targets: Vec<LogTarget>,
+) -> Option<LogSelection> {
+    let mut targets = normalize_log_targets(targets);
+    if targets.is_empty() {
+        return None;
+    }
+    let total = targets.len();
+    let capped = total > LOG_MAX_STREAMS;
+    if capped {
+        targets.truncate(LOG_MAX_STREAMS);
+    }
+    let scope = if capped {
+        format!(
+            "{prefix} {namespace}/{name} ({} of {total} streams, capped)",
+            targets.len()
+        )
+    } else {
+        format!("{prefix} {namespace}/{name} ({total} streams)")
+    };
+    Some(LogSelection { scope, targets })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(pod: &str) -> LogTarget {
+        LogTarget {
+            context: "ctx".to_string(),
+            namespace: "ns".to_string(),
+            pod: pod.to_string(),
+            container: Some("main".to_string()),
+        }
+    }
+
+    #[test]
+    fn caps_concurrent_streams_and_marks_scope() {
+        let targets: Vec<LogTarget> = (0..(LOG_MAX_STREAMS + 25))
+            .map(|i| target(&format!("pod-{i:04}")))
+            .collect();
+        let sel = capped_multi_pod_selection("deploy", "ns", "app", targets).expect("selection");
+        assert_eq!(sel.targets.len(), LOG_MAX_STREAMS);
+        assert!(sel.scope.contains("capped"), "scope: {}", sel.scope);
+    }
+
+    #[test]
+    fn does_not_cap_under_limit() {
+        let targets = vec![target("pod-a"), target("pod-b")];
+        let sel = capped_multi_pod_selection("rs", "ns", "app", targets).expect("selection");
+        assert_eq!(sel.targets.len(), 2);
+        assert!(!sel.scope.contains("capped"));
+    }
+
+    #[test]
+    fn empty_targets_yield_no_selection() {
+        assert!(capped_multi_pod_selection("rs", "ns", "app", Vec::new()).is_none());
     }
 }
