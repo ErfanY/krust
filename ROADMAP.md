@@ -87,10 +87,14 @@ Root problem: full object JSON kept for every entity.
   `docs/design/phase-1.1-lean-entity-model.md`.
   **Measured (kwok 10k pods, 1 ctx): RSS 482MB -> 85.5MB (5.6x); pulse 7.62ms -> 0.36ms (21x).**
   71 tests pass. Residual per-event `to_value` remains (initial sync ~unchanged) -> Phase 1.2.
-- [ ] **1.2 Metadata/table-mode watches** — list watchers deserialize full typed objects
-  (`Api<Pod>` etc., `spawn_watch_for_kind` kube_provider.rs:928). Move list kinds to
-  `PartialObjectMetadata` (metadata-only) or server-side Table where viable; hydrate full
-  objects only on describe. Cuts deserialize + transfer + heap.
+- [-] **1.2 Metadata/table-mode watches** — DEPRIORITIZED after measurement (2026-06-24).
+  Micro-bench (`perf_to_value_vs_dynamic_parse`, kube_provider.rs) on a 2.6KB pod:
+  `to_value` 5.4µs/obj, typed parse 5.0µs, dynamic parse 7.9µs. Current ingest serde
+  (parse+to_value) ≈ 104ms/10k; dynamic ≈ 79ms/10k → net **~25ms saved over 10k**, and dynamic
+  parse is *slower* than typed. Against a 2.1s initial sync, serde is ~5%. Sync is dominated by the
+  initial LIST (network/pagination) + channel delivery + store.apply, not serialization. Not worth
+  the watch-layer rewrite. Revisit only if a real cluster with fat objects (10-15KB) shifts the
+  ratio, or fold a watcher list `page_size` bump into 3.x.
 - [ ] **1.3 Warm-context memory bound** — entities for warm contexts (warm_contexts TTL,
   kube_provider.rs:321) can dominate RSS at 20 ctx. Cap/evict entity sets for non-active
   contexts; verify store shrinks when watchers stop (today `Reset` only fires on relist).
@@ -116,9 +120,13 @@ Root problem: full object JSON kept for every entity.
 ---
 
 ## Phase 3 — Stability under churn/scale
-- [ ] **3.1 Reset/relist without blank window** — `Event::Init`→`StateDelta::Reset` wipes a
-  whole kind on every reconnect (kube_provider.rs:769, store.rs:138) then repopulates,
-  blanking the table during a 10k-pod relist. Mark stale + atomic replace (generation id).
+- [x] **3.1 Reset/relist without blank window** — DONE. Replaced `StateDelta::Reset` (wiped the
+  whole kind on every reconnect) with `RelistStart`/`RelistEnd` + a per-(ctx,kind) generation in the
+  store: `Event::Init` bumps the generation (old set stays visible), each apply refreshes objects to
+  the new generation, `Event::InitDone` sweeps only entities left at an older generation (truly gone
+  while disconnected). No blank window during a 10k-pod relist. Unit test
+  `relist_keeps_data_visible_and_sweeps_only_gone_objects`; bench confirms no perf/RSS regression
+  (sync 2.03s, RSS 64.6MB). 72 tests pass.
 - [ ] **3.2 Delta backpressure/coalescing** — single shared `mpsc` (cap 2048) for all
   watchers (lib.rs:62). Define policy under simultaneous initial-lists: per-context lanes
   and/or coalescing so a big relist doesn't delay input/other contexts.

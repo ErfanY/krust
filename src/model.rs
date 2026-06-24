@@ -221,8 +221,20 @@ pub struct NodeCapacity {
 pub enum StateDelta {
     Upsert(ResourceEntity),
     Remove(ResourceKey),
-    Reset { context: String, kind: ResourceKind },
-    Error { context: String, message: String },
+    /// A (re)list of this kind is starting — mark the existing set stale, keep showing it.
+    RelistStart {
+        context: String,
+        kind: ResourceKind,
+    },
+    /// The (re)list finished — sweep entities not refreshed during it.
+    RelistEnd {
+        context: String,
+        kind: ResourceKind,
+    },
+    Error {
+        context: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
