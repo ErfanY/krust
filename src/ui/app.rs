@@ -243,9 +243,16 @@ pub async fn run(
             last_render = Instant::now() - frame_budget;
         }
 
-        while let Ok(delta) = delta_rx.try_recv() {
-            app.store.apply(delta);
-            dirty = true;
+        let mut drained = 0usize;
+        while drained < DELTA_MAX_PER_CYCLE {
+            match delta_rx.try_recv() {
+                Ok(delta) => {
+                    app.store.apply(delta);
+                    dirty = true;
+                    drained += 1;
+                }
+                Err(_) => break,
+            }
         }
         if app.drain_log_events() {
             dirty = true;
@@ -448,6 +455,13 @@ const LOG_MAX_LINES: usize = 5_000;
 const LOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const LOG_DEFAULT_TAIL_LINES: i64 = 2_000;
 const LOG_MAX_EVENTS_PER_DRAIN: usize = 1_024;
+/// Max state deltas applied per UI cycle. Bounds per-cycle work so an initial-list flood
+/// (10k+ upserts) can't starve input/render within one loop iteration; the rest drains next cycle
+/// (the bounded channel back-pressures producers, so nothing is lost or grows unbounded).
+const DELTA_MAX_PER_CYCLE: usize = 4_096;
+/// Max concurrent pod log streams for a multi-pod selection (ReplicaSet/Deployment). A deployment
+/// with hundreds of replicas would otherwise open hundreds of follow connections to the apiserver.
+const LOG_MAX_STREAMS: usize = 50;
 const PULSE_TAG_WIDTH: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
