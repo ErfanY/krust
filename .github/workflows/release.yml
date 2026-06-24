@@ -83,13 +83,8 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Validate (fmt/check/test/build)
-        run: |
-          set -euo pipefail
-          cargo fmt --all -- --check
-          cargo check --locked
-          cargo test --locked
-          cargo build --release --locked
+      - name: Validate (make validate)
+        run: make validate
 
       - name: Resolve next semver
         id: version
@@ -253,19 +248,8 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package artifact
-        shell: bash
-        run: |
-          set -euo pipefail
-          TARGET='${{ matrix.target }}'
-          PKG="krust-${TARGET}"
-          mkdir -p "dist/${PKG}"
-          cp "target/${TARGET}/release/krust" "dist/${PKG}/krust"
-          cp README.md LICENSE "dist/${PKG}/"
-          tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
+      - name: Build + package artifact (make package)
+        run: make package TARGET=${{ matrix.target }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

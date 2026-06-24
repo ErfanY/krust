@@ -9,11 +9,13 @@
 Agent behavior must prioritize snappiness and controlled API pressure over feature breadth.
 
 ## Mandatory Change Pipeline
-After every code change, run validation in this order:
-1. `cargo fmt --all`
-2. `cargo check`
-3. `cargo test`
-4. `cargo build --release`
+After every code change, run `make validate` — it runs, in order:
+1. `cargo fmt --all -- --check`
+2. `cargo check --locked`
+3. `cargo test --locked`
+4. `cargo build --release --locked`
+
+This is the same target CI runs (`make ci`). Use `make fmt` to auto-format.
 
 Rules:
 - If tests fail, do not proceed to release build until fixed.
