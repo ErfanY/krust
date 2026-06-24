@@ -231,6 +231,11 @@ pub enum StateDelta {
         context: String,
         kind: ResourceKind,
     },
+    /// All watchers for a context were stopped (dropped from the active + warm set) — drop its
+    /// cached entities so store memory stays bounded to active + warm contexts (Phase 1.3).
+    EvictContext {
+        context: String,
+    },
     Error {
         context: String,
         message: String,

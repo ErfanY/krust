@@ -64,12 +64,21 @@ impl App {
         mut delta_rx: mpsc::Receiver<StateDelta>,
         iters: usize,
         settle_secs: u64,
+        context_count: usize,
     ) {
         // Scope to all-namespace Pods — the densest list and the primary scale target.
         let pods_idx = ResourceKind::ORDERED
             .iter()
             .position(|k| *k == ResourceKind::Pods)
             .unwrap_or(0);
+
+        // Phase 1.3 memory test: warm N contexts in sequence and report the bounded store size.
+        if context_count > 1 {
+            self.run_bench_multi_context(&mut delta_rx, pods_idx, context_count)
+                .await;
+            return;
+        }
+
         {
             let tab = self.current_tab_mut();
             tab.kind_idx = pods_idx;
@@ -171,5 +180,71 @@ impl App {
         print_stats("pulse aggregate", &stats(pulse));
         print_stats("frame render (cached)", &stats(draw));
         println!("==========================\n");
+    }
+
+    /// Warm `count` contexts in sequence (each its default namespace) and report the resulting
+    /// store size + RSS. With Phase 1.3 eviction, the final store stays bounded to the active +
+    /// warm contexts instead of accumulating every visited context.
+    async fn run_bench_multi_context(
+        &mut self,
+        delta_rx: &mut mpsc::Receiver<StateDelta>,
+        pods_idx: usize,
+        count: usize,
+    ) {
+        let n = count.min(self.tabs.len());
+        eprintln!(
+            "[bench] multi-context memory test: warming {n} contexts (each default namespace)"
+        );
+
+        let drain_for = |app: &mut App, rx: &mut mpsc::Receiver<StateDelta>| {
+            while let Ok(delta) = rx.try_recv() {
+                app.store.apply(delta);
+            }
+        };
+
+        let mut peak_entities = 0usize;
+        for idx in 0..n {
+            self.active_tab = idx;
+            self.current_tab_mut().kind_idx = pods_idx; // keep the tab's default namespace
+            let ctx = self.current_tab().context.clone();
+            self.ensure_active_watch().await;
+
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                drain_for(self, delta_rx);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            peak_entities = peak_entities.max(self.store.entity_count());
+            eprintln!(
+                "[bench]   {}/{} ctx={ctx}  store entities now {}",
+                idx + 1,
+                n,
+                self.store.entity_count()
+            );
+        }
+
+        // final settle so trailing evictions are applied
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            drain_for(self, delta_rx);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let rss_kb = current_rss_kb();
+        println!("\n=== krust bench report (multi-context memory, Phase 1.3) ===");
+        println!("  contexts visited:      {n}");
+        println!("  store entities final:  {}", self.store.entity_count());
+        println!("  peak during sweep:     {peak_entities}");
+        match rss_kb {
+            Some(kb) => println!(
+                "  RSS:                   {kb} KB  ({:.1} MB)",
+                kb as f64 / 1024.0
+            ),
+            None => println!("  RSS:                   (unavailable)"),
+        }
+        println!(
+            "  expected: final ≈ (active + warm_contexts) contexts, NOT {n}× per-context entities"
+        );
+        println!("============================================================\n");
     }
 }

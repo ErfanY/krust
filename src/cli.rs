@@ -41,6 +41,10 @@ pub struct Cli {
     #[arg(long, hide = true, default_value_t = 20)]
     pub bench_settle_secs: u64,
 
+    /// Bench: warm this many contexts in sequence and report store size/RSS (Phase 1.3 memory test).
+    #[arg(long, hide = true, default_value_t = 1)]
+    pub bench_contexts: usize,
+
     /// Print the discovered API resources for the initial context, then exit (Phase 4.1 check).
     #[arg(long, hide = true, default_value_t = false)]
     pub discover: bool,

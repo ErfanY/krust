@@ -29,6 +29,7 @@ impl StateStore {
             StateDelta::Remove(key) => self.remove(&key),
             StateDelta::RelistStart { context, kind } => self.relist_start(&context, kind),
             StateDelta::RelistEnd { context, kind } => self.relist_end(&context, kind),
+            StateDelta::EvictContext { context } => self.evict_context(&context),
             StateDelta::Error { context, message } => {
                 self.errors.insert(context, message);
             }
@@ -149,6 +150,26 @@ impl StateStore {
         }
     }
 
+    /// Drop everything cached for a context whose watchers were stopped (Phase 1.3). Bounds store
+    /// memory to the active + warm contexts instead of accumulating every context ever visited.
+    fn evict_context(&mut self, context: &str) {
+        let kinds: Vec<ResourceKind> = self
+            .context_kind_index
+            .keys()
+            .filter(|(ctx, _)| ctx == context)
+            .map(|(_, kind)| *kind)
+            .collect();
+        for kind in kinds {
+            if let Some(keys) = self.context_kind_index.remove(&(context.to_string(), kind)) {
+                for key in keys {
+                    self.entities.remove(&key);
+                }
+            }
+            self.current_generation.remove(&(context.to_string(), kind));
+        }
+        self.namespaces_by_context.remove(context);
+    }
+
     /// Begin a (re)list for a kind: bump its generation. Existing entities keep their old
     /// generation and stay visible until the matching `relist_end` sweeps whatever wasn't refreshed.
     fn relist_start(&mut self, context: &str, kind: ResourceKind) {
@@ -228,6 +249,23 @@ mod tests {
         store.apply(StateDelta::Remove(key.clone()));
 
         assert!(store.get(&key).is_none());
+    }
+
+    #[test]
+    fn evict_context_drops_only_that_context() {
+        let mut store = StateStore::default();
+        store.apply(StateDelta::Upsert(mk_entity("ctx-a", Some("ns"), "pod-a")));
+        store.apply(StateDelta::Upsert(mk_entity("ctx-b", Some("ns"), "pod-b")));
+        assert_eq!(store.entity_count(), 2);
+
+        store.apply(StateDelta::EvictContext {
+            context: "ctx-a".to_string(),
+        });
+
+        assert_eq!(store.entity_count(), 1);
+        assert!(store.list("ctx-a", ResourceKind::Pods, None).is_empty());
+        assert_eq!(store.list("ctx-b", ResourceKind::Pods, None).len(), 1);
+        assert!(store.namespaces("ctx-a").is_empty());
     }
 
     #[test]

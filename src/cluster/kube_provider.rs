@@ -245,6 +245,8 @@ impl ResourceProvider for KubeResourceProvider {
             .collect();
 
         let mut watched = self.watched.lock().await;
+        let contexts_before: HashSet<String> =
+            watched.keys().map(|key| key.context.clone()).collect();
         let existing_keys: Vec<WatchKey> = watched.keys().cloned().collect();
         for key in existing_keys {
             let keep_existing = if key.context == context {
@@ -269,6 +271,21 @@ impl ResourceProvider for KubeResourceProvider {
                 tx.clone(),
             );
             watched.insert(key, task);
+        }
+
+        // Contexts that lost all their watchers (dropped from active + warm) get their cached
+        // entities evicted so store memory stays bounded (Phase 1.3).
+        let contexts_after: HashSet<String> =
+            watched.keys().map(|key| key.context.clone()).collect();
+        drop(watched);
+        for evicted in contexts_before.difference(&contexts_after) {
+            if evicted != context {
+                let _ = tx
+                    .send(StateDelta::EvictContext {
+                        context: evicted.clone(),
+                    })
+                    .await;
+            }
         }
 
         Ok(())
