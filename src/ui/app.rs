@@ -61,8 +61,8 @@ use super::search::{
 
 use crate::{
     cluster::{
-        ActionError, ActionExecutor, PodLogEvent, PodLogRequest, PodLogStream, ResourceProvider,
-        WatchTarget,
+        ActionError, ActionExecutor, DiscoveredResource, PodLogEvent, PodLogRequest, PodLogStream,
+        ResourceProvider, WatchTarget,
     },
     keymap::{Action, Keymap},
     model::{
@@ -364,6 +364,8 @@ struct App {
     pending_detail_g: bool,
     needs_terminal_reset: bool,
     detail_cache: Option<DetailObject>,
+    /// Per-context API discovery catalog (Phase 4.1), cached after first `:api`/dynamic browse.
+    discovery_cache: HashMap<String, Vec<DiscoveredResource>>,
 }
 
 /// On-demand full object for the active detail/describe/decode/edit view. Single-slot: holds the
@@ -911,6 +913,7 @@ impl App {
             pending_detail_g: false,
             needs_terminal_reset: false,
             detail_cache: None,
+            discovery_cache: HashMap::new(),
         }
     }
 
@@ -2034,6 +2037,23 @@ fn percent(numerator: u64, denominator: u64) -> String {
     format!("{pct:.0}%")
 }
 
+/// Compact age (e.g. "3d", "5h", "12m") for dynamic-resource rows.
+fn short_age(when: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let Some(when) = when else {
+        return "-".to_string();
+    };
+    let delta = chrono::Utc::now().signed_duration_since(when);
+    if delta.num_days() > 0 {
+        format!("{}d", delta.num_days())
+    } else if delta.num_hours() > 0 {
+        format!("{}h", delta.num_hours())
+    } else if delta.num_minutes() > 0 {
+        format!("{}m", delta.num_minutes())
+    } else {
+        format!("{}s", delta.num_seconds().max(0))
+    }
+}
+
 fn log_target_name(target: &LogTarget) -> String {
     if let Some(container) = &target.container {
         format!("{}/{}/{}", target.namespace, target.pod, container)
@@ -2258,7 +2278,16 @@ mod tests {
             &self,
             _context: &str,
         ) -> anyhow::Result<Vec<crate::cluster::DiscoveredResource>> {
-            Ok(Vec::new())
+            let mut ar = kube::core::ApiResource::from_gvk(&kube::core::GroupVersionKind::gvk(
+                "demo.krust.io",
+                "v1",
+                "Widget",
+            ));
+            ar.plural = "widgets".to_string();
+            Ok(vec![crate::cluster::DiscoveredResource {
+                api_resource: ar,
+                namespaced: true,
+            }])
         }
 
         async fn list_dynamic(
@@ -2267,7 +2296,20 @@ mod tests {
             _resource: &crate::cluster::DiscoveredResource,
             _namespace: Option<&str>,
         ) -> anyhow::Result<Vec<crate::cluster::DynamicRow>> {
-            Ok(Vec::new())
+            Ok(vec![
+                crate::cluster::DynamicRow {
+                    namespace: Some("ns-00".to_string()),
+                    name: "widget-0".to_string(),
+                    age: None,
+                    status: "-".to_string(),
+                },
+                crate::cluster::DynamicRow {
+                    namespace: Some("ns-00".to_string()),
+                    name: "widget-1".to_string(),
+                    age: None,
+                    status: "-".to_string(),
+                },
+            ])
         }
 
         async fn get_dynamic(
@@ -2275,9 +2317,13 @@ mod tests {
             _context: &str,
             _resource: &crate::cluster::DiscoveredResource,
             _namespace: Option<&str>,
-            _name: &str,
+            name: &str,
         ) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::json!({}))
+            Ok(serde_json::json!({
+                "apiVersion": "demo.krust.io/v1",
+                "kind": "Widget",
+                "metadata": { "name": name, "namespace": "ns-00" }
+            }))
         }
     }
 
@@ -2419,6 +2465,8 @@ mod tests {
             "resources",
             "res",
             "aliases",
+            "api",
+            "apis",
             "clear",
             "clear-filter",
             "c",
@@ -2786,6 +2834,38 @@ mod tests {
         assert!(snap.contains("[!!] Pending"));
         assert!(snap.contains("pod-bad"));
         assert!(snap.contains("[XX]"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_browse_catalog_list_and_describe() {
+        let mut app = test_app();
+
+        // :api catalog lists the discovered CRD.
+        app.show_api_catalog(None).await;
+        let catalog = app.current_view_text().expect("catalog overlay");
+        assert!(
+            catalog.contains("widgets.demo.krust.io"),
+            "catalog: {catalog}"
+        );
+
+        // :widgets lists objects.
+        assert!(app.browse_dynamic("widgets", None).await);
+        let list = app.current_view_text().expect("list overlay");
+        assert!(
+            list.contains("widget-0") && list.contains("widget-1"),
+            "list: {list}"
+        );
+
+        // :Widget (by kind) resolves too.
+        assert!(app.browse_dynamic("Widget", None).await);
+
+        // :widgets widget-0 describes one object.
+        assert!(app.browse_dynamic("widgets", Some("widget-0")).await);
+        let described = app.current_view_text().expect("describe overlay");
+        assert!(described.contains("kind: Widget"), "describe: {described}");
+
+        // Unknown token does not resolve.
+        assert!(!app.browse_dynamic("definitely-not-a-resource", None).await);
     }
 
     #[test]

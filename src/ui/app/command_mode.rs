@@ -137,7 +137,7 @@ impl App {
         match cmd.as_str() {
             "q" | "quit" | "exit" => true,
             "help" | "?" => {
-                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :fmt [yaml|json] | :c | :sources | :pause | :resume | :edit [yaml|json] | :tail | :copy | :dump <path> | :resources | :clear | :quit | :all".to_string();
+                self.status_line = "Commands: :ctx [name] | :ns [name|all] | :kind <kind> | :api [filter] | :<resource> [name] | :fmt [yaml|json] | :c | :sources | :pause | :resume | :edit [yaml|json] | :tail | :copy | :dump <path> | :resources | :clear | :quit | :all".to_string();
                 false
             }
             "contexts" | "ctxs" => {
@@ -283,6 +283,10 @@ impl App {
                 self.dump_current_view(args);
                 false
             }
+            "api" | "apis" => {
+                self.show_api_catalog(args.first().copied()).await;
+                false
+            }
             "pulse" | "pulses" | "pu" | "xray" | "popeye" | "pop" | "plugins" | "plugin" => {
                 self.status_line =
                     format!("Command ':{cmd}' is recognized but not implemented yet");
@@ -293,17 +297,176 @@ impl App {
                     self.execute_resource_command(kind, args);
                     false
                 }
-                ResourceAlias::Unsupported(resource) => {
-                    self.status_line =
-                        format!("Resource '{resource}' is recognized but not implemented yet");
-                    false
-                }
-                ResourceAlias::Unknown => {
-                    self.status_line = format!("Unknown command: :{raw}");
+                // Not a curated kind — try the dynamic path (any discovered resource/CRD).
+                // `:<resource>` lists objects; `:<resource> <name>` describes one.
+                other => {
+                    let name = args.first().copied();
+                    if self.browse_dynamic(&cmd, name).await {
+                        return false;
+                    }
+                    self.status_line = match other {
+                        ResourceAlias::Unsupported(resource) => format!(
+                            "'{resource}' not found on this context (try the full plural, e.g. :customresourcedefinitions)"
+                        ),
+                        _ => format!("Unknown command or resource: :{raw}"),
+                    };
                     false
                 }
             },
         }
+    }
+
+    /// Discovered API resources for a context, cached after the first lookup (Phase 4.1).
+    pub(super) async fn discovery_for(&mut self, context: &str) -> Vec<DiscoveredResource> {
+        if let Some(cached) = self.discovery_cache.get(context) {
+            return cached.clone();
+        }
+        let provider = self.resource_provider.clone();
+        match provider.discover(context).await {
+            Ok(list) => {
+                self.discovery_cache
+                    .insert(context.to_string(), list.clone());
+                list
+            }
+            Err(err) => {
+                self.status_line = format!("API discovery failed: {err}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// `:api [filter]` — show the discovered API resource catalog in a scrollable overlay.
+    pub(super) async fn show_api_catalog(&mut self, filter: Option<&str>) {
+        let context = self.current_tab().context.clone();
+        let catalog = self.discovery_for(&context).await;
+        if catalog.is_empty() {
+            return;
+        }
+        let needle = filter.map(|f| f.to_ascii_lowercase());
+        let mut lines = vec![
+            format!("API resources on {context} ({} total)", catalog.len()),
+            String::new(),
+            format!("{:<46} {:<26} SCOPE", "NAME", "KIND"),
+        ];
+        let mut shown = 0usize;
+        for r in &catalog {
+            if let Some(n) = &needle
+                && !r.full_name().to_ascii_lowercase().contains(n.as_str())
+                && !r.kind().to_ascii_lowercase().contains(n.as_str())
+            {
+                continue;
+            }
+            shown += 1;
+            lines.push(format!(
+                "{:<46} {:<26} {}",
+                r.full_name(),
+                r.kind(),
+                if r.namespaced {
+                    "namespaced"
+                } else {
+                    "cluster"
+                }
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Browse: :<plural|kind>     Describe: :<plural|kind> <name>".to_string());
+        self.overlay = Some(Overlay::Text {
+            title: "API Resources".to_string(),
+            lines,
+            scroll: 0,
+            hscroll: 0,
+            wrap: false,
+        });
+        self.status_line = format!("API resources: {shown} shown / {} total", catalog.len());
+    }
+
+    /// Resolve `token` against discovery and either list its objects or, with `name`, describe one.
+    /// Returns false if the token doesn't match any discovered resource.
+    pub(super) async fn browse_dynamic(&mut self, token: &str, name: Option<&str>) -> bool {
+        let context = self.current_tab().context.clone();
+        let tab_namespace = self.current_tab().namespace.clone();
+        let catalog = self.discovery_for(&context).await;
+        let Some(resource) = catalog
+            .iter()
+            .find(|r| {
+                r.plural().eq_ignore_ascii_case(token)
+                    || r.kind().eq_ignore_ascii_case(token)
+                    || r.full_name().eq_ignore_ascii_case(token)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+
+        let namespace = if resource.namespaced {
+            tab_namespace
+        } else {
+            None
+        };
+        let provider = self.resource_provider.clone();
+
+        if let Some(name) = name {
+            match provider
+                .get_dynamic(&context, &resource, namespace.as_deref(), name)
+                .await
+            {
+                Ok(obj) => {
+                    let yaml = to_pretty_yaml(&obj);
+                    self.overlay = Some(Overlay::Text {
+                        title: format!("{} {}", resource.kind(), name),
+                        lines: yaml.lines().map(str::to_string).collect(),
+                        scroll: 0,
+                        hscroll: 0,
+                        wrap: false,
+                    });
+                    self.status_line = format!("Describe {} {name}", resource.kind());
+                }
+                Err(err) => {
+                    self.status_line = format!("get {} {name} failed: {err}", resource.kind())
+                }
+            }
+            return true;
+        }
+
+        match provider
+            .list_dynamic(&context, &resource, namespace.as_deref())
+            .await
+        {
+            Ok(rows) => {
+                let capped = if rows.len() >= 500 { ", capped" } else { "" };
+                let mut lines = vec![
+                    format!(
+                        "{} ({} shown{capped})  ns={}",
+                        resource.full_name(),
+                        rows.len(),
+                        namespace.as_deref().unwrap_or("all")
+                    ),
+                    String::new(),
+                    format!("{:<24} {:<50} {:<8} STATUS", "NAMESPACE", "NAME", "AGE"),
+                ];
+                for row in &rows {
+                    lines.push(format!(
+                        "{:<24} {:<50} {:<8} {}",
+                        row.namespace.as_deref().unwrap_or("-"),
+                        row.name,
+                        short_age(row.age),
+                        row.status
+                    ));
+                }
+                lines.push(String::new());
+                lines.push(format!("Describe: :{token} <name>"));
+                self.overlay = Some(Overlay::Text {
+                    title: format!("{} objects", resource.kind()),
+                    lines,
+                    scroll: 0,
+                    hscroll: 0,
+                    wrap: false,
+                });
+                self.status_line = format!("{} {} object(s)", rows.len(), resource.kind());
+            }
+            Err(err) => self.status_line = format!("list {} failed: {err}", resource.full_name()),
+        }
+        true
     }
 
     pub(super) fn autocomplete_command_input(&mut self) {

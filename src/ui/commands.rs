@@ -20,6 +20,8 @@ pub(crate) fn command_names() -> &'static [&'static str] {
         "resources",
         "res",
         "aliases",
+        "api",
+        "apis",
         "clear",
         "clear-filter",
         "fmt",
