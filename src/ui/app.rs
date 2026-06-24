@@ -375,6 +375,9 @@ struct App {
     pending_detail_g: bool,
     needs_terminal_reset: bool,
     detail_cache: Option<DetailObject>,
+    /// Events correlated to the selected resource (Phase 4.3), fetched on demand for the Events
+    /// pane when the selection isn't itself an Event.
+    events_cache: Option<(ResourceKey, Vec<crate::cluster::EventRow>)>,
     /// Per-context API discovery catalog (Phase 4.1), cached after first `:api`/dynamic browse.
     discovery_cache: HashMap<String, Vec<DiscoveredResource>>,
     /// Live cluster usage from metrics.k8s.io (Phase 4.2), refreshed lazily for the active context.
@@ -940,6 +943,7 @@ impl App {
             pending_detail_g: false,
             needs_terminal_reset: false,
             detail_cache: None,
+            events_cache: None,
             discovery_cache: HashMap::new(),
             metrics: None,
             pod_metrics: HashMap::new(),
@@ -1708,7 +1712,66 @@ impl App {
             self.status_line = format!("watch setup error: {err}");
         }
         self.maybe_load_detail().await;
+        self.maybe_load_events().await;
         self.maybe_refresh_metrics().await;
+    }
+
+    /// Fetch events correlated to the selected resource for the Events pane (Phase 4.3), unless the
+    /// selection is itself an Event (that case shows the Event's own manifest via detail_cache).
+    async fn maybe_load_events(&mut self) {
+        if self.current_tab().pane != Pane::Events {
+            return;
+        }
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        if row.key.kind == ResourceKind::Events {
+            return;
+        }
+        if self.events_cache.as_ref().map(|(k, _)| k) == Some(&row.key) {
+            return;
+        }
+        let provider = self.resource_provider.clone();
+        let key = row.key.clone();
+        let rows = provider
+            .events_for(&key.context, key.namespace.as_deref(), &key.name)
+            .await
+            .unwrap_or_default();
+        self.events_cache = Some((key, rows));
+    }
+
+    /// Render correlated events for a resource (kubectl-describe-style), from `events_cache`.
+    fn format_correlated_events(&self, key: &ResourceKey) -> String {
+        let kind = key.kind.short_name();
+        let Some((cached_key, rows)) = &self.events_cache else {
+            return format!("Loading events for {kind} {} …", key.name);
+        };
+        if cached_key != key {
+            return format!("Loading events for {kind} {} …", key.name);
+        }
+        if rows.is_empty() {
+            return format!("No events for {kind} {}", key.name);
+        }
+        let mut out = vec![
+            format!("Events for {kind} {} ({})", key.name, rows.len()),
+            String::new(),
+            format!(
+                "{:<8}  {:<8}  {:<26}  {:>4}  {:<10}  MESSAGE",
+                "LAST", "TYPE", "REASON", "CNT", "SOURCE"
+            ),
+        ];
+        for event in rows {
+            out.push(format!(
+                "{:<8}  {:<8}  {:<26}  {:>4}  {:<10}  {}",
+                short_age(event.last),
+                event.type_,
+                event.reason,
+                event.count,
+                event.source,
+                event.message,
+            ));
+        }
+        out.join("\n")
     }
 
     /// Refresh live usage (metrics.k8s.io) for the active context+namespace, at most every 15s:
@@ -1766,6 +1829,11 @@ impl App {
         let Some(row) = self.selected_row() else {
             return;
         };
+        // The Events pane on a non-Event resource shows correlated events (maybe_load_events),
+        // not the resource's own manifest — skip the on-demand object fetch there.
+        if pane == Pane::Events && row.key.kind != ResourceKind::Events {
+            return;
+        }
         if self.detail_cache.as_ref().map(|d| &d.key) == Some(&row.key) {
             return;
         }
@@ -2315,6 +2383,11 @@ impl App {
         self.pod_metrics
             .insert((namespace.to_string(), name.to_string()), (cpu_m, mem_b));
     }
+
+    /// Inject correlated events directly (tests don't run the async events fetch).
+    fn seed_events_for_test(&mut self, key: ResourceKey, rows: Vec<crate::cluster::EventRow>) {
+        self.events_cache = Some((key, rows));
+    }
 }
 
 #[cfg(test)]
@@ -2452,6 +2525,22 @@ mod tests {
                 name: "pod-ok".to_string(),
                 cpu_used_m: 250,
                 mem_used_b: 64 * 1024 * 1024,
+            }])
+        }
+
+        async fn events_for(
+            &self,
+            _context: &str,
+            _namespace: Option<&str>,
+            _name: &str,
+        ) -> anyhow::Result<Vec<crate::cluster::EventRow>> {
+            Ok(vec![crate::cluster::EventRow {
+                type_: "Warning".to_string(),
+                reason: "BackOff".to_string(),
+                message: "Back-off restarting failed container".to_string(),
+                count: 5,
+                last: Some(chrono::Utc::now()),
+                source: "kubelet".to_string(),
             }])
         }
     }
@@ -2962,6 +3051,40 @@ mod tests {
             snap.contains("R200") && snap.contains("L50"),
             "mem R/L: {snap}"
         ); // 256/128, 256/512
+    }
+
+    #[test]
+    fn events_pane_shows_correlated_events_for_a_pod() {
+        let mut app = test_app();
+        let entity = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        );
+        let key = entity.key.clone();
+        app.store.apply(StateDelta::Upsert(entity));
+        app.current_tab_mut().pane = Pane::Events;
+        app.seed_events_for_test(
+            key,
+            vec![crate::cluster::EventRow {
+                type_: "Warning".to_string(),
+                reason: "BackOff".to_string(),
+                message: "Back-off restarting failed container".to_string(),
+                count: 5,
+                last: Some(Utc::now()),
+                source: "kubelet".to_string(),
+            }],
+        );
+
+        let body = app.current_view_text().expect("events body");
+        assert!(body.contains("Events for po pod-a"), "{body}");
+        assert!(
+            body.contains("Warning") && body.contains("BackOff"),
+            "{body}"
+        );
+        assert!(body.contains("Back-off restarting"), "{body}");
     }
 
     #[test]

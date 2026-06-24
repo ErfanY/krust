@@ -54,13 +54,19 @@ krust --all-contexts
 - `g` / `G`: top / bottom (in detail panes use `gg` for top)
 - `Enter`: select namespace in namespace view; otherwise open describe
 - `d`: describe selected resource (toggles back to table)
-- `v`: view YAML; `t`: back to table; `E`: events pane; `l`: logs
+- `v`: view YAML; `t`: back to table; `E`: events pane (this resource's events); `l`: logs
 - `n`: cycle namespace; `s`: cycle sort column; `r`: reverse sort order
 - `ctrl+d`: delete (guarded, table only); `ctrl+k`: kill (delete)
 - `?`: toggle help (table) / search (detail panes)
 - `esc`: clear filter (table) / close view (detail) / cancel pending action
 
 All of the above are remappable via `keymap.toml`; the on-screen help line reflects your active bindings.
+
+## Events
+
+Press `E` on any resource (pod, deployment, node, …) to see **its** events — the ones whose
+`involvedObject` is that resource — newest first (LAST / TYPE / REASON / COUNT / SOURCE / MESSAGE),
+like the Events section of `kubectl describe`. Selecting an Event resource itself shows its manifest.
 
 ## Metrics
 

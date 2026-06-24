@@ -174,8 +174,12 @@ Root problem: full object JSON kept for every entity.
   - **Right-sizing:** Pods CPU/MEM cells show `‹used› R‹%req› L‹%limit›` (e.g. `1.50c R150 L75`) —
     actual usage plus utilization vs request and limit; cell yellow ≥100% request, red ≥90% limit.
     `pod_usage_cell` helper; unit-tested.
-- [ ] **4.3 Resource-correlated events** — selecting a pod shows its events; today Events pane
-  only renders Event objects directly (detail_pane.rs:170 "planned").
+- [x] **4.3 Resource-correlated events** — DONE. The Events pane (`E`) on any non-Event resource now
+  lists that resource's events via `ResourceProvider::events_for` (core/v1 Events, fieldSelector
+  `involvedObject.name`), kubectl-describe-style (LAST/TYPE/REASON/CNT/SOURCE/MESSAGE), newest first;
+  on-demand + cached per selected key (`events_cache`), like detail. Event-kind selections still show
+  the Event's own manifest. Hidden `--events <ns>/<name>` probe. **Verified against a real cluster
+  (correlated a live Warning/PolicyViolation event); unit-tested render.**
 - [ ] **4.4 Rendered describe** — kubectl-style human `describe` output alongside YAML/JSON.
 - [~] **4.5 Filter parity** — table filter now parses k9s-style: `!term` inverse, and label
   selectors `key=value`/`key==value`/`key!=value` (comma-separated, all must hold) matched against

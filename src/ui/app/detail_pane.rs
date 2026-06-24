@@ -142,6 +142,11 @@ impl App {
         let Some(key) = key else {
             return "No resource selected".to_string();
         };
+        // Events pane on a non-Event resource shows that resource's correlated events (Phase 4.3),
+        // not its manifest — served from events_cache, not the on-demand object.
+        if pane == Pane::Events && key.kind != ResourceKind::Events {
+            return self.format_correlated_events(key);
+        }
         // The full object is fetched on demand (lean entity model) and held in detail_cache.
         let Some(detail) = self.detail_cache.as_ref().filter(|d| &d.key == key) else {
             return format!("Loading {} {} …", key.kind.short_name(), key.name);
@@ -170,13 +175,11 @@ impl App {
                 }
             }
             Pane::Events => {
-                if key.kind == ResourceKind::Events {
-                    match format {
-                        DetailFormat::Yaml => to_pretty_yaml(raw),
-                        DetailFormat::Json => to_pretty_json(raw),
-                    }
-                } else {
-                    "Events pane currently supports Event resources directly; resource-scoped event correlation is planned in next milestone.".to_string()
+                // Non-Event resources are handled earlier (correlated events); here the selection
+                // is an Event itself, so show its manifest.
+                match format {
+                    DetailFormat::Yaml => to_pretty_yaml(raw),
+                    DetailFormat::Json => to_pretty_json(raw),
                 }
             }
             Pane::Logs => {
