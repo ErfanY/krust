@@ -73,8 +73,9 @@ krust --readonly
 
 Available now:
 - Multi-context workflow with fast context switching and namespace scoping (`all` namespace supported)
-- Kubernetes resource browser for:
+- Kubernetes resource browser for curated kinds:
   pods, deployments, replicasets, statefulsets, daemonsets, services, ingresses, configmaps, secrets, jobs, cronjobs, pvc/pv, nodes, namespaces, events, serviceaccounts, roles/rolebindings/clusterroles/clusterrolebindings, networkpolicies, hpa, pdb
+- Dynamic discovery: list and describe **any** other resource or CRD on the cluster (read-only) via `:api` and `:<resource>`
 - Describe/detail pane with YAML/JSON toggle, syntax highlighting, vim-style search, and wrap/horizontal scroll modes
 - Logs pane with stream, tail, pause, source filtering, container selection, and multi-pod fan-in for deployment/replicaset views
 - Secret decode view in YAML, with edit/apply support and automatic re-encode on apply

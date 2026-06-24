@@ -50,11 +50,17 @@ krust --all-contexts
 ## Core Navigation
 
 - `tab` / `shift+tab`: switch context tabs
-- `j` / `k` (or arrows): move selection and scroll
+- `j` / `k` (or arrows): move selection (table) / scroll (detail, logs)
+- `g` / `G`: top / bottom (in detail panes use `gg` for top)
 - `Enter`: select namespace in namespace view; otherwise open describe
-- `d`: describe selected resource
-- `ctrl+d`: delete (guarded)
-- `esc`: clear active filter/search prompt
+- `d`: describe selected resource (toggles back to table)
+- `v`: view YAML; `t`: back to table; `E`: events pane; `l`: logs
+- `n`: cycle namespace; `s`: cycle sort column; `r`: reverse sort order
+- `ctrl+d`: delete (guarded, table only); `ctrl+k`: kill (delete)
+- `?`: toggle help (table) / search (detail panes)
+- `esc`: clear filter (table) / close view (detail) / cancel pending action
+
+All of the above are remappable via `keymap.toml`; the on-screen help line reflects your active bindings.
 
 ## Logs and Runtime Inspect
 
@@ -83,6 +89,8 @@ Common command mode entries:
 - `:ctx` contexts
 - `:ns` namespaces
 - `:po`, `:deploy`, `:svc`, `:ing`, `:cm`, `:sec`, etc.
+- `:api [filter]` list all API resources/CRDs discovered on the context
+- `:<resource>` browse any discovered resource/CRD (e.g. `:endpoints`, `:widgets`); `:<resource> <name>` describes one
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
 

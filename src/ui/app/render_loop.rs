@@ -908,7 +908,7 @@ impl App {
         );
     }
 
-    fn context_help_text(&self, active: &ContextTabState) -> String {
+    pub(super) fn context_help_text(&self, active: &ContextTabState) -> String {
         if let Some(input) = &self.command_input {
             return match input.mode {
                 CommandMode::Command => [
@@ -972,64 +972,96 @@ impl App {
             };
         }
 
-        let mut items = vec![
-            "ctrl+c quit",
-            ": command",
-            "/ search/filter",
-            "tab switch-ctx",
-            "[ ] history",
-            "- repeat",
-            "ctrl+a aliases",
+        // Key hints are derived from the active keymap so they stay correct when remapped.
+        let k = &self.keymap;
+        let lit = |s: &str| s.to_string();
+        let mut items: Vec<String> = vec![
+            format!("{} quit", k.hint(Action::Quit)),
+            lit(": command"),
+            format!(
+                "{}/{} ctx",
+                k.hint(Action::NextContext),
+                k.hint(Action::PrevContext)
+            ),
+            lit("[ ]/- history"),
+            lit("ctrl+a aliases :api"),
         ];
 
         match active.pane {
             Pane::Table => {
                 items.extend([
-                    "j/k move",
-                    "gg/G top/bottom",
-                    "ctrl+d/u page",
-                    "Enter describe/select-ns",
-                    "d describe",
-                    "l logs",
-                    "c containers",
-                    "ctrl+d delete",
-                    "ctrl+k kill",
+                    format!(
+                        "{}/{} move",
+                        k.hint(Action::MoveDown),
+                        k.hint(Action::MoveUp)
+                    ),
+                    format!(
+                        "{}/{} top/bot",
+                        k.hint(Action::GotoTop),
+                        k.hint(Action::GotoBottom)
+                    ),
+                    format!("{} filter", k.hint(Action::FilterMode)),
+                    lit("Enter open/select-ns"),
+                    format!("{} describe", k.hint(Action::ToggleDescribe)),
+                    format!("{} logs", k.hint(Action::ToLogs)),
+                    format!("{} events", k.hint(Action::ToEvents)),
+                    lit("c containers"),
+                    format!("{} namespace", k.hint(Action::CycleNamespace)),
+                    format!("{} sort", k.hint(Action::CycleSort)),
+                    format!("{} reverse", k.hint(Action::ToggleDesc)),
+                    format!("{} help", k.hint(Action::ToggleHelp)),
+                    format!("{} delete", k.hint(Action::Delete)),
+                    format!("{} clear-filter", k.hint(Action::Cancel)),
                 ]);
             }
             Pane::Describe | Pane::SecretDecode | Pane::Events => {
                 items.extend([
-                    "j/k scroll",
-                    "gg/G top/bottom",
-                    "ctrl+d/u page",
-                    "n/N next/prev",
-                    "w wrap",
-                    "left/right h-scroll",
-                    "y copy",
-                    "d table/describe toggle",
+                    format!(
+                        "{}/{} scroll",
+                        k.hint(Action::MoveDown),
+                        k.hint(Action::MoveUp)
+                    ),
+                    lit("gg/G top/bottom"),
+                    lit("ctrl+d/u half-page"),
+                    lit("n/N match"),
+                    lit("/ search"),
+                    lit("w wrap"),
+                    lit("left/right h-scroll"),
+                    lit("y copy"),
+                    format!("{} describe-toggle", k.hint(Action::ToggleDescribe)),
                 ]);
                 if matches!(active.pane, Pane::Describe | Pane::SecretDecode) {
-                    items.extend(["e edit", ":fmt yaml|json"]);
+                    items.extend([lit("e edit"), lit(":fmt yaml|json")]);
                 }
                 if active.kind() == ResourceKind::Secrets {
-                    items.push("x decode toggle");
+                    items.push(lit("x decode toggle"));
                 }
-                items.push("l logs");
+                items.push(format!("{} logs", k.hint(Action::ToLogs)));
+                items.push(format!("{} table", k.hint(Action::ToTable)));
+                items.push(format!("{} close", k.hint(Action::Cancel)));
             }
             Pane::Logs => {
                 items.extend([
-                    "j/k scroll",
-                    "gg/G top/bottom",
-                    "ctrl+d/u page",
-                    "n/N next/prev",
-                    "w wrap",
-                    "left/right h-scroll",
-                    "y copy",
-                    "s tail on/off",
-                    "p pause/resume",
-                    "S sources",
-                    "L latest",
-                    "c containers",
-                    "d describe",
+                    format!(
+                        "{}/{} scroll",
+                        k.hint(Action::MoveDown),
+                        k.hint(Action::MoveUp)
+                    ),
+                    lit("gg/G top/bottom"),
+                    lit("ctrl+d/u half-page"),
+                    lit("n/N match"),
+                    lit("/ search"),
+                    lit("w wrap"),
+                    lit("left/right h-scroll"),
+                    lit("y copy"),
+                    format!("{} tail", k.hint(Action::CycleSort)),
+                    lit("p pause"),
+                    lit("S sources"),
+                    lit("L latest"),
+                    lit("c containers"),
+                    format!("{} describe", k.hint(Action::ToggleDescribe)),
+                    format!("{} table", k.hint(Action::ToTable)),
+                    format!("{} close", k.hint(Action::Cancel)),
                 ]);
             }
         }
