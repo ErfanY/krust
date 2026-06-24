@@ -654,17 +654,27 @@ impl App {
                             let sev = classify_status_severity(&row.status);
                             let status = format!("{} {}", severity_tag(sev), row.status);
                             let cells = if pods_view {
-                                let (cpu, mem) =
-                                    match self.pod_usage(key.namespace.as_deref(), &key.name) {
-                                        Some((c, m)) => (format_millicpu(c), format_bytes(m)),
-                                        None => ("-".to_string(), "-".to_string()),
-                                    };
+                                let usage = self.pod_usage(key.namespace.as_deref(), &key.name);
+                                let res =
+                                    self.store.get(key).and_then(|e| e.extracted.pod_resources);
+                                let (cpu_str, cpu_sev) = pod_usage_cell(
+                                    usage.map(|(c, _)| c),
+                                    res.map(|r| r.cpu_request_m).unwrap_or(0),
+                                    res.map(|r| r.cpu_limit_m).unwrap_or(0),
+                                    format_millicpu,
+                                );
+                                let (mem_str, mem_sev) = pod_usage_cell(
+                                    usage.map(|(_, m)| m),
+                                    res.map(|r| r.mem_request_b).unwrap_or(0),
+                                    res.map(|r| r.mem_limit_b).unwrap_or(0),
+                                    format_bytes,
+                                );
                                 vec![
                                     Cell::from(row.namespace),
                                     Cell::from(row.name),
                                     Cell::from(status),
-                                    Cell::from(cpu),
-                                    Cell::from(mem),
+                                    Cell::from(cpu_str).style(severity_style(&theme, cpu_sev)),
+                                    Cell::from(mem_str).style(severity_style(&theme, mem_sev)),
                                     Cell::from(row.age),
                                 ]
                             } else {
@@ -684,12 +694,12 @@ impl App {
                         (
                             vec!["Namespace", "Name", "Status", "CPU", "MEM", "Age"],
                             vec![
+                                Constraint::Length(16),
+                                Constraint::Min(18),
                                 Constraint::Length(18),
-                                Constraint::Min(20),
-                                Constraint::Length(20),
-                                Constraint::Length(9),
-                                Constraint::Length(10),
-                                Constraint::Length(8),
+                                Constraint::Length(17),
+                                Constraint::Length(17),
+                                Constraint::Length(6),
                             ],
                         )
                     } else {
@@ -704,19 +714,19 @@ impl App {
                             ],
                         )
                     };
-                    let metrics_note = if pods_view && self.pod_metrics.is_empty() {
-                        "  (CPU/MEM: metrics-server n/a)"
+                    let title = if pods_view {
+                        let legend = if self.pod_metrics.is_empty() {
+                            "CPU/MEM: metrics-server n/a"
+                        } else {
+                            "CPU/MEM = used R%req L%limit"
+                        };
+                        format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
                     } else {
-                        ""
+                        format!("[KIND] {} ({})", active.kind(), vm.len())
                     };
                     let table = Table::new(rows, widths)
                         .header(Row::new(header).style(theme.table_header))
-                        .block(Block::default().borders(Borders::ALL).title(format!(
-                            "[KIND] {} ({}){}",
-                            active.kind(),
-                            vm.len(),
-                            metrics_note
-                        )))
+                        .block(Block::default().borders(Borders::ALL).title(title))
                         .row_highlight_style(theme.row_highlight);
 
                     // Rows are pre-sliced to the window, so the widget offset is 0 and the

@@ -2112,6 +2112,34 @@ fn percent(numerator: u64, denominator: u64) -> String {
     format!("{pct:.0}%")
 }
 
+/// Format a pod's per-resource usage cell as `‹used› R‹%req› L‹%limit›` and pick a severity:
+/// red when usage is ≥90% of the limit (throttle/OOM risk), yellow when ≥100% of the request
+/// (under-requested). A low `R%` shows over-provisioning. Missing pieces render as `R-`/`L-`,
+/// and no usage at all renders as `-`.
+fn pod_usage_cell(
+    used: Option<u64>,
+    request: u64,
+    limit: u64,
+    render: fn(u64) -> String,
+) -> (String, Severity) {
+    let Some(used) = used else {
+        return ("-".to_string(), Severity::Ok);
+    };
+    let pct = |denom: u64| (denom > 0).then(|| used.saturating_mul(100) / denom);
+    let req_pct = pct(request);
+    let lim_pct = pct(limit);
+    let req_s = req_pct.map_or_else(|| "R-".to_string(), |v| format!("R{v}"));
+    let lim_s = lim_pct.map_or_else(|| "L-".to_string(), |v| format!("L{v}"));
+    let severity = if lim_pct.is_some_and(|v| v >= 90) {
+        Severity::Err
+    } else if req_pct.is_some_and(|v| v >= 100) {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    };
+    (format!("{} {req_s} {lim_s}", render(used)), severity)
+}
+
 /// Compact age (e.g. "3d", "5h", "12m") for dynamic-resource rows.
 fn short_age(when: Option<chrono::DateTime<chrono::Utc>>) -> String {
     let Some(when) = when else {
@@ -2903,21 +2931,37 @@ mod tests {
     }
 
     #[test]
-    fn pods_table_renders_live_cpu_mem_columns() {
+    fn pods_table_shows_usage_and_right_sizing() {
         let mut app = test_app();
-        app.store.apply(StateDelta::Upsert(mk_entity(
+        let mut entity = mk_entity(
             "ctx-dev",
             ResourceKind::Pods,
             Some("default"),
             "pod-a",
             "Running",
-        )));
+        );
+        entity.extracted.pod_resources = Some(crate::model::PodResources {
+            cpu_request_m: 1000,
+            cpu_limit_m: 2000,
+            mem_request_b: 128 * 1024 * 1024,
+            mem_limit_b: 512 * 1024 * 1024,
+        });
+        app.store.apply(StateDelta::Upsert(entity));
         app.seed_pod_metrics_for_test("default", "pod-a", 1500, 256 * 1024 * 1024);
 
-        let snap = render_snapshot(&mut app, 140, 20);
-        assert!(snap.contains("CPU") && snap.contains("MEM"), "{snap}");
-        assert!(snap.contains("1.50c"), "expected cpu usage column: {snap}");
-        assert!(snap.contains("256Mi"), "expected mem usage column: {snap}");
+        let snap = render_snapshot(&mut app, 160, 20);
+        // actual usage
+        assert!(snap.contains("1.50c"), "cpu used: {snap}");
+        assert!(snap.contains("256Mi"), "mem used: {snap}");
+        // right-sizing vs request and limit
+        assert!(
+            snap.contains("R150") && snap.contains("L75"),
+            "cpu R/L: {snap}"
+        ); // 1500/1000, 1500/2000
+        assert!(
+            snap.contains("R200") && snap.contains("L50"),
+            "mem R/L: {snap}"
+        ); // 256/128, 256/512
     }
 
     #[test]

@@ -64,11 +64,15 @@ All of the above are remappable via `keymap.toml`; the on-screen help line refle
 
 ## Metrics
 
-If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage:
-- the **Pods table** gains **CPU** and **MEM** columns (actual usage per pod, summed across containers)
-- the **Cluster Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%
+If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage and right-sizing:
+- the **Pods table** **CPU** and **MEM** columns show `‹used› R‹%req› L‹%limit›` per pod — e.g.
+  `1.50c R150 L75` means using 1.5 cores, 150% of its request, 75% of its limit. `R%` is the
+  right-sizing signal (low = over-provisioned, ≥100 = under-requested); `L%` is the risk signal.
+  Cells turn yellow at ≥100% of request and red at ≥90% of limit (throttle/OOM risk).
+- the **Cluster Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%.
 
-Without a metrics-server these degrade gracefully (columns show `-`, the table title notes `metrics-server n/a`, and the pulse falls back to request/limit-based numbers).
+Without a metrics-server these degrade gracefully (columns show `-`, the table title notes
+`metrics-server n/a`, and the pulse falls back to request/limit-based numbers).
 
 ## Logs and Runtime Inspect
 
