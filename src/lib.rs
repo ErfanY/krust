@@ -87,6 +87,7 @@ pub async fn run() -> anyhow::Result<()> {
             cli.readonly,
             cli.bench_iters,
             cli.bench_settle_secs,
+            cli.bench_contexts,
         )
         .await;
     }

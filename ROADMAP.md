@@ -52,7 +52,8 @@ frame render (cached):     p50 5.91ms  p99 6.21ms               (builds a Row pe
 **Read:** under churn (revision bumps invalidate caches each delta) a single frame ≈ pulse 7.6 +
 projection 2.0 + render 5.9 ≈ **15.5ms for ONE context** — at the 16.6ms/60fps budget before input
 or multi-context overhead. RSS 482MB/ctx is the headline memory risk. Confirms Phase 1→2 ordering.
-RSS @20 warm ctx not yet measured (needs interactive driving; expected ~linear in retained ctx).
+RSS @20 warm ctx: see Phase 1.3 — bounded to active+warm (1,048 entities / 55 MB after visiting 20),
+not linear in contexts visited.
 
 ### After Phase 1.1 (lean entity model) — same conditions
 ```
@@ -95,9 +96,12 @@ Root problem: full object JSON kept for every entity.
   initial LIST (network/pagination) + channel delivery + store.apply, not serialization. Not worth
   the watch-layer rewrite. Revisit only if a real cluster with fat objects (10-15KB) shifts the
   ratio, or fold a watcher list `page_size` bump into 3.x.
-- [ ] **1.3 Warm-context memory bound** — entities for warm contexts (warm_contexts TTL,
-  kube_provider.rs:321) can dominate RSS at 20 ctx. Cap/evict entity sets for non-active
-  contexts; verify store shrinks when watchers stop (today `Reset` only fires on relist).
+- [x] **1.3 Warm-context memory bound** — DONE. Entities used to persist after a context's watchers
+  stopped, so the store grew with every context visited. `replace_watch_plan` now emits
+  `StateDelta::EvictContext` for contexts dropped from the active+warm set; the store drops their
+  entities/indexes/generation. **Measured (lab, warm 20 contexts): store plateaus at 1,048 entities
+  (≈ active + 1 warm × 524) instead of ~10,480; RSS 55 MB for all 20 visited.** Bench gained
+  `--bench-contexts N`. Unit test `evict_context_drops_only_that_context`. 81 tests pass.
 
 ---
 
