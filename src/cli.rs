@@ -65,4 +65,9 @@ pub struct Cli {
     /// Print live cluster usage from metrics.k8s.io for the initial context, then exit (4.2 check).
     #[arg(long, hide = true, default_value_t = false)]
     pub metrics: bool,
+
+    /// Print events correlated to `<namespace>/<name>` (or `<name>`) for the initial context, then
+    /// exit (Phase 4.3 check).
+    #[arg(long, hide = true)]
+    pub events: Option<String>,
 }

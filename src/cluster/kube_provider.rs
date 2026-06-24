@@ -39,7 +39,7 @@ use tracing::{error, warn};
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
-    ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, NodeUsage,
+    ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, EventRow, NodeUsage,
     PodLogEvent, PodLogRequest, PodLogStream, PodUsage, ResourceProvider, WatchTarget,
     extract::{extracted_for, usage_from_metrics},
 };
@@ -479,6 +479,49 @@ impl ResourceProvider for KubeResourceProvider {
                 })
             })
             .collect();
+        Ok(rows)
+    }
+
+    async fn events_for(
+        &self,
+        context: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Vec<EventRow>> {
+        let client = self.client_for_context(context).await?;
+        let api: Api<KubeEvent> = match namespace {
+            Some(ns) => Api::namespaced(client, ns),
+            None => Api::all(client),
+        };
+        let params = ListParams::default().fields(&format!("involvedObject.name={name}"));
+        let list = api.list(&params).await?;
+        let mut rows: Vec<EventRow> = list
+            .into_iter()
+            .map(|event| {
+                let last = event
+                    .last_timestamp
+                    .map(|t| DateTime::<Utc>::from(std::time::SystemTime::from(t.0)))
+                    .or_else(|| {
+                        event
+                            .event_time
+                            .map(|t| DateTime::<Utc>::from(std::time::SystemTime::from(t.0)))
+                    });
+                let source = event
+                    .source
+                    .and_then(|s| s.component)
+                    .or(event.reporting_component)
+                    .unwrap_or_default();
+                EventRow {
+                    type_: event.type_.unwrap_or_default(),
+                    reason: event.reason.unwrap_or_default(),
+                    message: event.message.unwrap_or_default(),
+                    count: event.count.unwrap_or(1),
+                    last,
+                    source,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.last.cmp(&a.last));
         Ok(rows)
     }
 }

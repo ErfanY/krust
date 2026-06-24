@@ -79,6 +79,10 @@ pub async fn run() -> anyhow::Result<()> {
         return run_metrics_probe(resource_provider.as_ref(), &initial_context).await;
     }
 
+    if let Some(target) = cli.events.as_deref() {
+        return run_events_probe(resource_provider.as_ref(), &initial_context, target).await;
+    }
+
     if cli.bench || cli.soak_secs > 0 {
         return ui::run_bench(
             contexts,
@@ -210,6 +214,29 @@ async fn run_metrics_probe(provider: &dyn ResourceProvider, context: &str) -> an
         }
         Ok(_) => println!("pod metrics: 0 pods reporting"),
         Err(err) => println!("pod metrics unavailable: {err}"),
+    }
+    Ok(())
+}
+
+/// Headless Phase 4.3 check: fetch events correlated to a resource and print a summary.
+async fn run_events_probe(
+    provider: &dyn ResourceProvider,
+    context: &str,
+    target: &str,
+) -> anyhow::Result<()> {
+    let (namespace, name) = match target.split_once('/') {
+        Some((ns, n)) => (Some(ns), n),
+        None => (None, target),
+    };
+    match provider.events_for(context, namespace, name).await {
+        Ok(events) if !events.is_empty() => {
+            println!("{} events for {target}:", events.len());
+            for e in events.iter().take(15) {
+                println!("  {:<8} {:<24} x{}", e.type_, e.reason, e.count);
+            }
+        }
+        Ok(_) => println!("no events for {target}"),
+        Err(err) => println!("events query failed: {err}"),
     }
     Ok(())
 }

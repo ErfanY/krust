@@ -57,6 +57,17 @@ pub struct PodUsage {
     pub mem_used_b: u64,
 }
 
+/// A Kubernetes Event correlated to a specific resource via `involvedObject` (Phase 4.3).
+#[derive(Debug, Clone)]
+pub struct EventRow {
+    pub type_: String,
+    pub reason: String,
+    pub message: String,
+    pub count: i32,
+    pub last: Option<DateTime<Utc>>,
+    pub source: String,
+}
+
 /// A generic row from a one-shot dynamic list (no curated columns).
 #[derive(Debug, Clone)]
 pub struct DynamicRow {
@@ -165,6 +176,15 @@ pub trait ResourceProvider: Send + Sync {
         context: &str,
         namespace: Option<&str>,
     ) -> anyhow::Result<Vec<PodUsage>>;
+
+    /// Events referencing a specific resource (`involvedObject.name`), newest first (Phase 4.3).
+    /// On-demand, like `get_object` — not watched.
+    async fn events_for(
+        &self,
+        context: &str,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<Vec<EventRow>>;
 }
 
 #[async_trait]
