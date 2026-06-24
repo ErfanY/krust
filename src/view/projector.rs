@@ -58,11 +58,9 @@ impl ViewProjector for SimpleViewProjector {
     fn project(&self, store: &StateStore, request: &ViewRequest) -> ViewModel {
         let namespace_filter = request.namespace.as_deref();
         let mut entities = store.list(&request.context, request.kind, namespace_filter);
-        let needle = request.filter.to_lowercase();
 
-        if !needle.is_empty() {
-            entities.retain(|entity| row_matches(entity, &needle));
-        }
+        let filter = Filter::parse(&request.filter);
+        entities.retain(|entity| filter.matches(entity));
 
         entities.sort_by(|a, b| {
             let ord = match request.sort {
@@ -87,9 +85,114 @@ impl ViewProjector for SimpleViewProjector {
     }
 }
 
-/// Case-insensitive substring match across the fields shown in the table, without allocating a
-/// combined haystack string per row.
-fn row_matches(entity: &crate::model::ResourceEntity, needle_lower: &str) -> bool {
+/// A parsed table filter (k9s-style). Compiled once per projection, applied per row.
+///
+/// Syntax:
+/// - empty                  → match everything
+/// - `!<rest>`              → invert the result of `<rest>`
+/// - `k=v`, `k==v`, `k!=v`  → label selector (comma-separated requirements, all must hold)
+/// - anything else          → case-insensitive substring over name/namespace/status/summary
+#[derive(Debug, Clone)]
+enum Filter {
+    All,
+    Substring { needle: String, negate: bool },
+    Labels { reqs: Vec<LabelReq>, negate: bool },
+}
+
+#[derive(Debug, Clone)]
+struct LabelReq {
+    key: String,
+    equal: bool,
+    value: String,
+}
+
+impl Filter {
+    fn parse(raw: &str) -> Self {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Filter::All;
+        }
+        let (negate, body) = match trimmed.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, trimmed),
+        };
+        if body.is_empty() {
+            // a lone "!" filters nothing useful — treat as match-all
+            return Filter::All;
+        }
+        if let Some(reqs) = parse_label_selector(body) {
+            return Filter::Labels { reqs, negate };
+        }
+        Filter::Substring {
+            needle: body.to_lowercase(),
+            negate,
+        }
+    }
+
+    fn matches(&self, entity: &crate::model::ResourceEntity) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Substring { needle, negate } => substring_match(entity, needle) ^ negate,
+            Filter::Labels { reqs, negate } => {
+                reqs.iter().all(|req| req.matches(&entity.labels)) ^ negate
+            }
+        }
+    }
+}
+
+impl LabelReq {
+    fn matches(&self, labels: &[(String, String)]) -> bool {
+        let found = labels.iter().find(|(k, _)| k == &self.key);
+        match (self.equal, found) {
+            (true, Some((_, v))) => v == &self.value,
+            (true, None) => false,
+            // `!=` holds when the label is absent or has a different value (k9s semantics)
+            (false, Some((_, v))) => v != &self.value,
+            (false, None) => true,
+        }
+    }
+}
+
+/// Parse `k=v,k2!=v2` into label requirements. Returns None if the text isn't a label selector
+/// (so it falls through to substring matching).
+fn parse_label_selector(body: &str) -> Option<Vec<LabelReq>> {
+    let mut reqs = Vec::new();
+    for part in body.split(',') {
+        let part = part.trim();
+        if let Some((k, v)) = part.split_once("!=") {
+            reqs.push(LabelReq {
+                key: valid_label_key(k)?,
+                equal: false,
+                value: v.trim().to_string(),
+            });
+        } else if let Some((k, v)) = part.split_once("==").or_else(|| part.split_once('=')) {
+            reqs.push(LabelReq {
+                key: valid_label_key(k)?,
+                equal: true,
+                value: v.trim().to_string(),
+            });
+        } else {
+            return None;
+        }
+    }
+    if reqs.is_empty() { None } else { Some(reqs) }
+}
+
+/// Accept a plausible Kubernetes label key (so a stray `=` in a search term doesn't masquerade
+/// as a selector). Returns the trimmed key, or None if it doesn't look like a label key.
+fn valid_label_key(raw: &str) -> Option<String> {
+    let key = raw.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let ok = key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if ok { Some(key.to_string()) } else { None }
+}
+
+/// Case-insensitive substring match across the fields shown in the table.
+fn substring_match(entity: &crate::model::ResourceEntity, needle_lower: &str) -> bool {
     let contains = |field: &str| field.to_lowercase().contains(needle_lower);
     contains(&entity.key.name)
         || entity
@@ -181,6 +284,76 @@ mod tests {
         assert_eq!(vm.len(), 1);
         let row = materialize_row(&store, vm.key(0).expect("one match")).expect("row materializes");
         assert_eq!(row.name, "worker");
+    }
+
+    fn put_labeled(store: &mut StateStore, name: &str, labels: &[(&str, &str)]) {
+        store.apply(StateDelta::Upsert(ResourceEntity {
+            key: ResourceKey::new("ctx", ResourceKind::Pods, Some("ns".to_string()), name),
+            status: "Running".to_string(),
+            age: Some(Utc::now()),
+            labels: labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            summary: String::new(),
+            extracted: Default::default(),
+        }));
+    }
+
+    fn project_names(store: &StateStore, filter: &str) -> Vec<String> {
+        SimpleViewProjector
+            .project(
+                store,
+                &ViewRequest {
+                    context: "ctx".to_string(),
+                    kind: ResourceKind::Pods,
+                    namespace: None,
+                    filter: filter.to_string(),
+                    sort: SortColumn::Name,
+                    descending: false,
+                },
+            )
+            .order
+            .iter()
+            .map(|key| key.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn filter_label_selector_matches_labels_not_substring() {
+        let mut store = StateStore::default();
+        put_labeled(&mut store, "api", &[("app", "api"), ("tier", "backend")]);
+        put_labeled(&mut store, "web", &[("app", "web"), ("tier", "frontend")]);
+
+        assert_eq!(project_names(&store, "app=api"), vec!["api"]);
+        assert_eq!(project_names(&store, "app==api"), vec!["api"]);
+        assert_eq!(project_names(&store, "app!=api"), vec!["web"]);
+        // all comma-separated requirements must hold
+        assert_eq!(project_names(&store, "app=api,tier=backend"), vec!["api"]);
+        assert!(project_names(&store, "app=api,tier=frontend").is_empty());
+        // label key absent => `!=` holds, `=` does not
+        assert_eq!(project_names(&store, "missing!=x").len(), 2);
+        assert!(project_names(&store, "missing=x").is_empty());
+    }
+
+    #[test]
+    fn filter_inverse_excludes_matches() {
+        let mut store = StateStore::default();
+        put_labeled(&mut store, "api", &[]);
+        put_labeled(&mut store, "worker", &[]);
+        assert_eq!(project_names(&store, "!work"), vec!["api"]);
+        assert_eq!(project_names(&store, "!app=api"), vec!["api", "worker"]); // no app label on either
+    }
+
+    #[test]
+    fn filter_non_selector_terms_use_substring() {
+        let mut store = StateStore::default();
+        put_labeled(&mut store, "api-server", &[]);
+        put_labeled(&mut store, "worker", &[]);
+        // "ap" is not a selector (no '='), so it substring-matches the name
+        assert_eq!(project_names(&store, "ap"), vec!["api-server"]);
+        // empty filter matches all
+        assert_eq!(project_names(&store, "").len(), 2);
     }
 
     #[test]
