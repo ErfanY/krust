@@ -75,6 +75,10 @@ pub async fn run() -> anyhow::Result<()> {
         .await;
     }
 
+    if cli.metrics {
+        return run_metrics_probe(resource_provider.as_ref(), &initial_context).await;
+    }
+
     if cli.bench || cli.soak_secs > 0 {
         return ui::run_bench(
             contexts,
@@ -175,6 +179,26 @@ async fn run_discover(
         }
     }
 
+    Ok(())
+}
+
+/// Headless Phase 4.2 check: fetch live node usage from metrics.k8s.io and print the cluster
+/// aggregate (no node names), verifying the metrics path against a real cluster.
+async fn run_metrics_probe(provider: &dyn ResourceProvider, context: &str) -> anyhow::Result<()> {
+    match provider.node_metrics(context).await {
+        Ok(nodes) if !nodes.is_empty() => {
+            let cpu_m: u64 = nodes.iter().map(|n| n.cpu_used_m).sum();
+            let mem_b: u64 = nodes.iter().map(|n| n.mem_used_b).sum();
+            println!(
+                "metrics.k8s.io OK: {} nodes reporting; cluster usage cpu={:.2} cores, mem={:.1} GiB",
+                nodes.len(),
+                cpu_m as f64 / 1000.0,
+                mem_b as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        }
+        Ok(_) => println!("metrics.k8s.io served but reported 0 nodes (no usage data yet)"),
+        Err(err) => println!("metrics.k8s.io unavailable (graceful fallback to requests): {err}"),
+    }
     Ok(())
 }
 

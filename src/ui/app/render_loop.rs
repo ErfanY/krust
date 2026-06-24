@@ -320,6 +320,47 @@ impl App {
                 Severity::Ok,
             ),
         ];
+        // Phase 4.2: live actual usage from metrics.k8s.io when a metrics-server is present;
+        // otherwise note its absence (the rows above are request/limit-based).
+        match &self.metrics {
+            Some(m) => {
+                let cpu_sev = match ratio_percent_value(m.cpu_used_m, node_caps.cpu_alloc_m) {
+                    Some(pct) if pct >= 90.0 => Severity::Err,
+                    Some(pct) if pct >= 75.0 => Severity::Warn,
+                    _ => Severity::Ok,
+                };
+                pulse_rows.push((
+                    "[USE]".to_string(),
+                    vec![
+                        format!(
+                            "cpu {} / {} ({})",
+                            format_millicpu(m.cpu_used_m),
+                            format_millicpu(node_caps.cpu_alloc_m),
+                            percent(m.cpu_used_m, node_caps.cpu_alloc_m)
+                        ),
+                        format!(
+                            "mem {} / {} ({})",
+                            format_bytes(m.mem_used_b),
+                            format_bytes(node_caps.mem_alloc_b),
+                            percent(m.mem_used_b, node_caps.mem_alloc_b)
+                        ),
+                        format!("live · {} nodes reporting", m.nodes_reporting),
+                    ],
+                    cpu_sev,
+                ));
+            }
+            None => {
+                pulse_rows.push((
+                    "[USE]".to_string(),
+                    vec![
+                        "live usage: metrics-server not available".to_string(),
+                        "(rows above are request/limit-based)".to_string(),
+                        String::new(),
+                    ],
+                    Severity::Ok,
+                ));
+            }
+        }
         if let Some(err) = watch_error {
             pulse_rows.push((
                 "[ALERT]".to_string(),

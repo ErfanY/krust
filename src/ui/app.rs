@@ -377,6 +377,18 @@ struct App {
     detail_cache: Option<DetailObject>,
     /// Per-context API discovery catalog (Phase 4.1), cached after first `:api`/dynamic browse.
     discovery_cache: HashMap<String, Vec<DiscoveredResource>>,
+    /// Live cluster usage from metrics.k8s.io (Phase 4.2), refreshed lazily for the active context.
+    /// `None` means metrics-server isn't available — the pulse falls back to request-based numbers.
+    metrics: Option<ClusterMetrics>,
+    metrics_fetched: Option<(String, Instant)>,
+}
+
+/// Cluster-wide actual usage summed from node metrics (Phase 4.2).
+#[derive(Debug, Clone, Copy)]
+struct ClusterMetrics {
+    cpu_used_m: u64,
+    mem_used_b: u64,
+    nodes_reporting: usize,
 }
 
 /// On-demand full object for the active detail/describe/decode/edit view. Single-slot: holds the
@@ -925,6 +937,8 @@ impl App {
             needs_terminal_reset: false,
             detail_cache: None,
             discovery_cache: HashMap::new(),
+            metrics: None,
+            metrics_fetched: None,
         }
     }
 
@@ -1689,6 +1703,35 @@ impl App {
             self.status_line = format!("watch setup error: {err}");
         }
         self.maybe_load_detail().await;
+        self.maybe_refresh_metrics().await;
+    }
+
+    /// Refresh live cluster usage (metrics.k8s.io) for the active context, at most every 15s.
+    /// On any error/absence (no metrics-server) the cache clears and the pulse degrades to
+    /// request-based numbers — never blocks or errors the UI.
+    async fn maybe_refresh_metrics(&mut self) {
+        let context = self.current_tab().context.clone();
+        let stale = match &self.metrics_fetched {
+            Some((ctx, at)) => ctx != &context || at.elapsed() > Duration::from_secs(15),
+            None => true,
+        };
+        if !stale {
+            return;
+        }
+        let provider = self.resource_provider.clone();
+        self.metrics = match provider.node_metrics(&context).await {
+            Ok(nodes) if !nodes.is_empty() => {
+                let cpu_used_m = nodes.iter().map(|n| n.cpu_used_m).sum();
+                let mem_used_b = nodes.iter().map(|n| n.mem_used_b).sum();
+                Some(ClusterMetrics {
+                    cpu_used_m,
+                    mem_used_b,
+                    nodes_reporting: nodes.len(),
+                })
+            }
+            _ => None,
+        };
+        self.metrics_fetched = Some((context, Instant::now()));
     }
 
     /// Fetch the full object for the selected row on demand when a detail pane is active and the
@@ -2335,6 +2378,13 @@ mod tests {
                 "kind": "Widget",
                 "metadata": { "name": name, "namespace": "ns-00" }
             }))
+        }
+
+        async fn node_metrics(
+            &self,
+            _context: &str,
+        ) -> anyhow::Result<Vec<crate::cluster::NodeUsage>> {
+            Ok(Vec::new())
         }
     }
 
