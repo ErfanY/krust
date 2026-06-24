@@ -144,9 +144,17 @@ Root problem: full object JSON kept for every entity.
 ---
 
 ## Phase 4 — Readonly parity vs k9s (HARD REQUIREMENT: all readonly k9s functions)
-- [ ] **4.1 Dynamic resource discovery + CRDs** — biggest functional gap. Today 24 fixed
-  kinds (`ResourceKind::ORDERED`, model.rs:36). Add API discovery + arbitrary GVK browse so
-  any resource/CRD is listable/describable (readonly).
+- [~] **4.1 Dynamic resource discovery + CRDs** — biggest functional gap. Hybrid design (curated 24
+  + generic dynamic), `docs/design/phase-4.1-dynamic-resources.md`. Shipped incrementally:
+  - [x] **4.1a-1 provider layer** — `ResourceProvider::{discover,list_dynamic,get_dynamic}` via
+    `kube::discovery` + `Api<DynamicObject>` (cluster/mod.rs, kube_provider.rs); `DiscoveredResource`
+    /`DynamicRow` types; hidden `--discover[ --discover-resource X]` headless check; `scripts/scale/crds.sh`
+    adds a sample CRD. Verified against lab: 68 resources incl. CRD `widgets.demo.krust.io`, listed +
+    described 3 Widgets. 75 tests pass.
+  - [ ] **4.1a-2 UI** — `:api` discovery catalog overlay + interactive dynamic-browse overlay
+    (generic columns) + describe-on-select, wiring the `:<unknown/CRD>` command fallback to the dynamic path.
+  - [ ] **4.1b dynamic watches + KindId/ResourceKey refactor** (fold 24 typed watches into the dynamic path).
+  - [ ] **4.1c navigation/UX** (discovered kinds in kind-cycle / resource picker, short names from discovery).
 - [ ] **4.2 Metrics integration** — `metrics.k8s.io` for real pod/node CPU+mem (top-style).
   Current numbers are from spec requests/limits, not usage.
 - [ ] **4.3 Resource-correlated events** — selecting a pod shows its events; today Events pane

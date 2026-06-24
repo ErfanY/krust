@@ -2253,6 +2253,32 @@ mod tests {
         async fn get_object(&self, _key: &ResourceKey) -> anyhow::Result<serde_json::Value> {
             Ok(serde_json::json!({}))
         }
+
+        async fn discover(
+            &self,
+            _context: &str,
+        ) -> anyhow::Result<Vec<crate::cluster::DiscoveredResource>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_dynamic(
+            &self,
+            _context: &str,
+            _resource: &crate::cluster::DiscoveredResource,
+            _namespace: Option<&str>,
+        ) -> anyhow::Result<Vec<crate::cluster::DynamicRow>> {
+            Ok(Vec::new())
+        }
+
+        async fn get_dynamic(
+            &self,
+            _context: &str,
+            _resource: &crate::cluster::DiscoveredResource,
+            _namespace: Option<&str>,
+            _name: &str,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
     }
 
     struct NoopExecutor;

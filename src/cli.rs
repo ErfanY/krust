@@ -40,4 +40,12 @@ pub struct Cli {
     /// Bench: seconds to let watchers settle / initial-sync before measuring.
     #[arg(long, hide = true, default_value_t = 20)]
     pub bench_settle_secs: u64,
+
+    /// Print the discovered API resources for the initial context, then exit (Phase 4.1 check).
+    #[arg(long, hide = true, default_value_t = false)]
+    pub discover: bool,
+
+    /// With --discover: also list (and describe the first object of) this resource (plural or kind).
+    #[arg(long, hide = true)]
+    pub discover_resource: Option<String>,
 }

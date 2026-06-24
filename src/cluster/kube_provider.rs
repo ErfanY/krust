@@ -26,9 +26,10 @@ use k8s_openapi::{
 };
 use kube::{
     Api, Client, Config, Resource, ResourceExt,
-    api::{DeleteParams, LogParams, PostParams},
+    api::{DeleteParams, ListParams, LogParams, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
     core::{ApiResource, DynamicObject, GroupVersionKind},
+    discovery::{Discovery, Scope},
 };
 use kube_runtime::watcher::{self, Event};
 use serde::Serialize;
@@ -38,9 +39,12 @@ use tracing::{error, warn};
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
 use super::{
-    ActionError, ActionExecutor, ActionResult, PodLogEvent, PodLogRequest, PodLogStream,
-    ResourceProvider, WatchTarget, extract::extracted_for,
+    ActionError, ActionExecutor, ActionResult, DiscoveredResource, DynamicRow, PodLogEvent,
+    PodLogRequest, PodLogStream, ResourceProvider, WatchTarget, extract::extracted_for,
 };
+
+/// Bounded one-shot dynamic list size (Phase 4.1 read-only browse).
+const DYNAMIC_LIST_LIMIT: u32 = 500;
 
 #[derive(Debug, Clone)]
 pub struct KubeProviderOptions {
@@ -336,6 +340,83 @@ impl ResourceProvider for KubeResourceProvider {
 
         Ok(serde_json::to_value(obj)?)
     }
+
+    async fn discover(&self, context: &str) -> anyhow::Result<Vec<DiscoveredResource>> {
+        let client = self.client_for_context(context).await?;
+        let discovery = Discovery::new(client).run().await?;
+        let mut out = Vec::new();
+        for group in discovery.groups() {
+            for (api_resource, caps) in group.recommended_resources() {
+                out.push(DiscoveredResource {
+                    api_resource,
+                    namespaced: matches!(caps.scope, Scope::Namespaced),
+                });
+            }
+        }
+        out.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
+        out.dedup_by(|a, b| a.full_name() == b.full_name());
+        Ok(out)
+    }
+
+    async fn list_dynamic(
+        &self,
+        context: &str,
+        resource: &DiscoveredResource,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<DynamicRow>> {
+        let client = self.client_for_context(context).await?;
+        let ar = &resource.api_resource;
+        let api: Api<DynamicObject> = match (resource.namespaced, namespace) {
+            (true, Some(ns)) => Api::namespaced_with(client, ns, ar),
+            _ => Api::all_with(client, ar),
+        };
+        let list = api
+            .list(&ListParams::default().limit(DYNAMIC_LIST_LIMIT))
+            .await?;
+        let rows = list
+            .into_iter()
+            .map(|obj| DynamicRow {
+                namespace: obj.namespace(),
+                age: obj
+                    .creation_timestamp()
+                    .map(|ts| DateTime::<Utc>::from(std::time::SystemTime::from(ts.0))),
+                status: dynamic_status(&obj),
+                name: obj.name_any(),
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    async fn get_dynamic(
+        &self,
+        context: &str,
+        resource: &DiscoveredResource,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let client = self.client_for_context(context).await?;
+        let ar = &resource.api_resource;
+        let api: Api<DynamicObject> = match (resource.namespaced, namespace) {
+            (true, Some(ns)) => Api::namespaced_with(client, ns, ar),
+            (true, None) => Api::namespaced_with(client, "default", ar),
+            (false, _) => Api::all_with(client, ar),
+        };
+        Ok(serde_json::to_value(api.get(name).await?)?)
+    }
+}
+
+/// Best-effort status string for a dynamic object (no curated extractor for unknown kinds).
+fn dynamic_status(obj: &DynamicObject) -> String {
+    obj.data
+        .pointer("/status/phase")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            obj.data
+                .pointer("/status/conditions/0/type")
+                .and_then(serde_json::Value::as_str)
+        })
+        .unwrap_or("-")
+        .to_string()
 }
 
 fn select_warm_contexts(
