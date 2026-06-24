@@ -26,14 +26,5 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo fmt --all -- --check
-        run: cargo fmt --all -- --check
-
-      - name: cargo check --locked
-        run: cargo check --locked
-
-      - name: cargo test --locked
-        run: cargo test --locked
-
-      - name: cargo build --release --locked
-        run: cargo build --release --locked
+      - name: Validate (make ci)
+        run: make ci

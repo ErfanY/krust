@@ -46,6 +46,9 @@ sudo install krust-x86_64-unknown-linux-gnu/krust /usr/local/bin/krust
 cargo install --git https://github.com/ErfanY/krust.git --locked krust
 ```
 
+For local development, `make` (no args) lists targets; `make validate` runs the full CI gate
+(fmt/check/test/release build) and `make package` builds a release tarball.
+
 ## Quick Start
 
 ```bash

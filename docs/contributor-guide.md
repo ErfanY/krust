@@ -36,11 +36,12 @@ cargo run -- --context <context-name>
 ## Required Validation Before PR
 
 ```bash
-cargo fmt --all
-cargo check --locked
-cargo test --locked
-cargo build --release --locked
+make validate   # fmt-check -> check -> test -> release build (identical to CI)
 ```
+
+`make validate` is exactly what GitHub Actions runs (`make ci`), so a green local run matches CI.
+`make` (no args) lists all targets. Individual steps are also available: `make fmt`, `make check`,
+`make test`, `make build-release`, `make clippy`.
 
 ## Code Review Focus
 

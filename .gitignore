@@ -31,3 +31,6 @@ target
 
 # Scale-lab generated kubeconfig (embeds kwok cluster certs — never commit)
 scripts/scale/kubeconfig-scale.yaml
+
+# Release packaging output (`make package`)
+/dist
