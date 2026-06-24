@@ -167,8 +167,12 @@ Root problem: full object JSON kept for every entity.
 - [ ] **4.3 Resource-correlated events** — selecting a pod shows its events; today Events pane
   only renders Event objects directly (detail_pane.rs:170 "planned").
 - [ ] **4.4 Rendered describe** — kubectl-style human `describe` output alongside YAML/JSON.
-- [ ] **4.5 Filter parity** — fuzzy + regex + label-selector matching (k9s `/`, `-l`), beyond
-  plain substring (projector.rs:46).
+- [~] **4.5 Filter parity** — table filter now parses k9s-style: `!term` inverse, and label
+  selectors `key=value`/`key==value`/`key!=value` (comma-separated, all must hold) matched against
+  entity labels — this also fixes `:<kind> -l app=foo`, which previously substring-matched the
+  literal `app=foo` instead of labels. Plain text stays substring (predictable default).
+  Compiled once per projection (`Filter`). Tests cover label eq/neq/absent, inverse, substring
+  fallback. Deferred (dep-free for now): fuzzy + regex matching; detail/log search still substring.
 - [ ] **4.6 Port-forward** — readonly-adjacent inspection; decide in/out of v1 scope.
 - [ ] **4.7 k9s readonly surface audit** — enumerate k9s readonly commands/keybindings; close
   remaining gaps or explicitly mark out-of-scope (pulses/xray/popeye are stubbed,

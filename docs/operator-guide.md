@@ -79,6 +79,11 @@ Controller behavior:
 ## Search and Command UX
 
 - `/`: filter in list/overlay panes, search in detail/log panes
+
+Table filter syntax (in the `/` prompt or via `:<kind> -l ...`):
+- plain text — case-insensitive substring over name/namespace/status/summary
+- `!term` — inverse (exclude matches)
+- `key=value` / `key==value` / `key!=value` — label selector; comma-separate requirements (`app=api,tier=backend`), all must hold
 - `?`: detail/search shortcut
 - `n` / `N`: next/previous match in detail/log panes
 - `:`: command mode
