@@ -7,7 +7,7 @@ impl App {
         let active_tab_idx = self.active_tab;
         let request = self.view_request_for_tab(&active);
         let vm = self.projected_view(&request);
-        let visible_rows = vm.rows.len();
+        let visible_rows = vm.len();
         let max_selection = visible_rows.saturating_sub(1);
         let mut selected = active.selected.min(max_selection);
         self.current_tab_mut().selected = selected;
@@ -71,8 +71,8 @@ impl App {
             top_line.push_str(if self.logs.auto_scroll { "on" } else { "off" });
         }
         if active.kind() == ResourceKind::Pods
-            && let Some(row) = vm.rows.get(selected)
-            && let Some(entity) = self.store.get(&row.key)
+            && let Some(key) = vm.key(selected)
+            && let Some(entity) = self.store.get(key)
             && let Some(res) = &entity.extracted.pod_resources
         {
             top_line.push_str(&format!(
@@ -386,7 +386,7 @@ impl App {
         if active.pane == Pane::Table {
             let viewport_rows = table_viewport_rows(chunks[2].height);
             let (synced_selected, synced_offset) =
-                sync_table_viewport(selected, table_offset, viewport_rows, vm.rows.len());
+                sync_table_viewport(selected, table_offset, viewport_rows, vm.len());
             selected = synced_selected;
             table_offset = synced_offset;
             let tab = self.current_tab_mut();
@@ -600,20 +600,26 @@ impl App {
         } else {
             match active.pane {
                 Pane::Table => {
-                    let rows: Vec<Row<'_>> = vm
-                        .rows
-                        .iter()
-                        .map(|row| {
+                    // Materialize only the visible window — O(viewport), not O(total rows).
+                    let viewport_rows = table_viewport_rows(chunks[2].height);
+                    let start = table_offset;
+                    let end = start.saturating_add(viewport_rows).min(vm.len());
+                    let rows: Vec<Row<'_>> = (start..end)
+                        .filter_map(|idx| {
+                            let key = vm.key(idx)?;
+                            let row = materialize_row(&self.store, key)?;
                             let sev = classify_status_severity(&row.status);
                             let status = format!("{} {}", severity_tag(sev), row.status);
-                            Row::new(vec![
-                                Cell::from(row.namespace.clone()),
-                                Cell::from(row.name.clone()),
-                                Cell::from(status),
-                                Cell::from(row.age.clone()),
-                                Cell::from(row.summary.clone()),
-                            ])
-                            .style(severity_style(&theme, sev))
+                            Some(
+                                Row::new(vec![
+                                    Cell::from(row.namespace),
+                                    Cell::from(row.name),
+                                    Cell::from(status),
+                                    Cell::from(row.age),
+                                    Cell::from(row.summary),
+                                ])
+                                .style(severity_style(&theme, sev)),
+                            )
                         })
                         .collect();
 
@@ -634,18 +640,21 @@ impl App {
                     .block(Block::default().borders(Borders::ALL).title(format!(
                         "[KIND] {} ({})",
                         active.kind(),
-                        vm.rows.len()
+                        vm.len()
                     )))
                     .row_highlight_style(theme.row_highlight);
 
+                    // Rows are pre-sliced to the window, so the widget offset is 0 and the
+                    // selection is window-relative.
                     let mut state = ratatui::widgets::TableState::default()
-                        .with_selected(Some(selected))
-                        .with_offset(table_offset);
+                        .with_selected(Some(selected.saturating_sub(start)))
+                        .with_offset(0);
                     frame.render_stateful_widget(table, chunks[2], &mut state);
                 }
                 Pane::Describe | Pane::SecretDecode | Pane::Events => {
+                    let key = vm.key(selected).cloned();
                     let raw_body =
-                        self.detail_text(&vm.rows, selected, active.pane, active.detail_format);
+                        self.detail_text(key.as_ref(), active.pane, active.detail_format);
                     let body = raw_body;
                     let content_width = chunks[2].width.saturating_sub(2);
                     let content_height = chunks[2].height.saturating_sub(2);

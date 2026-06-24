@@ -25,9 +25,26 @@ pub struct ViewRow {
     pub summary: String,
 }
 
+/// Ordered, filtered view of a resource list. Holds only row *identities* (keys); display rows are
+/// materialized on demand for the visible window so per-frame render cost is O(visible), not
+/// O(total). The full ordered list is still needed for sort/filter/count/selection bounds.
 #[derive(Debug, Clone, Default)]
 pub struct ViewModel {
-    pub rows: Vec<ViewRow>,
+    pub order: Vec<ResourceKey>,
+}
+
+impl ViewModel {
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    pub fn key(&self, index: usize) -> Option<&ResourceKey> {
+        self.order.get(index)
+    }
 }
 
 pub trait ViewProjector: Send + Sync {
@@ -44,15 +61,7 @@ impl ViewProjector for SimpleViewProjector {
         let needle = request.filter.to_lowercase();
 
         if !needle.is_empty() {
-            entities.retain(|entity| {
-                let ns = entity.key.namespace.as_deref().unwrap_or("");
-                let haystack = format!(
-                    "{} {} {} {}",
-                    entity.key.name, ns, entity.status, entity.summary
-                )
-                .to_lowercase();
-                haystack.contains(&needle)
-            });
+            entities.retain(|entity| row_matches(entity, &needle));
         }
 
         entities.sort_by(|a, b| {
@@ -69,24 +78,45 @@ impl ViewProjector for SimpleViewProjector {
             }
         });
 
-        let rows = entities
-            .into_iter()
-            .map(|entity| ViewRow {
-                key: entity.key.clone(),
-                namespace: entity
-                    .key
-                    .namespace
-                    .clone()
-                    .unwrap_or_else(|| "-".to_string()),
-                name: entity.key.name.clone(),
-                status: entity.status.clone(),
-                age: human_age(entity.age),
-                summary: entity.summary.clone(),
-            })
-            .collect();
-
-        ViewModel { rows }
+        ViewModel {
+            order: entities
+                .into_iter()
+                .map(|entity| entity.key.clone())
+                .collect(),
+        }
     }
+}
+
+/// Case-insensitive substring match across the fields shown in the table, without allocating a
+/// combined haystack string per row.
+fn row_matches(entity: &crate::model::ResourceEntity, needle_lower: &str) -> bool {
+    let contains = |field: &str| field.to_lowercase().contains(needle_lower);
+    contains(&entity.key.name)
+        || entity
+            .key
+            .namespace
+            .as_deref()
+            .is_some_and(|ns| contains(ns))
+        || contains(&entity.status)
+        || contains(&entity.summary)
+}
+
+/// Build the display row for a single key (visible-window materialization). Returns None if the
+/// entity is no longer in the store (e.g. removed between projection and render).
+pub fn materialize_row(store: &StateStore, key: &ResourceKey) -> Option<ViewRow> {
+    let entity = store.get(key)?;
+    Some(ViewRow {
+        key: entity.key.clone(),
+        namespace: entity
+            .key
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
+        name: entity.key.name.clone(),
+        status: entity.status.clone(),
+        age: human_age(entity.age),
+        summary: entity.summary.clone(),
+    })
 }
 
 fn human_age(when: Option<DateTime<Utc>>) -> String {
@@ -148,8 +178,9 @@ mod tests {
             },
         );
 
-        assert_eq!(vm.rows.len(), 1);
-        assert_eq!(vm.rows[0].name, "worker");
+        assert_eq!(vm.len(), 1);
+        let row = materialize_row(&store, vm.key(0).expect("one match")).expect("row materializes");
+        assert_eq!(row.name, "worker");
     }
 
     #[test]
@@ -179,7 +210,7 @@ mod tests {
         let start = Instant::now();
         let mut rows = 0usize;
         for _ in 0..30 {
-            rows = projector.project(&store, &request).rows.len();
+            rows = projector.project(&store, &request).len();
         }
         let elapsed = start.elapsed();
         eprintln!(
