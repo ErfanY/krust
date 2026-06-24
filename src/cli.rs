@@ -45,6 +45,15 @@ pub struct Cli {
     #[arg(long, hide = true, default_value_t = 1)]
     pub bench_contexts: usize,
 
+    /// Soak: run the data plane for this many seconds under live churn, sampling RSS/entities/fds
+    /// to detect leaks/unbounded growth, then exit. 0 disables (Phase 5 soak).
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub soak_secs: u64,
+
+    /// Soak: seconds between samples.
+    #[arg(long, hide = true, default_value_t = 15)]
+    pub soak_sample_secs: u64,
+
     /// Print the discovered API resources for the initial context, then exit (Phase 4.1 check).
     #[arg(long, hide = true, default_value_t = false)]
     pub discover: bool,

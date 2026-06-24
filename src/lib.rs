@@ -75,7 +75,7 @@ pub async fn run() -> anyhow::Result<()> {
         .await;
     }
 
-    if cli.bench {
+    if cli.bench || cli.soak_secs > 0 {
         return ui::run_bench(
             contexts,
             initial_context,
@@ -88,6 +88,8 @@ pub async fn run() -> anyhow::Result<()> {
             cli.bench_iters,
             cli.bench_settle_secs,
             cli.bench_contexts,
+            cli.soak_secs,
+            cli.soak_sample_secs,
         )
         .await;
     }

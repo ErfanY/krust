@@ -58,19 +58,45 @@ fn current_rss_kb() -> Option<u64> {
         .ok()
 }
 
+/// Open file-descriptor count for this process (leak proxy for streams/connections) via `lsof`.
+fn current_fd_count() -> Option<usize> {
+    let pid = std::process::id().to_string();
+    let out = std::process::Command::new("lsof")
+        .args(["-p", &pid])
+        .output()
+        .ok()?;
+    // subtract the header line
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .count()
+            .saturating_sub(1),
+    )
+}
+
 impl App {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_bench(
         &mut self,
         mut delta_rx: mpsc::Receiver<StateDelta>,
         iters: usize,
         settle_secs: u64,
         context_count: usize,
+        soak_secs: u64,
+        soak_sample_secs: u64,
     ) {
         // Scope to all-namespace Pods — the densest list and the primary scale target.
         let pods_idx = ResourceKind::ORDERED
             .iter()
             .position(|k| *k == ResourceKind::Pods)
             .unwrap_or(0);
+
+        // Phase 5 soak: run under live churn for a while, sampling RSS/entities/fds for leaks.
+        if soak_secs > 0 {
+            self.run_bench_soak(&mut delta_rx, pods_idx, soak_secs, soak_sample_secs)
+                .await;
+            return;
+        }
 
         // Phase 1.3 memory test: warm N contexts in sequence and report the bounded store size.
         if context_count > 1 {
@@ -246,5 +272,118 @@ impl App {
             "  expected: final ≈ (active + warm_contexts) contexts, NOT {n}× per-context entities"
         );
         println!("============================================================\n");
+    }
+
+    /// Run the real watch→store pipeline for `soak_secs` under live churn, sampling RSS / entity
+    /// count / fd count to surface leaks or unbounded growth. Churn is driven externally
+    /// (scripts/scale/churn.sh); periodic watcher relists are exercised regardless.
+    async fn run_bench_soak(
+        &mut self,
+        delta_rx: &mut mpsc::Receiver<StateDelta>,
+        pods_idx: usize,
+        soak_secs: u64,
+        sample_secs: u64,
+    ) {
+        {
+            let tab = self.current_tab_mut();
+            tab.kind_idx = pods_idx;
+            tab.namespace = None;
+        }
+        let context = self.current_tab().context.clone();
+        eprintln!(
+            "[soak] context={context} kind=Pods ns=all  duration={soak_secs}s  sample={sample_secs}s"
+        );
+        self.ensure_active_watch().await;
+
+        // Warmup: drain until the initial list is in (cap 30s).
+        let warm = Instant::now();
+        loop {
+            while let Ok(delta) = delta_rx.try_recv() {
+                self.store.apply(delta);
+            }
+            if warm.elapsed() > Duration::from_secs(30)
+                || (self.store.entity_count() > 0 && warm.elapsed() > Duration::from_secs(5))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let base_rss = current_rss_kb().unwrap_or(0);
+        let base_entities = self.store.entity_count();
+        eprintln!(
+            "[soak] warmup done: entities={base_entities} rss={:.1}MB fds={:?}",
+            base_rss as f64 / 1024.0,
+            current_fd_count()
+        );
+        println!("\n  elapsed  entities   rss(MB)   fds   deltas/s");
+
+        let start = Instant::now();
+        let mut last_sample = Instant::now();
+        let mut last_rev = self.store.revision();
+        let mut max_rss = base_rss;
+        let mut max_entities = base_entities;
+        while start.elapsed() < Duration::from_secs(soak_secs) {
+            let mut n = 0;
+            while n < 8192 {
+                match delta_rx.try_recv() {
+                    Ok(delta) => {
+                        self.store.apply(delta);
+                        n += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if last_sample.elapsed() >= Duration::from_secs(sample_secs) {
+                let rss = current_rss_kb().unwrap_or(0);
+                let entities = self.store.entity_count();
+                let rev = self.store.revision();
+                let dps = rev.saturating_sub(last_rev) as f64
+                    / last_sample.elapsed().as_secs_f64().max(0.001);
+                max_rss = max_rss.max(rss);
+                max_entities = max_entities.max(entities);
+                println!(
+                    "  {:>6}s  {:>7}   {:>7.1}   {:>4}   {:>7.0}",
+                    start.elapsed().as_secs(),
+                    entities,
+                    rss as f64 / 1024.0,
+                    current_fd_count().map(|f| f as i64).unwrap_or(-1),
+                    dps,
+                );
+                last_sample = Instant::now();
+                last_rev = rev;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let final_rss = current_rss_kb().unwrap_or(0);
+        let growth = final_rss as i64 - base_rss as i64;
+        let pct = if base_rss > 0 {
+            growth as f64 / base_rss as f64 * 100.0
+        } else {
+            0.0
+        };
+        println!("\n=== krust soak report ({soak_secs}s under churn) ===");
+        println!(
+            "  entities: baseline {base_entities}  final {}  max {max_entities}",
+            self.store.entity_count()
+        );
+        println!(
+            "  RSS(MB):  baseline {:.1}  final {:.1}  max {:.1}  growth {:+.1}",
+            base_rss as f64 / 1024.0,
+            final_rss as f64 / 1024.0,
+            max_rss as f64 / 1024.0,
+            growth as f64 / 1024.0,
+        );
+        println!(
+            "  RSS growth: {pct:+.1}%  ({})",
+            if pct.abs() < 15.0 {
+                "stable"
+            } else {
+                "INVESTIGATE"
+            }
+        );
+        println!("  fds (final): {:?}", current_fd_count());
+        println!("=================================================\n");
     }
 }
