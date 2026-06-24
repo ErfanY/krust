@@ -787,7 +787,8 @@ where
             tx.send(StateDelta::Remove(key)).await.map_err(|_| ())?;
         }
         Event::Init => {
-            tx.send(StateDelta::Reset {
+            // (Re)list starting: mark the current set stale but keep showing it (no blank window).
+            tx.send(StateDelta::RelistStart {
                 context: context.to_string(),
                 kind,
             })
@@ -800,7 +801,13 @@ where
             }
         }
         Event::InitDone => {
-            // Marker that initial list state has been fully emitted.
+            // Initial list fully emitted: sweep entities not refreshed during this relist.
+            tx.send(StateDelta::RelistEnd {
+                context: context.to_string(),
+                kind,
+            })
+            .await
+            .map_err(|_| ())?;
         }
     }
     Ok(())
@@ -1038,6 +1045,118 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::Mutex;
+
+    // Representative non-trivial pod (labels, annotations, 2 containers w/ env+resources, status).
+    fn representative_pod_json() -> serde_json::Value {
+        json!({
+            "apiVersion": "v1", "kind": "Pod",
+            "metadata": {
+                "name": "api-7d9f8c6b5d-abcde", "namespace": "team-payments",
+                "uid": "f1e2d3c4-b5a6-7890-1234-567890abcdef",
+                "resourceVersion": "1048576", "creationTimestamp": "2026-06-20T10:00:00Z",
+                "labels": {
+                    "app": "api", "app.kubernetes.io/name": "api", "app.kubernetes.io/instance": "api-prod",
+                    "app.kubernetes.io/version": "1.42.0", "pod-template-hash": "7d9f8c6b5d",
+                    "team": "payments", "tier": "backend", "env": "prod"
+                },
+                "annotations": {
+                    "kubectl.kubernetes.io/restartedAt": "2026-06-20T10:00:00Z",
+                    "prometheus.io/scrape": "true", "prometheus.io/port": "9090",
+                    "checksum/config": "9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211",
+                    "sidecar.istio.io/status": "{\"version\":\"1.20\",\"initContainers\":[\"istio-init\"],\"containers\":[\"istio-proxy\"]}"
+                },
+                "ownerReferences": [ { "apiVersion": "apps/v1", "kind": "ReplicaSet", "name": "api-7d9f8c6b5d", "uid": "aabbccdd", "controller": true } ]
+            },
+            "spec": {
+                "nodeName": "ip-10-0-12-34.eu-north-1.compute.internal",
+                "serviceAccountName": "api",
+                "containers": [
+                    {
+                        "name": "api", "image": "registry.example.com/payments/api:1.42.0",
+                        "ports": [ { "containerPort": 8080, "name": "http" }, { "containerPort": 9090, "name": "metrics" } ],
+                        "env": [
+                            { "name": "LOG_LEVEL", "value": "info" }, { "name": "DB_HOST", "value": "aurora.internal" },
+                            { "name": "DB_PORT", "value": "5432" }, { "name": "POD_IP", "valueFrom": { "fieldRef": { "fieldPath": "status.podIP" } } }
+                        ],
+                        "resources": { "requests": { "cpu": "250m", "memory": "256Mi" }, "limits": { "cpu": "1", "memory": "512Mi" } },
+                        "volumeMounts": [ { "name": "config", "mountPath": "/etc/api" }, { "name": "kube-api-access", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true } ]
+                    },
+                    {
+                        "name": "istio-proxy", "image": "docker.io/istio/proxyv2:1.20",
+                        "resources": { "requests": { "cpu": "100m", "memory": "128Mi" }, "limits": { "cpu": "2", "memory": "1Gi" } },
+                        "env": [ { "name": "PILOT_CERT_PROVIDER", "value": "istiod" } ]
+                    }
+                ]
+            },
+            "status": {
+                "phase": "Running", "podIP": "10.0.12.200", "hostIP": "10.0.12.34", "startTime": "2026-06-20T10:00:01Z",
+                "conditions": [
+                    { "type": "Initialized", "status": "True", "lastTransitionTime": "2026-06-20T10:00:02Z" },
+                    { "type": "Ready", "status": "True", "lastTransitionTime": "2026-06-20T10:00:10Z" },
+                    { "type": "ContainersReady", "status": "True", "lastTransitionTime": "2026-06-20T10:00:10Z" },
+                    { "type": "PodScheduled", "status": "True", "lastTransitionTime": "2026-06-20T10:00:00Z" }
+                ],
+                "containerStatuses": [
+                    { "name": "api", "ready": true, "restartCount": 0, "image": "registry.example.com/payments/api:1.42.0", "started": true, "state": { "running": { "startedAt": "2026-06-20T10:00:05Z" } } },
+                    { "name": "istio-proxy", "ready": true, "restartCount": 1, "image": "docker.io/istio/proxyv2:1.20", "started": true, "state": { "running": { "startedAt": "2026-06-20T10:00:06Z" } } }
+                ]
+            }
+        })
+    }
+
+    #[test]
+    #[ignore = "performance benchmark"]
+    fn perf_to_value_vs_dynamic_parse() {
+        use k8s_openapi::api::core::v1::Pod;
+        use kube::core::DynamicObject;
+
+        let wire = serde_json::to_string(&representative_pod_json()).expect("serialize");
+        let iters = 50_000u32;
+
+        // Current ingest path: parse wire -> typed Pod, then serde_json::to_value(pod).
+        let pod: Pod = serde_json::from_str(&wire).expect("pod parse");
+        let start = Instant::now();
+        let mut acc = 0usize;
+        for _ in 0..iters {
+            let v = serde_json::to_value(&pod).expect("to_value");
+            acc = acc.wrapping_add(v.as_object().map(|o| o.len()).unwrap_or(0));
+        }
+        let to_value_per = start.elapsed() / iters;
+
+        // Parse cost comparison: typed Pod vs DynamicObject (proposed ingest).
+        let start = Instant::now();
+        for _ in 0..iters {
+            let p: Pod = serde_json::from_str(&wire).expect("pod parse");
+            acc = acc.wrapping_add(p.metadata.name.is_some() as usize);
+        }
+        let pod_parse_per = start.elapsed() / iters;
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let d: DynamicObject = serde_json::from_str(&wire).expect("dynamic parse");
+            acc = acc.wrapping_add(d.metadata.name.is_some() as usize);
+        }
+        let dyn_parse_per = start.elapsed() / iters;
+
+        std::hint::black_box(acc);
+        eprintln!(
+            "[perf] wire={}B  to_value/obj={:?}  pod_parse/obj={:?}  dyn_parse/obj={:?}",
+            wire.len(),
+            to_value_per,
+            pod_parse_per,
+            dyn_parse_per
+        );
+        eprintln!(
+            "[perf] current ingest serde ≈ pod_parse+to_value = {:?}/obj  -> 10k = {:?}",
+            pod_parse_per + to_value_per,
+            (pod_parse_per + to_value_per) * 10_000
+        );
+        eprintln!(
+            "[perf] proposed (dynamic) serde ≈ dyn_parse = {:?}/obj  -> 10k = {:?}",
+            dyn_parse_per,
+            dyn_parse_per * 10_000
+        );
+    }
 
     #[test]
     fn select_warm_contexts_respects_limit_and_ttl() {

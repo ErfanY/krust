@@ -2,11 +2,22 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::{ResourceEntity, ResourceKey, ResourceKind, StateDelta};
 
+/// Stored entity plus the relist generation it was last seen in. On reconnect we bump the
+/// generation, refresh still-present objects to the new generation as their applies arrive, and
+/// sweep anything left at an older generation — so the previous list stays visible the whole time
+/// instead of blanking.
+#[derive(Debug)]
+struct EntitySlot {
+    entity: ResourceEntity,
+    generation: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct StateStore {
-    entities: HashMap<ResourceKey, ResourceEntity>,
+    entities: HashMap<ResourceKey, EntitySlot>,
     context_kind_index: HashMap<(String, ResourceKind), HashSet<ResourceKey>>,
     namespaces_by_context: HashMap<String, HashSet<String>>,
+    current_generation: HashMap<(String, ResourceKind), u64>,
     errors: HashMap<String, String>,
     revision: u64,
 }
@@ -16,7 +27,8 @@ impl StateStore {
         match delta {
             StateDelta::Upsert(entity) => self.upsert(entity),
             StateDelta::Remove(key) => self.remove(&key),
-            StateDelta::Reset { context, kind } => self.reset_kind(&context, kind),
+            StateDelta::RelistStart { context, kind } => self.relist_start(&context, kind),
+            StateDelta::RelistEnd { context, kind } => self.relist_end(&context, kind),
             StateDelta::Error { context, message } => {
                 self.errors.insert(context, message);
             }
@@ -36,7 +48,7 @@ impl StateStore {
 
         keys.iter()
             .filter_map(|key| {
-                let entity = self.entities.get(key)?;
+                let entity = &self.entities.get(key)?.entity;
                 if let Some(target_ns) = namespace
                     && entity.key.namespace.as_deref() != Some(target_ns)
                 {
@@ -48,7 +60,7 @@ impl StateStore {
     }
 
     pub fn get(&self, key: &ResourceKey) -> Option<&ResourceEntity> {
-        self.entities.get(key)
+        self.entities.get(key).map(|slot| &slot.entity)
     }
 
     pub fn count(&self, context: &str, kind: ResourceKind, namespace: Option<&str>) -> usize {
@@ -103,14 +115,16 @@ impl StateStore {
 
     fn upsert(&mut self, entity: ResourceEntity) {
         let key = entity.key.clone();
+        // Stamp with the active generation for this (context, kind) so a relist sweep keeps it.
+        let generation = self
+            .current_generation
+            .get(&(key.context.clone(), key.kind))
+            .copied()
+            .unwrap_or(0);
 
-        if let Some(existing) = self.entities.insert(key.clone(), entity)
-            && let Some(index) = self
-                .context_kind_index
-                .get_mut(&(existing.key.context.clone(), existing.key.kind))
-        {
-            index.remove(&existing.key);
-        }
+        // Re-inserting the same key into the index HashSet is a no-op, so no removal needed.
+        self.entities
+            .insert(key.clone(), EntitySlot { entity, generation });
 
         if let Some(ns) = key.namespace.clone() {
             self.namespaces_by_context
@@ -135,11 +149,38 @@ impl StateStore {
         }
     }
 
-    fn reset_kind(&mut self, context: &str, kind: ResourceKind) {
-        if let Some(keys) = self.context_kind_index.remove(&(context.to_string(), kind)) {
-            for key in keys {
-                self.entities.remove(&key);
-            }
+    /// Begin a (re)list for a kind: bump its generation. Existing entities keep their old
+    /// generation and stay visible until the matching `relist_end` sweeps whatever wasn't refreshed.
+    fn relist_start(&mut self, context: &str, kind: ResourceKind) {
+        *self
+            .current_generation
+            .entry((context.to_string(), kind))
+            .or_insert(0) += 1;
+    }
+
+    /// Finish a (re)list: drop entities still at an older generation (objects that disappeared
+    /// while disconnected and were absent from the fresh list).
+    fn relist_end(&mut self, context: &str, kind: ResourceKind) {
+        let generation = self
+            .current_generation
+            .get(&(context.to_string(), kind))
+            .copied()
+            .unwrap_or(0);
+        let Some(keys) = self.context_kind_index.get(&(context.to_string(), kind)) else {
+            return;
+        };
+        let stale: Vec<ResourceKey> = keys
+            .iter()
+            .filter(|key| {
+                self.entities
+                    .get(*key)
+                    .map(|slot| slot.generation < generation)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.remove(&key);
         }
     }
 }
@@ -187,5 +228,48 @@ mod tests {
         store.apply(StateDelta::Remove(key.clone()));
 
         assert!(store.get(&key).is_none());
+    }
+
+    #[test]
+    fn relist_keeps_data_visible_and_sweeps_only_gone_objects() {
+        let mut store = StateStore::default();
+        // Initial list: two pods.
+        store.apply(StateDelta::RelistStart {
+            context: "dev".to_string(),
+            kind: ResourceKind::Pods,
+        });
+        store.apply(StateDelta::Upsert(mk_entity("dev", Some("a"), "pod-a")));
+        store.apply(StateDelta::Upsert(mk_entity("dev", Some("a"), "pod-b")));
+        store.apply(StateDelta::RelistEnd {
+            context: "dev".to_string(),
+            kind: ResourceKind::Pods,
+        });
+        assert_eq!(store.list("dev", ResourceKind::Pods, None).len(), 2);
+
+        // Reconnect/relist: pod-a is still present, pod-b is gone, pod-c is new.
+        store.apply(StateDelta::RelistStart {
+            context: "dev".to_string(),
+            kind: ResourceKind::Pods,
+        });
+        // Mid-relist the previous set must remain fully visible (no blank window).
+        assert_eq!(store.list("dev", ResourceKind::Pods, None).len(), 2);
+        store.apply(StateDelta::Upsert(mk_entity("dev", Some("a"), "pod-a")));
+        store.apply(StateDelta::Upsert(mk_entity("dev", Some("a"), "pod-c")));
+        // Still 3 visible until the relist ends (pod-b not yet swept).
+        assert_eq!(store.list("dev", ResourceKind::Pods, None).len(), 3);
+        store.apply(StateDelta::RelistEnd {
+            context: "dev".to_string(),
+            kind: ResourceKind::Pods,
+        });
+
+        let names: std::collections::HashSet<String> = store
+            .list("dev", ResourceKind::Pods, None)
+            .into_iter()
+            .map(|e| e.key.name.clone())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains("pod-a"));
+        assert!(names.contains("pod-c"));
+        assert!(!names.contains("pod-b"));
     }
 }
