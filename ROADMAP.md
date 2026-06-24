@@ -151,8 +151,11 @@ Root problem: full object JSON kept for every entity.
     /`DynamicRow` types; hidden `--discover[ --discover-resource X]` headless check; `scripts/scale/crds.sh`
     adds a sample CRD. Verified against lab: 68 resources incl. CRD `widgets.demo.krust.io`, listed +
     described 3 Widgets. 75 tests pass.
-  - [ ] **4.1a-2 UI** — `:api` discovery catalog overlay + interactive dynamic-browse overlay
-    (generic columns) + describe-on-select, wiring the `:<unknown/CRD>` command fallback to the dynamic path.
+  - [x] **4.1a-2 UI** — `:api [filter]` shows the discovery catalog; `:<resource>` lists any
+    discovered resource/CRD's objects (generic columns) and `:<resource> <name>` describes one — all
+    via the proven `Overlay::Text` (command-driven, no new interactive overlay). Per-context
+    discovery cached. Unit test `dynamic_browse_catalog_list_and_describe`. 76 tests pass.
+    (Interactive selectable dynamic-list overlay deferred to 4.1c polish.)
   - [ ] **4.1b dynamic watches + KindId/ResourceKey refactor** (fold 24 typed watches into the dynamic path).
   - [ ] **4.1c navigation/UX** (discovered kinds in kind-cycle / resource picker, short names from discovery).
 - [ ] **4.2 Metrics integration** — `metrics.k8s.io` for real pod/node CPU+mem (top-style).
