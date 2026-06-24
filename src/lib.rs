@@ -65,6 +65,16 @@ pub async fn run() -> anyhow::Result<()> {
     let action_executor: Arc<dyn ActionExecutor> = provider.clone();
     let resource_provider: Arc<dyn ResourceProvider> = provider;
 
+    if cli.discover {
+        return run_discover(
+            resource_provider.as_ref(),
+            &initial_context,
+            cli.discover_resource.as_deref(),
+            initial_namespace.as_deref(),
+        )
+        .await;
+    }
+
     if cli.bench {
         return ui::run_bench(
             contexts,
@@ -95,6 +105,74 @@ pub async fn run() -> anyhow::Result<()> {
         app_config.ui.show_help,
     )
     .await
+}
+
+/// Headless Phase 4.1 check: print discovered API resources for a context, and optionally list +
+/// describe one resource. Verifies the dynamic discovery/list/get path against a real cluster.
+async fn run_discover(
+    provider: &dyn ResourceProvider,
+    context: &str,
+    resource: Option<&str>,
+    namespace: Option<&str>,
+) -> anyhow::Result<()> {
+    let catalog = provider.discover(context).await?;
+    println!(
+        "Discovered {} API resources on context '{context}':",
+        catalog.len()
+    );
+    for r in &catalog {
+        println!(
+            "  {:<44} {:<22} {}",
+            r.full_name(),
+            r.kind(),
+            if r.namespaced {
+                "namespaced"
+            } else {
+                "cluster"
+            }
+        );
+    }
+
+    if let Some(token) = resource {
+        let Some(res) = catalog.iter().find(|r| {
+            r.plural().eq_ignore_ascii_case(token)
+                || r.kind().eq_ignore_ascii_case(token)
+                || r.full_name().eq_ignore_ascii_case(token)
+        }) else {
+            println!("\nresource '{token}' not found in discovery");
+            return Ok(());
+        };
+
+        println!(
+            "\nListing {} (namespace={namespace:?}) ...",
+            res.full_name()
+        );
+        let rows = provider.list_dynamic(context, res, namespace).await?;
+        println!("  {} object(s) returned (bounded):", rows.len());
+        for row in rows.iter().take(20) {
+            println!(
+                "    {}/{}  status={}",
+                row.namespace.as_deref().unwrap_or("-"),
+                row.name,
+                row.status
+            );
+        }
+
+        if let Some(first) = rows.first() {
+            let obj = provider
+                .get_dynamic(context, res, first.namespace.as_deref(), &first.name)
+                .await?;
+            let yaml = serde_yaml::to_string(&obj).unwrap_or_default();
+            let preview: Vec<&str> = yaml.lines().take(15).collect();
+            println!(
+                "\ndescribe {} (first 15 lines):\n{}",
+                first.name,
+                preview.join("\n")
+            );
+        }
+    }
+
+    Ok(())
 }
 
 fn init_tracing() {

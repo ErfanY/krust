@@ -2,11 +2,53 @@ mod extract;
 mod kube_provider;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use kube::core::ApiResource;
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::model::{ResourceKey, ResourceKind};
 
 pub use kube_provider::{KubeProviderOptions, KubeResourceProvider};
+
+/// An API resource discovered on a cluster (built-in or CRD), beyond krust's curated kinds.
+/// Phase 4.1: enables read-only browse/describe of arbitrary GVKs via the dynamic path.
+#[derive(Debug, Clone)]
+pub struct DiscoveredResource {
+    pub api_resource: ApiResource,
+    pub namespaced: bool,
+}
+
+impl DiscoveredResource {
+    pub fn group(&self) -> &str {
+        &self.api_resource.group
+    }
+    pub fn version(&self) -> &str {
+        &self.api_resource.version
+    }
+    pub fn kind(&self) -> &str {
+        &self.api_resource.kind
+    }
+    pub fn plural(&self) -> &str {
+        &self.api_resource.plural
+    }
+    /// `kind.group` (or just `kind` for core), lowercased — a stable display/match handle.
+    pub fn full_name(&self) -> String {
+        if self.api_resource.group.is_empty() {
+            self.api_resource.plural.clone()
+        } else {
+            format!("{}.{}", self.api_resource.plural, self.api_resource.group)
+        }
+    }
+}
+
+/// A generic row from a one-shot dynamic list (no curated columns).
+#[derive(Debug, Clone)]
+pub struct DynamicRow {
+    pub namespace: Option<String>,
+    pub name: String,
+    pub age: Option<DateTime<Utc>>,
+    pub status: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct ActionResult {
@@ -74,6 +116,27 @@ pub trait ResourceProvider: Send + Sync {
     /// Fetch the full object for a single resource on demand (for detail/describe/decode/edit).
     /// Not retained per row — see the lean entity model (docs/design/phase-1.1-lean-entity-model.md).
     async fn get_object(&self, key: &ResourceKey) -> anyhow::Result<serde_json::Value>;
+
+    /// Discover all API resources available on a context (built-ins + CRDs). One cached call per
+    /// context. Phase 4.1 (dynamic resources).
+    async fn discover(&self, context: &str) -> anyhow::Result<Vec<DiscoveredResource>>;
+
+    /// One-shot list of a discovered resource's objects (bounded), with generic columns.
+    async fn list_dynamic(
+        &self,
+        context: &str,
+        resource: &DiscoveredResource,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<DynamicRow>>;
+
+    /// Fetch a single dynamic object's full manifest for describe.
+    async fn get_dynamic(
+        &self,
+        context: &str,
+        resource: &DiscoveredResource,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> anyhow::Result<serde_json::Value>;
 }
 
 #[async_trait]
