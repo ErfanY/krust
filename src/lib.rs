@@ -199,6 +199,18 @@ async fn run_metrics_probe(provider: &dyn ResourceProvider, context: &str) -> an
         Ok(_) => println!("metrics.k8s.io served but reported 0 nodes (no usage data yet)"),
         Err(err) => println!("metrics.k8s.io unavailable (graceful fallback to requests): {err}"),
     }
+    match provider.pod_metrics(context, None).await {
+        Ok(pods) if !pods.is_empty() => {
+            let cpu_m: u64 = pods.iter().map(|p| p.cpu_used_m).sum();
+            println!(
+                "pod metrics OK: {} pods reporting; summed cpu={:.2} cores",
+                pods.len(),
+                cpu_m as f64 / 1000.0,
+            );
+        }
+        Ok(_) => println!("pod metrics: 0 pods reporting"),
+        Err(err) => println!("pod metrics unavailable: {err}"),
+    }
     Ok(())
 }
 

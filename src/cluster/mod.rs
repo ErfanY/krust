@@ -48,6 +48,15 @@ pub struct NodeUsage {
     pub mem_used_b: u64,
 }
 
+/// Actual resource usage for one pod (summed across its containers), from `metrics.k8s.io`.
+#[derive(Debug, Clone)]
+pub struct PodUsage {
+    pub namespace: String,
+    pub name: String,
+    pub cpu_used_m: u64,
+    pub mem_used_b: u64,
+}
+
 /// A generic row from a one-shot dynamic list (no curated columns).
 #[derive(Debug, Clone)]
 pub struct DynamicRow {
@@ -148,6 +157,14 @@ pub trait ResourceProvider: Send + Sync {
     /// Per-node actual usage from `metrics.k8s.io` (Phase 4.2). Errors if the metrics API is not
     /// served (no metrics-server); callers degrade gracefully.
     async fn node_metrics(&self, context: &str) -> anyhow::Result<Vec<NodeUsage>>;
+
+    /// Per-pod actual usage (summed across containers) from `metrics.k8s.io`, scoped to a namespace
+    /// or cluster-wide. Errors if the metrics API is not served; callers degrade gracefully.
+    async fn pod_metrics(
+        &self,
+        context: &str,
+        namespace: Option<&str>,
+    ) -> anyhow::Result<Vec<PodUsage>>;
 }
 
 #[async_trait]
