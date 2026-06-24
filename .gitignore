@@ -28,3 +28,6 @@ target
 # macOS Finder artifacts
 .DS_Store
 **/.DS_Store
+
+# Scale-lab generated kubeconfig (embeds kwok cluster certs — never commit)
+scripts/scale/kubeconfig-scale.yaml
