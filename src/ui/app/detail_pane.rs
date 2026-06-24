@@ -142,29 +142,38 @@ impl App {
         let Some(row) = rows.get(selected) else {
             return "No resource selected".to_string();
         };
-        let Some(entity) = self.store.get(&row.key) else {
-            return "Resource details unavailable".to_string();
+        // The full object is fetched on demand (lean entity model) and held in detail_cache.
+        let Some(detail) = self.detail_cache.as_ref().filter(|d| d.key == row.key) else {
+            return format!("Loading {} {} …", row.key.kind.short_name(), row.key.name);
         };
+        if let Some(err) = &detail.error {
+            return format!(
+                "Failed to load {} {}: {err}",
+                row.key.kind.short_name(),
+                row.key.name
+            );
+        }
+        let raw = &detail.value;
 
         match pane {
             Pane::Describe => match format {
-                DetailFormat::Yaml => to_pretty_yaml(&entity.raw),
-                DetailFormat::Json => to_pretty_json(&entity.raw),
+                DetailFormat::Yaml => to_pretty_yaml(raw),
+                DetailFormat::Json => to_pretty_json(raw),
             },
             Pane::SecretDecode => {
                 if row.key.kind != ResourceKind::Secrets {
                     return "Decode pane is available for Secret resources only".to_string();
                 }
                 match format {
-                    DetailFormat::Yaml => decoded_secret_text(&entity.raw),
-                    DetailFormat::Json => decoded_secret_json_text(&entity.raw),
+                    DetailFormat::Yaml => decoded_secret_text(raw),
+                    DetailFormat::Json => decoded_secret_json_text(raw),
                 }
             }
             Pane::Events => {
                 if row.key.kind == ResourceKind::Events {
                     match format {
-                        DetailFormat::Yaml => to_pretty_yaml(&entity.raw),
-                        DetailFormat::Json => to_pretty_json(&entity.raw),
+                        DetailFormat::Yaml => to_pretty_yaml(raw),
+                        DetailFormat::Json => to_pretty_json(raw),
                     }
                 } else {
                     "Events pane currently supports Event resources directly; resource-scoped event correlation is planned in next milestone.".to_string()
@@ -242,12 +251,26 @@ impl App {
             self.status_line = "No resource selected".to_string();
             return;
         };
-        let Some(entity) = self.store.get(&row.key) else {
-            self.status_line = "Resource details unavailable".to_string();
-            return;
-        };
         let key = row.key.clone();
-        let original = entity.raw.clone();
+        // Reuse the on-demand detail object if it is for this row; otherwise fetch it now.
+        let cached = self
+            .detail_cache
+            .as_ref()
+            .filter(|d| d.key == key && d.error.is_none())
+            .map(|d| d.value.clone());
+        let original = match cached {
+            Some(value) => value,
+            None => {
+                let provider = self.resource_provider.clone();
+                match provider.get_object(&key).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.status_line = format!("Failed to load {} for edit: {err}", key.name);
+                        return;
+                    }
+                }
+            }
+        };
 
         let initial_text = match pane {
             Pane::Describe => match detail_format {

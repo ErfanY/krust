@@ -28,4 +28,16 @@ pub struct Cli {
     /// Eagerly initialize auth/client for all kubeconfig contexts.
     #[arg(long, default_value_t = false)]
     pub all_contexts: bool,
+
+    /// Run a headless performance benchmark against the initial context, print a report, then exit.
+    #[arg(long, hide = true, default_value_t = false)]
+    pub bench: bool,
+
+    /// Bench: iterations per measured operation.
+    #[arg(long, hide = true, default_value_t = 100)]
+    pub bench_iters: usize,
+
+    /// Bench: seconds to let watchers settle / initial-sync before measuring.
+    #[arg(long, hide = true, default_value_t = 20)]
+    pub bench_settle_secs: u64,
 }

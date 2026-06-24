@@ -164,7 +164,57 @@ pub struct ResourceEntity {
     pub age: Option<DateTime<Utc>>,
     pub labels: Vec<(String, String)>,
     pub summary: String,
-    pub raw: serde_json::Value,
+    /// Compact fields extracted once at ingest for the all-rows hot paths (pulse aggregates,
+    /// log fan-in owner mapping, container pickers). The full object is fetched on demand for
+    /// detail/describe/edit via `ResourceProvider::get_object`, never retained per row.
+    pub extracted: Extracted,
+}
+
+/// Small, fixed-size per-row payload. Replaces retaining the full object JSON for every entity.
+/// Most fields are empty for kinds that don't need them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Extracted {
+    /// Pod's scheduled node (pods only).
+    pub node_name: Option<String>,
+    /// Pod container names (pods only) — used by the container picker and log fan-in.
+    pub containers: Vec<String>,
+    /// ownerReferences (kind,name) — used to map Deployment -> ReplicaSet -> Pod for logs.
+    pub owners: Vec<OwnerRef>,
+    /// Aggregated pod resource requests/limits (pods only) — used by the cluster pulse.
+    pub pod_resources: Option<PodResources>,
+    /// Node capacity/condition summary (nodes only) — used by the cluster pulse.
+    pub node_capacity: Option<NodeCapacity>,
+}
+
+impl Extracted {
+    pub fn owned_by(&self, kind: &str, name: &str) -> bool {
+        self.owners
+            .iter()
+            .any(|owner| owner.kind == kind && owner.name == name)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OwnerRef {
+    pub kind: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PodResources {
+    pub cpu_request_m: u64,
+    pub cpu_limit_m: u64,
+    pub mem_request_b: u64,
+    pub mem_limit_b: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct NodeCapacity {
+    pub ready: bool,
+    pub unschedulable: bool,
+    pub cpu_alloc_m: u64,
+    pub mem_alloc_b: u64,
+    pub pod_alloc: u64,
 }
 
 #[derive(Debug, Clone)]

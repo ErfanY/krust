@@ -65,6 +65,22 @@ pub async fn run() -> anyhow::Result<()> {
     let action_executor: Arc<dyn ActionExecutor> = provider.clone();
     let resource_provider: Arc<dyn ResourceProvider> = provider;
 
+    if cli.bench {
+        return ui::run_bench(
+            contexts,
+            initial_context,
+            context_default_namespaces,
+            rx,
+            action_executor,
+            resource_provider,
+            keymap,
+            cli.readonly,
+            cli.bench_iters,
+            cli.bench_settle_secs,
+        )
+        .await;
+    }
+
     ui::run(
         contexts,
         initial_context,

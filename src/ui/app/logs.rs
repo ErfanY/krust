@@ -2,24 +2,9 @@ use super::*;
 
 impl App {
     pub(super) fn pod_container_names_for_key(&self, pod_key: &ResourceKey) -> Vec<String> {
-        let Some(entity) = self.store.get(pod_key) else {
-            return Vec::new();
-        };
-        entity
-            .raw
-            .pointer("/spec/containers")
-            .and_then(serde_json::Value::as_array)
-            .map(|containers| {
-                containers
-                    .iter()
-                    .filter_map(|container| {
-                        container
-                            .get("name")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .collect::<Vec<_>>()
-            })
+        self.store
+            .get(pod_key)
+            .map(|entity| entity.extracted.containers.clone())
             .unwrap_or_default()
     }
 
@@ -73,7 +58,7 @@ impl App {
             .store
             .list(&rs_key.context, ResourceKind::Pods, namespace)
             .into_iter()
-            .filter(|pod| owner_reference_matches(&pod.raw, "ReplicaSet", &rs_key.name))
+            .filter(|pod| pod.extracted.owned_by("ReplicaSet", &rs_key.name))
             .map(|pod| pod.key.clone())
             .collect();
         pods.sort_by(|a, b| a.name.cmp(&b.name));
@@ -87,7 +72,7 @@ impl App {
             .store
             .list(&dep_key.context, ResourceKind::ReplicaSets, namespace)
             .into_iter()
-            .filter(|rs| owner_reference_matches(&rs.raw, "Deployment", &dep_key.name))
+            .filter(|rs| rs.extracted.owned_by("Deployment", &dep_key.name))
             .map(|rs| rs.key.clone())
             .collect();
         replica_sets.sort_by(|a, b| a.name.cmp(&b.name));
