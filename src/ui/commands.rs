@@ -52,6 +52,8 @@ pub(crate) fn command_names() -> &'static [&'static str] {
         "pulses",
         "pu",
         "xray",
+        "triage",
+        "issues",
         "popeye",
         "pop",
         "plugins",

@@ -266,7 +266,7 @@ impl App {
                     *scroll = scroll.saturating_add(delta as u16);
                 }
             }
-            Some(Overlay::Xray { selected, .. }) => {
+            Some(Overlay::Xray { selected, .. } | Overlay::Triage { selected, .. }) => {
                 if delta < 0 {
                     *selected = selected.saturating_sub(delta.unsigned_abs() as usize);
                 } else {
@@ -359,7 +359,9 @@ impl App {
     pub(super) fn overlay_home(&mut self) {
         match &mut self.overlay {
             Some(Overlay::Text { scroll, .. }) => *scroll = 0,
-            Some(Overlay::Xray { selected, .. }) => *selected = 0,
+            Some(Overlay::Xray { selected, .. } | Overlay::Triage { selected, .. }) => {
+                *selected = 0
+            }
             Some(Overlay::Contexts {
                 contexts,
                 selected,
@@ -395,7 +397,9 @@ impl App {
         match &mut self.overlay {
             Some(Overlay::Text { scroll, .. }) => *scroll = u16::MAX,
             // Clamped to the row count in render.
-            Some(Overlay::Xray { selected, .. }) => *selected = usize::MAX,
+            Some(Overlay::Xray { selected, .. } | Overlay::Triage { selected, .. }) => {
+                *selected = usize::MAX
+            }
             Some(Overlay::Contexts {
                 contexts,
                 selected,
