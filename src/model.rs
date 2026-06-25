@@ -99,6 +99,106 @@ impl ResourceKind {
                 | ResourceKind::ClusterRoleBindings
         )
     }
+
+    /// Kind-specific table columns shown after the universal Namespace/Name/Status/Age.
+    ///
+    /// This is the single source of truth for both the table header (labels + widths) and the
+    /// per-row values: `extract_columns` in the cluster provider MUST emit exactly these values,
+    /// in this order, for the same kind. The
+    /// `extract_columns_matches_declared_header_count_for_every_kind` test enforces the count.
+    /// Kinds with no meaningful extra columns return `&[]` and render with just the four
+    /// universal columns.
+    pub fn extra_columns(self) -> &'static [ExtraColumn] {
+        use ExtraColumn as C;
+        const DEPLOY: &[ExtraColumn] = &[C::new("UP-TO-DATE", 11), C::new("AVAILABLE", 10)];
+        const RS: &[ExtraColumn] = &[
+            C::new("DESIRED", 8),
+            C::new("CURRENT", 8),
+            C::new("READY", 7),
+        ];
+        const STS: &[ExtraColumn] = &[C::new("READY", 8)];
+        const DS: &[ExtraColumn] = &[C::new("DESIRED", 8), C::new("READY", 7), C::new("AVAIL", 7)];
+        const SVC: &[ExtraColumn] = &[
+            C::new("TYPE", 13),
+            C::new("CLUSTER-IP", 16),
+            C::new("PORTS", 22),
+        ];
+        const ING: &[ExtraColumn] = &[
+            C::new("CLASS", 12),
+            C::new("HOSTS", 30),
+            C::new("ADDRESS", 20),
+        ];
+        const JOB: &[ExtraColumn] = &[C::new("COMPLETIONS", 12), C::new("DURATION", 10)];
+        const CJ: &[ExtraColumn] = &[
+            C::new("SCHEDULE", 14),
+            C::new("SUSPEND", 8),
+            C::new("ACTIVE", 7),
+        ];
+        const CM: &[ExtraColumn] = &[C::new("DATA", 6)];
+        const SECRET: &[ExtraColumn] = &[C::new("TYPE", 30), C::new("DATA", 6)];
+        const NODE: &[ExtraColumn] = &[C::new("ROLES", 20), C::new("VERSION", 16)];
+        const PVC: &[ExtraColumn] = &[
+            C::new("VOLUME", 22),
+            C::new("CAPACITY", 10),
+            C::new("ACCESS", 10),
+            C::new("STORAGECLASS", 16),
+        ];
+        const PV: &[ExtraColumn] = &[
+            C::new("CAPACITY", 10),
+            C::new("ACCESS", 10),
+            C::new("RECLAIM", 10),
+            C::new("CLAIM", 26),
+            C::new("STORAGECLASS", 16),
+        ];
+        const HPA: &[ExtraColumn] = &[
+            C::new("REFERENCE", 26),
+            C::new("MINPODS", 8),
+            C::new("MAXPODS", 8),
+            C::new("REPLICAS", 9),
+        ];
+        const SA: &[ExtraColumn] = &[C::new("SECRETS", 8), C::new("PULL-SECRETS", 13)];
+        const BINDING: &[ExtraColumn] = &[C::new("ROLE", 26), C::new("SUBJECTS", 34)];
+        const PDB: &[ExtraColumn] = &[
+            C::new("MIN-AVAIL", 10),
+            C::new("MAX-UNAVAIL", 12),
+            C::new("ALLOWED", 8),
+        ];
+        match self {
+            ResourceKind::Deployments => DEPLOY,
+            ResourceKind::ReplicaSets => RS,
+            ResourceKind::StatefulSets => STS,
+            ResourceKind::DaemonSets => DS,
+            ResourceKind::Services => SVC,
+            ResourceKind::Ingresses => ING,
+            ResourceKind::Jobs => JOB,
+            ResourceKind::CronJobs => CJ,
+            ResourceKind::ConfigMaps => CM,
+            ResourceKind::Secrets => SECRET,
+            ResourceKind::Nodes => NODE,
+            ResourceKind::PersistentVolumeClaims => PVC,
+            ResourceKind::PersistentVolumes => PV,
+            ResourceKind::HorizontalPodAutoscalers => HPA,
+            ResourceKind::ServiceAccounts => SA,
+            ResourceKind::RoleBindings | ResourceKind::ClusterRoleBindings => BINDING,
+            ResourceKind::PodDisruptionBudgets => PDB,
+            _ => &[],
+        }
+    }
+}
+
+/// A kind-specific table column appended after the universal Namespace/Name/Status/Age columns.
+/// See [`ResourceKind::extra_columns`] for the header/value contract.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtraColumn {
+    pub header: &'static str,
+    /// Fixed display width in cells.
+    pub width: u16,
+}
+
+impl ExtraColumn {
+    pub const fn new(header: &'static str, width: u16) -> Self {
+        ExtraColumn { header, width }
+    }
 }
 
 impl fmt::Display for ResourceKind {
@@ -163,7 +263,9 @@ pub struct ResourceEntity {
     pub status: String,
     pub age: Option<DateTime<Utc>>,
     pub labels: Vec<(String, String)>,
-    pub summary: String,
+    /// Kind-specific column values, in the order declared by [`ResourceKind::extra_columns`].
+    /// Empty for kinds (and pods, which render live metric columns) that have no extra columns.
+    pub columns: Vec<String>,
     /// Compact fields extracted once at ingest for the all-rows hot paths (pulse aggregates,
     /// log fan-in owner mapping, container pickers). The full object is fetched on demand for
     /// detail/describe/edit via `ResourceProvider::get_object`, never retained per row.

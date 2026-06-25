@@ -1032,7 +1032,7 @@ where
         .collect();
 
     let status = extract_status(kind, &raw);
-    let summary = extract_summary(kind, &raw);
+    let columns = extract_columns(kind, &raw);
     // Extract the few scalar fields the all-rows hot paths need, then drop the full JSON.
     let extracted = extracted_for(kind, &raw);
 
@@ -1041,7 +1041,7 @@ where
         status,
         age,
         labels,
-        summary,
+        columns,
         extracted,
     })
 }
@@ -1115,28 +1115,300 @@ fn extract_pod_status(raw: &serde_json::Value) -> String {
         .to_string()
 }
 
-fn extract_summary(kind: ResourceKind, raw: &serde_json::Value) -> String {
+/// Produce the kind-specific column values for an entity, in the exact order declared by
+/// [`ResourceKind::extra_columns`]. The lengths must match (enforced by `kind_columns_contract`).
+fn extract_columns(kind: ResourceKind, raw: &serde_json::Value) -> Vec<String> {
+    // Small readers over the raw JSON.
+    let s = |p: &str| {
+        raw.pointer(p)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let i = |p: &str| raw.pointer(p).and_then(serde_json::Value::as_i64);
+    let int_cell = |p: &str| i(p).unwrap_or(0).to_string();
+    // Count of keys in an object (ConfigMap/Secret `data`) or elements in an array.
+    let count = |p: &str| match raw.pointer(p) {
+        Some(serde_json::Value::Object(m)) => m.len().to_string(),
+        Some(serde_json::Value::Array(a)) => a.len().to_string(),
+        _ => "0".to_string(),
+    };
+    let dash = || "-".to_string();
+
     match kind {
-        ResourceKind::Pods => raw
-            .pointer("/spec/nodeName")
+        ResourceKind::Deployments => vec![
+            int_cell("/status/updatedReplicas"),
+            int_cell("/status/availableReplicas"),
+        ],
+        ResourceKind::ReplicaSets => vec![
+            int_cell("/spec/replicas"),
+            int_cell("/status/replicas"),
+            int_cell("/status/readyReplicas"),
+        ],
+        ResourceKind::StatefulSets => vec![format!(
+            "{}/{}",
+            i("/status/readyReplicas").unwrap_or(0),
+            i("/spec/replicas").unwrap_or(0)
+        )],
+        ResourceKind::DaemonSets => vec![
+            int_cell("/status/desiredNumberScheduled"),
+            int_cell("/status/numberReady"),
+            int_cell("/status/numberAvailable"),
+        ],
+        ResourceKind::Services => vec![
+            s("/spec/type").unwrap_or_else(|| "ClusterIP".to_string()),
+            s("/spec/clusterIP").unwrap_or_else(dash),
+            service_ports(raw),
+        ],
+        ResourceKind::Ingresses => vec![
+            s("/spec/ingressClassName").unwrap_or_else(dash),
+            ingress_hosts(raw),
+            ingress_address(raw),
+        ],
+        ResourceKind::Jobs => vec![
+            format!(
+                "{}/{}",
+                i("/status/succeeded").unwrap_or(0),
+                i("/spec/completions")
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "1".to_string())
+            ),
+            job_duration(raw),
+        ],
+        ResourceKind::CronJobs => vec![
+            s("/spec/schedule").unwrap_or_else(dash),
+            raw.pointer("/spec/suspend")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                .to_string(),
+            count("/status/active"),
+        ],
+        ResourceKind::ConfigMaps => vec![count("/data")],
+        ResourceKind::Secrets => vec![
+            s("/type").unwrap_or_else(|| "Opaque".to_string()),
+            count("/data"),
+        ],
+        ResourceKind::Nodes => vec![
+            node_roles(raw),
+            s("/status/nodeInfo/kubeletVersion").unwrap_or_else(dash),
+        ],
+        ResourceKind::PersistentVolumeClaims => vec![
+            s("/spec/volumeName").unwrap_or_else(dash),
+            s("/status/capacity/storage").unwrap_or_else(dash),
+            access_modes(raw),
+            s("/spec/storageClassName").unwrap_or_else(dash),
+        ],
+        ResourceKind::PersistentVolumes => vec![
+            s("/spec/capacity/storage").unwrap_or_else(dash),
+            access_modes(raw),
+            s("/spec/persistentVolumeReclaimPolicy").unwrap_or_else(dash),
+            pv_claim(raw),
+            s("/spec/storageClassName").unwrap_or_else(dash),
+        ],
+        ResourceKind::HorizontalPodAutoscalers => vec![
+            format!(
+                "{}/{}",
+                s("/spec/scaleTargetRef/kind").unwrap_or_else(dash),
+                s("/spec/scaleTargetRef/name").unwrap_or_else(dash)
+            ),
+            int_cell("/spec/minReplicas"),
+            int_cell("/spec/maxReplicas"),
+            int_cell("/status/currentReplicas"),
+        ],
+        ResourceKind::ServiceAccounts => vec![count("/secrets"), count("/imagePullSecrets")],
+        ResourceKind::RoleBindings | ResourceKind::ClusterRoleBindings => {
+            vec![role_ref(raw), subjects_summary(raw)]
+        }
+        ResourceKind::PodDisruptionBudgets => vec![
+            int_or_str("/spec/minAvailable", raw),
+            int_or_str("/spec/maxUnavailable", raw),
+            int_cell("/status/disruptionsAllowed"),
+        ],
+        _ => vec![],
+    }
+}
+
+/// `spec.ports[]` rendered as `port/proto` joined by commas (e.g. `80/TCP,443/TCP`).
+fn service_ports(raw: &serde_json::Value) -> String {
+    let Some(ports) = raw.pointer("/spec/ports").and_then(|v| v.as_array()) else {
+        return "-".to_string();
+    };
+    let rendered: Vec<String> = ports
+        .iter()
+        .map(|p| {
+            let port = p.pointer("/port").and_then(serde_json::Value::as_i64);
+            let proto = p
+                .pointer("/protocol")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("TCP");
+            match port {
+                Some(port) => format!("{port}/{proto}"),
+                None => proto.to_string(),
+            }
+        })
+        .collect();
+    if rendered.is_empty() {
+        "-".to_string()
+    } else {
+        rendered.join(",")
+    }
+}
+
+/// Distinct `spec.rules[].host` values joined by commas.
+fn ingress_hosts(raw: &serde_json::Value) -> String {
+    let Some(rules) = raw.pointer("/spec/rules").and_then(|v| v.as_array()) else {
+        return "-".to_string();
+    };
+    let hosts: Vec<&str> = rules
+        .iter()
+        .filter_map(|r| r.pointer("/host").and_then(serde_json::Value::as_str))
+        .collect();
+    if hosts.is_empty() {
+        "*".to_string()
+    } else {
+        hosts.join(",")
+    }
+}
+
+/// First `status.loadBalancer.ingress[]` ip or hostname.
+fn ingress_address(raw: &serde_json::Value) -> String {
+    raw.pointer("/status/loadBalancer/ingress")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|e| {
+            e.pointer("/ip")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| e.pointer("/hostname").and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_string)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Job wall-clock duration from `status.startTime` to `status.completionTime` (or now).
+fn job_duration(raw: &serde_json::Value) -> String {
+    let parse = |p: &str| {
+        raw.pointer(p)
             .and_then(serde_json::Value::as_str)
-            .map(|node| format!("node={node}"))
-            .unwrap_or_else(|| "-".to_string()),
-        ResourceKind::Services => raw
-            .pointer("/spec/type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("ClusterIP")
-            .to_string(),
-        ResourceKind::Events => raw
-            .pointer("/reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("-")
-            .to_string(),
-        _ => raw
-            .pointer("/metadata/labels")
-            .and_then(serde_json::Value::as_object)
-            .map(|labels| format!("{} labels", labels.len()))
-            .unwrap_or_else(|| "-".to_string()),
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let Some(start) = parse("/status/startTime") else {
+        return "-".to_string();
+    };
+    let end = parse("/status/completionTime").unwrap_or_else(Utc::now);
+    let secs = end.signed_duration_since(start).num_seconds().max(0);
+    if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Role names from `node-role.kubernetes.io/<role>` labels, joined by commas.
+fn node_roles(raw: &serde_json::Value) -> String {
+    let Some(labels) = raw.pointer("/metadata/labels").and_then(|v| v.as_object()) else {
+        return "<none>".to_string();
+    };
+    let roles: Vec<&str> = labels
+        .keys()
+        .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/"))
+        .filter(|r| !r.is_empty())
+        .collect();
+    if roles.is_empty() {
+        "<none>".to_string()
+    } else {
+        roles.join(",")
+    }
+}
+
+/// `spec.accessModes[]` abbreviated (RWO/ROX/RWX/RWOP) and joined.
+fn access_modes(raw: &serde_json::Value) -> String {
+    let Some(modes) = raw.pointer("/spec/accessModes").and_then(|v| v.as_array()) else {
+        return "-".to_string();
+    };
+    let abbr: Vec<&str> = modes
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(|m| match m {
+            "ReadWriteOnce" => "RWO",
+            "ReadOnlyMany" => "ROX",
+            "ReadWriteMany" => "RWX",
+            "ReadWriteOncePod" => "RWOP",
+            other => other,
+        })
+        .collect();
+    if abbr.is_empty() {
+        "-".to_string()
+    } else {
+        abbr.join(",")
+    }
+}
+
+/// PV bound claim as `namespace/name`.
+fn pv_claim(raw: &serde_json::Value) -> String {
+    let ns = raw
+        .pointer("/spec/claimRef/namespace")
+        .and_then(serde_json::Value::as_str);
+    let name = raw
+        .pointer("/spec/claimRef/name")
+        .and_then(serde_json::Value::as_str);
+    match (ns, name) {
+        (Some(ns), Some(name)) => format!("{ns}/{name}"),
+        (None, Some(name)) => name.to_string(),
+        _ => "-".to_string(),
+    }
+}
+
+/// Role/ClusterRole referenced by a (Cluster)RoleBinding, as `kind/name` (e.g. `ClusterRole/view`).
+fn role_ref(raw: &serde_json::Value) -> String {
+    let kind = raw
+        .pointer("/roleRef/kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let name = raw
+        .pointer("/roleRef/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    format!("{kind}/{name}")
+}
+
+/// Binding subjects as `abbrev:name` joined by commas (sa/u/g for ServiceAccount/User/Group).
+fn subjects_summary(raw: &serde_json::Value) -> String {
+    let Some(subjects) = raw.pointer("/subjects").and_then(|v| v.as_array()) else {
+        return "-".to_string();
+    };
+    let parts: Vec<String> = subjects
+        .iter()
+        .map(|s| {
+            let kind = s.pointer("/kind").and_then(serde_json::Value::as_str);
+            let name = s
+                .pointer("/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let abbr = match kind {
+                Some("ServiceAccount") => "sa",
+                Some("User") => "u",
+                Some("Group") => "g",
+                Some(other) => other,
+                None => "?",
+            };
+            format!("{abbr}:{name}")
+        })
+        .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(",")
+    }
+}
+
+/// A field that may be an integer or a percentage string (e.g. PDB `minAvailable`).
+fn int_or_str(pointer: &str, raw: &serde_json::Value) -> String {
+    match raw.pointer(pointer) {
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        Some(serde_json::Value::String(s)) => s.clone(),
+        _ => "-".to_string(),
     }
 }
 
@@ -1234,8 +1506,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ActionError, KubeResourceProvider, api_resource_spec_for_kind, extract_status,
-        is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts,
+        ActionError, KubeResourceProvider, api_resource_spec_for_kind, extract_columns,
+        extract_status, is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts,
     };
     use crate::{
         cluster::ActionExecutor,
@@ -1519,6 +1791,92 @@ mod tests {
 
         let status = extract_status(ResourceKind::Pods, &raw);
         assert_eq!(status, "ImagePullBackOff");
+    }
+
+    #[test]
+    fn extract_columns_matches_declared_header_count_for_every_kind() {
+        // The header (ResourceKind::extra_columns) and the per-row values (extract_columns) must
+        // stay in lockstep; an empty object exercises every default branch.
+        for kind in ResourceKind::ORDERED {
+            let values = extract_columns(kind, &json!({}));
+            assert_eq!(
+                values.len(),
+                kind.extra_columns().len(),
+                "{kind} column count mismatch: {values:?} vs headers {:?}",
+                kind.extra_columns()
+            );
+        }
+    }
+
+    #[test]
+    fn extract_columns_renders_deployment_and_service_fields() {
+        let deploy = json!({
+            "spec": { "replicas": 3 },
+            "status": { "readyReplicas": 2, "updatedReplicas": 3, "availableReplicas": 2 }
+        });
+        // headers: UP-TO-DATE, AVAILABLE
+        assert_eq!(
+            extract_columns(ResourceKind::Deployments, &deploy),
+            vec!["3".to_string(), "2".to_string()]
+        );
+
+        let svc = json!({
+            "spec": {
+                "type": "LoadBalancer",
+                "clusterIP": "10.0.0.5",
+                "ports": [ { "port": 80, "protocol": "TCP" }, { "port": 443, "protocol": "TCP" } ]
+            }
+        });
+        // headers: TYPE, CLUSTER-IP, PORTS
+        assert_eq!(
+            extract_columns(ResourceKind::Services, &svc),
+            vec![
+                "LoadBalancer".to_string(),
+                "10.0.0.5".to_string(),
+                "80/TCP,443/TCP".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_columns_abbreviates_pvc_access_modes() {
+        let pvc = json!({
+            "spec": {
+                "volumeName": "pv-001",
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": "gp3"
+            },
+            "status": { "capacity": { "storage": "10Gi" } }
+        });
+        // headers: VOLUME, CAPACITY, ACCESS, STORAGECLASS
+        assert_eq!(
+            extract_columns(ResourceKind::PersistentVolumeClaims, &pvc),
+            vec![
+                "pv-001".to_string(),
+                "10Gi".to_string(),
+                "RWO".to_string(),
+                "gp3".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_columns_summarizes_rolebinding_role_and_subjects() {
+        let rb = json!({
+            "roleRef": { "kind": "ClusterRole", "name": "view" },
+            "subjects": [
+                { "kind": "ServiceAccount", "name": "build", "namespace": "ci" },
+                { "kind": "User", "name": "alice" }
+            ]
+        });
+        // headers: ROLE, SUBJECTS
+        assert_eq!(
+            extract_columns(ResourceKind::RoleBindings, &rb),
+            vec![
+                "ClusterRole/view".to_string(),
+                "sa:build,u:alice".to_string()
+            ]
+        );
     }
 
     fn readonly_provider() -> KubeResourceProvider {

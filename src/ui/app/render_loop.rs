@@ -694,13 +694,14 @@ impl App {
                                     num(mem.lim_pct, mem.lim_sev),
                                 ]
                             } else {
-                                vec![
+                                let mut cells = vec![
                                     Cell::from(row.namespace),
                                     Cell::from(row.name),
                                     Cell::from(status),
                                     Cell::from(row.age),
-                                    Cell::from(row.summary),
-                                ]
+                                ];
+                                cells.extend(row.columns.into_iter().map(Cell::from));
+                                cells
                             };
                             Some(Row::new(cells).style(severity_style(&theme, sev)))
                         })
@@ -749,22 +750,23 @@ impl App {
                             ],
                         )
                     } else {
-                        (
-                            vec![
-                                mark("Namespace", SortColumn::Namespace),
-                                mark("Name", SortColumn::Name),
-                                mark("Status", SortColumn::Status),
-                                mark("Age", SortColumn::Age),
-                                Cell::from("Summary"),
-                            ],
-                            vec![
-                                Constraint::Length(20),
-                                Constraint::Min(24),
-                                Constraint::Length(18),
-                                Constraint::Length(8),
-                                Constraint::Min(10),
-                            ],
-                        )
+                        let mut header = vec![
+                            mark("Namespace", SortColumn::Namespace),
+                            mark("Name", SortColumn::Name),
+                            mark("Status", SortColumn::Status),
+                            mark("Age", SortColumn::Age),
+                        ];
+                        let mut widths = vec![
+                            Constraint::Length(20),
+                            Constraint::Min(24),
+                            Constraint::Length(18),
+                            Constraint::Length(8),
+                        ];
+                        for col in active.kind().extra_columns() {
+                            header.push(Cell::from(col.header));
+                            widths.push(Constraint::Length(col.width));
+                        }
+                        (header, widths)
                     };
                     let title = if pods_view {
                         let legend = if self.pod_metrics.is_empty() {

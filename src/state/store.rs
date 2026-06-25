@@ -224,7 +224,7 @@ mod tests {
             status: "Running".to_string(),
             age: Some(Utc::now()),
             labels: vec![("app".to_string(), "demo".to_string())],
-            summary: "test".to_string(),
+            columns: vec![],
             extracted: Default::default(),
         }
     }
