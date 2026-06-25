@@ -111,9 +111,10 @@ The **Pods table** splits this into six right-aligned columns — `CPU %CPU/R %C
 `MEM %MEM/R %MEM/L`:
 - **CPU** / **MEM** — actual usage (e.g. `1.50c`, `256Mi`).
 - **%CPU/R** / **%MEM/R** — usage as a percentage of the CPU/memory **request** (the right-sizing
-  signal: low = over-provisioned, ≥100 = under-requested). Turns yellow at ≥100%.
+  signal: low = over-provisioned). Graduated: yellow ≥100% (under-requested), red ≥200% (severely
+  under-requested — QoS/scheduling risk).
 - **%CPU/L** / **%MEM/L** — usage as a percentage of the CPU/memory **limit** (the risk signal).
-  Turns red at ≥90% (throttle/OOM risk).
+  Graduated: yellow ≥75% (approaching), red ≥90% (throttle/OOM risk).
 
 So a pod showing CPU `1.50c`, %CPU/R `150%`, %CPU/L `75%` is using 1.5 cores, 150% of its CPU
 request, and 75% of its CPU limit. Missing pieces (no request/limit, or no metrics) render as `-`.

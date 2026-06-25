@@ -2389,15 +2389,17 @@ fn pod_usage_cells(
         used: render(used),
         req_pct: req_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
         lim_pct: lim_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
-        req_sev: if req_pct.is_some_and(|v| v >= 100) {
-            Severity::Warn
-        } else {
-            Severity::Ok
+        // Graduated green→yellow→red. Request (right-sizing): warn when over-requested, red when
+        // severely so. Limit (risk): warn when approaching, red at throttle/OOM range.
+        req_sev: match req_pct {
+            Some(v) if v >= 200 => Severity::Err,
+            Some(v) if v >= 100 => Severity::Warn,
+            _ => Severity::Ok,
         },
-        lim_sev: if lim_pct.is_some_and(|v| v >= 90) {
-            Severity::Err
-        } else {
-            Severity::Ok
+        lim_sev: match lim_pct {
+            Some(v) if v >= 90 => Severity::Err,
+            Some(v) if v >= 75 => Severity::Warn,
+            _ => Severity::Ok,
         },
     }
 }
@@ -3259,6 +3261,20 @@ mod tests {
         assert!(snap.contains('7'), "restart count: {snap}");
         assert!(snap.contains("10.0.1.23"), "pod ip: {snap}");
         assert!(snap.contains("ip-10-0-1-9.ec2.internal"), "node: {snap}");
+    }
+
+    #[test]
+    fn pod_usage_cell_severity_is_graduated() {
+        let cell =
+            |used, req, lim| super::pod_usage_cells(Some(used), req, lim, super::format_millicpu);
+        // %R (vs request): <100 ok · ≥100 warn · ≥200 err
+        assert_eq!(cell(50, 100, 100_000).req_sev, Severity::Ok);
+        assert_eq!(cell(150, 100, 100_000).req_sev, Severity::Warn);
+        assert_eq!(cell(250, 100, 100_000).req_sev, Severity::Err);
+        // %L (vs limit): <75 ok · ≥75 warn · ≥90 err
+        assert_eq!(cell(50, 100_000, 100).lim_sev, Severity::Ok);
+        assert_eq!(cell(80, 100_000, 100).lim_sev, Severity::Warn);
+        assert_eq!(cell(95, 100_000, 100).lim_sev, Severity::Err);
     }
 
     #[test]
