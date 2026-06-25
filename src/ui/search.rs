@@ -121,9 +121,9 @@ pub(crate) fn detail_viewer_title(
     active_line: Option<usize>,
 ) -> String {
     let search = if search_query.trim().is_empty() {
-        "search:-".to_string()
+        "search: -".to_string()
     } else if match_lines.is_empty() {
-        format!("search:/{} 0/0", search_query.trim())
+        format!("search: /{} 0/0", search_query.trim())
     } else {
         let current_idx = active_line
             .and_then(|line| match_lines.iter().position(|candidate| *candidate == line))
@@ -137,7 +137,7 @@ pub(crate) fn detail_viewer_title(
             })
             .unwrap_or(match_lines.len());
         format!(
-            "search:/{} {}/{}",
+            "search: /{} {}/{}",
             search_query.trim(),
             current_idx,
             match_lines.len()
@@ -146,7 +146,7 @@ pub(crate) fn detail_viewer_title(
     let total = total_lines.max(1);
     let line_pos = ((scroll as usize) + 1).min(total);
     format!(
-        "{} | NORMAL | {} | ln:{}/{} | wrap:{}",
+        "{} · {} · ln: {}/{} · wrap: {}",
         pane_title,
         search,
         line_pos,

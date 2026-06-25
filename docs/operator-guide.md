@@ -80,28 +80,29 @@ like the Events section of `kubectl describe`. Selecting an Event resource itsel
 Every table starts with the universal columns **Namespace · Name · Status · Age**. Beyond those,
 each kind shows columns tailored to it (like `kubectl get`), e.g.:
 
-- **Deployments** — `UP-TO-DATE`, `AVAILABLE`
-- **ReplicaSets** — `DESIRED`, `CURRENT`, `READY`
-- **StatefulSets** — `READY`
-- **DaemonSets** — `DESIRED`, `READY`, `AVAIL`
-- **Services** — `TYPE`, `CLUSTER-IP`, `PORTS`
-- **Ingresses** — `CLASS`, `HOSTS`, `ADDRESS`
-- **Jobs** — `COMPLETIONS`, `DURATION`
-- **CronJobs** — `SCHEDULE`, `SUSPEND`, `ACTIVE`
-- **ConfigMaps** — `DATA`; **Secrets** — `TYPE`, `DATA`
-- **ServiceAccounts** — `SECRETS`, `PULL-SECRETS`
-- **RoleBindings / ClusterRoleBindings** — `ROLE` (e.g. `ClusterRole/view`), `SUBJECTS` (e.g. `sa:build,u:alice`)
-- **Nodes** — `ROLES`, `VERSION`
-- **PVCs** — `VOLUME`, `CAPACITY`, `ACCESS`, `STORAGECLASS`; **PVs** add `RECLAIM`, `CLAIM`
-- **HPAs** — `REFERENCE`, `MINPODS`, `MAXPODS`, `REPLICAS`
-- **PodDisruptionBudgets** — `MIN-AVAIL`, `MAX-UNAVAIL`, `ALLOWED`
+- **Deployments** — `Up-to-date`, `Available`
+- **ReplicaSets** — `Desired`, `Current`, `Ready`
+- **StatefulSets** — `Ready`
+- **DaemonSets** — `Desired`, `Ready`, `Avail`
+- **Services** — `Type`, `Cluster-IP`, `Ports`
+- **Ingresses** — `Class`, `Hosts`, `Address`
+- **Jobs** — `Completions`, `Duration`
+- **CronJobs** — `Schedule`, `Suspend`, `Active`
+- **ConfigMaps** — `Data`; **Secrets** — `Type`, `Data`
+- **ServiceAccounts** — `Secrets`, `Pull-secrets`
+- **RoleBindings / ClusterRoleBindings** — `Role` (e.g. `ClusterRole/view`), `Subjects` (e.g. `sa:build,u:alice`)
+- **Nodes** — `Roles`, `Version`
+- **PVCs** — `Volume`, `Capacity`, `Access`, `StorageClass`; **PVs** add `Reclaim`, `Claim`
+- **HPAs** — `Reference`, `Min Pods`, `Max Pods`, `Replicas`
+- **PodDisruptionBudgets** — `Min-avail`, `Max-unavail`, `Allowed`
 
 Kinds without distinctive columns show just the four universal ones. Pods are special — see Metrics.
-Filtering and `:dump`/copy operate over all visible columns.
+Filtering and `:dump`/copy operate over all visible columns. Header style: plain words use Title
+case (`Namespace`, `Node`, `Ready`); acronyms stay uppercase (`CPU`, `MEM`, `IP`).
 
 The **Pods table** adds, beyond the universal four:
-`RST` (container restarts) · `CPU %CPU/R %CPU/L` · `MEM %MEM/R %MEM/L` · `IP` · `NODE`. `RST` turns
-yellow at ≥3 restarts, red at ≥10 (crashloop signal); the metric columns are described below.
+`Restarts` · `CPU %CPU/R %CPU/L` · `MEM %MEM/R %MEM/L` · `IP` · `Node`. `Restarts` turns
+yellow at ≥3, red at ≥10 (crashloop signal); the metric columns are described below.
 
 ## Metrics
 

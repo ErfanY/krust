@@ -110,58 +110,58 @@ impl ResourceKind {
     /// universal columns.
     pub fn extra_columns(self) -> &'static [ExtraColumn] {
         use ExtraColumn as C;
-        const DEPLOY: &[ExtraColumn] = &[C::new("UP-TO-DATE", 11), C::new("AVAILABLE", 10)];
+        const DEPLOY: &[ExtraColumn] = &[C::new("Up-to-date", 11), C::new("Available", 10)];
         const RS: &[ExtraColumn] = &[
-            C::new("DESIRED", 8),
-            C::new("CURRENT", 8),
-            C::new("READY", 7),
+            C::new("Desired", 8),
+            C::new("Current", 8),
+            C::new("Ready", 7),
         ];
-        const STS: &[ExtraColumn] = &[C::new("READY", 8)];
-        const DS: &[ExtraColumn] = &[C::new("DESIRED", 8), C::new("READY", 7), C::new("AVAIL", 7)];
+        const STS: &[ExtraColumn] = &[C::new("Ready", 8)];
+        const DS: &[ExtraColumn] = &[C::new("Desired", 8), C::new("Ready", 7), C::new("Avail", 7)];
         const SVC: &[ExtraColumn] = &[
-            C::new("TYPE", 13),
-            C::new("CLUSTER-IP", 16),
-            C::new("PORTS", 22),
+            C::new("Type", 13),
+            C::new("Cluster-IP", 16),
+            C::new("Ports", 22),
         ];
         const ING: &[ExtraColumn] = &[
-            C::new("CLASS", 12),
-            C::new("HOSTS", 30),
-            C::new("ADDRESS", 20),
+            C::new("Class", 12),
+            C::new("Hosts", 30),
+            C::new("Address", 20),
         ];
-        const JOB: &[ExtraColumn] = &[C::new("COMPLETIONS", 12), C::new("DURATION", 10)];
+        const JOB: &[ExtraColumn] = &[C::new("Completions", 12), C::new("Duration", 10)];
         const CJ: &[ExtraColumn] = &[
-            C::new("SCHEDULE", 14),
-            C::new("SUSPEND", 8),
-            C::new("ACTIVE", 7),
+            C::new("Schedule", 14),
+            C::new("Suspend", 8),
+            C::new("Active", 7),
         ];
-        const CM: &[ExtraColumn] = &[C::new("DATA", 6)];
-        const SECRET: &[ExtraColumn] = &[C::new("TYPE", 30), C::new("DATA", 6)];
-        const NODE: &[ExtraColumn] = &[C::new("ROLES", 20), C::new("VERSION", 16)];
+        const CM: &[ExtraColumn] = &[C::new("Data", 6)];
+        const SECRET: &[ExtraColumn] = &[C::new("Type", 30), C::new("Data", 6)];
+        const NODE: &[ExtraColumn] = &[C::new("Roles", 20), C::new("Version", 16)];
         const PVC: &[ExtraColumn] = &[
-            C::new("VOLUME", 22),
-            C::new("CAPACITY", 10),
-            C::new("ACCESS", 10),
-            C::new("STORAGECLASS", 16),
+            C::new("Volume", 22),
+            C::new("Capacity", 10),
+            C::new("Access", 10),
+            C::new("StorageClass", 16),
         ];
         const PV: &[ExtraColumn] = &[
-            C::new("CAPACITY", 10),
-            C::new("ACCESS", 10),
-            C::new("RECLAIM", 10),
-            C::new("CLAIM", 26),
-            C::new("STORAGECLASS", 16),
+            C::new("Capacity", 10),
+            C::new("Access", 10),
+            C::new("Reclaim", 10),
+            C::new("Claim", 26),
+            C::new("StorageClass", 16),
         ];
         const HPA: &[ExtraColumn] = &[
-            C::new("REFERENCE", 26),
-            C::new("MINPODS", 8),
-            C::new("MAXPODS", 8),
-            C::new("REPLICAS", 9),
+            C::new("Reference", 26),
+            C::new("Min Pods", 8),
+            C::new("Max Pods", 8),
+            C::new("Replicas", 9),
         ];
-        const SA: &[ExtraColumn] = &[C::new("SECRETS", 8), C::new("PULL-SECRETS", 13)];
-        const BINDING: &[ExtraColumn] = &[C::new("ROLE", 26), C::new("SUBJECTS", 34)];
+        const SA: &[ExtraColumn] = &[C::new("Secrets", 8), C::new("Pull-secrets", 13)];
+        const BINDING: &[ExtraColumn] = &[C::new("Role", 26), C::new("Subjects", 34)];
         const PDB: &[ExtraColumn] = &[
-            C::new("MIN-AVAIL", 10),
-            C::new("MAX-UNAVAIL", 12),
-            C::new("ALLOWED", 8),
+            C::new("Min-avail", 10),
+            C::new("Max-unavail", 12),
+            C::new("Allowed", 8),
         ];
         match self {
             ResourceKind::Deployments => DEPLOY,

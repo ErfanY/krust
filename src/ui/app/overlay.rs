@@ -4,7 +4,6 @@ impl App {
     pub(super) fn show_contexts_overlay(&mut self) {
         let contexts = self.tabs.iter().map(|tab| tab.context.clone()).collect();
         self.overlay = Some(Overlay::Contexts {
-            title: "Contexts".to_string(),
             contexts,
             selected: self.active_tab,
             filter: String::new(),
@@ -15,7 +14,6 @@ impl App {
     pub(super) fn show_log_sources_overlay(&mut self) {
         let sources = self.available_log_sources();
         self.overlay = Some(Overlay::LogSources {
-            title: "Log Sources".to_string(),
             sources,
             selected: 0,
             filter: String::new(),
@@ -42,7 +40,7 @@ impl App {
         containers.insert(0, "* all containers".to_string());
         self.overlay = Some(Overlay::Containers {
             title: format!(
-                "Containers {}/{}",
+                "{}/{}",
                 row.key
                     .namespace
                     .clone()
