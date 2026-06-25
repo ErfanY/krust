@@ -36,12 +36,7 @@ impl App {
         let selected_human = if visible_rows == 0 { 0 } else { selected + 1 };
         let hb = activity_icon(revision);
         let ctx_short = compact_context_name(&active.context);
-        let sort_col = match active.sort {
-            SortColumn::Name => "name",
-            SortColumn::Namespace => "ns",
-            SortColumn::Status => "status",
-            SortColumn::Age => "age",
-        };
+        let sort_col = active.sort.label();
         let sort_arrow = if active.descending { "↓" } else { "↑" };
         let mut top_line = format!(
             "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [SORT] {sort_col}{sort_arrow}  [CLR] {}  [REV] +{}  [STALE] {}s  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
@@ -878,18 +873,18 @@ impl App {
 
                     // Mark the active sort column in the header with a direction arrow.
                     let arrow = if active.descending { " ↓" } else { " ↑" };
-                    // Left-aligned, sortable text header.
-                    let mark = |label: &str, col: SortColumn| {
-                        let text = if active.sort == col {
+                    let marked = |label: &str, col: SortColumn| {
+                        if active.sort == col {
                             format!("{label}{arrow}")
                         } else {
                             label.to_string()
-                        };
-                        Cell::from(text)
+                        }
                     };
-                    // Right-aligned numeric header (matches the right-aligned numeric cells).
-                    let num_head = |label: &str| {
-                        Cell::from(Line::from(label.to_string()).alignment(Alignment::Right))
+                    // Left-aligned sortable text header.
+                    let mark = |label: &str, col: SortColumn| Cell::from(marked(label, col));
+                    // Right-aligned sortable numeric header (matches the numeric cells).
+                    let num_mark = |label: &str, col: SortColumn| {
+                        Cell::from(Line::from(marked(label, col)).alignment(Alignment::Right))
                     };
                     let (header, widths): (Vec<Cell>, Vec<Constraint>) = if pods_view {
                         (
@@ -898,15 +893,15 @@ impl App {
                                 mark("Name", SortColumn::Name),
                                 mark("Status", SortColumn::Status),
                                 mark("Age", SortColumn::Age),
-                                num_head("Restarts"),
-                                num_head("CPU"),
-                                num_head("%CPU/R"),
-                                num_head("%CPU/L"),
-                                num_head("MEM"),
-                                num_head("%MEM/R"),
-                                num_head("%MEM/L"),
-                                Cell::from("IP"),
-                                Cell::from("Node"),
+                                num_mark("Restarts", SortColumn::Restarts),
+                                num_mark("CPU", SortColumn::Cpu),
+                                num_mark("%CPU/R", SortColumn::CpuReqPct),
+                                num_mark("%CPU/L", SortColumn::CpuLimPct),
+                                num_mark("MEM", SortColumn::Mem),
+                                num_mark("%MEM/R", SortColumn::MemReqPct),
+                                num_mark("%MEM/L", SortColumn::MemLimPct),
+                                mark("IP", SortColumn::Ip),
+                                mark("Node", SortColumn::Node),
                             ],
                             vec![
                                 Constraint::Length(16),
