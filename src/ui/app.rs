@@ -82,6 +82,7 @@ mod detail_pane;
 mod logs;
 mod overlay;
 mod render_loop;
+mod triage;
 mod xray;
 
 #[derive(Debug, Clone)]
@@ -187,6 +188,13 @@ enum Overlay {
         namespace: Option<String>,
         selected: usize,
         collapsed: HashSet<String>,
+    },
+    /// Live triage board (`:triage`): pods needing attention (crashloop/OOM/pending/not-ready/
+    /// restart-hot), worst first. Rows rebuilt from the store each frame. `namespace` None =
+    /// whole cluster.
+    Triage {
+        namespace: Option<String>,
+        selected: usize,
     },
     Contexts {
         title: String,
@@ -817,7 +825,7 @@ impl App {
                 | Overlay::LogSources { filter, .. } => {
                     return filter.clone();
                 }
-                Overlay::Text { .. } | Overlay::Xray { .. } => {}
+                Overlay::Text { .. } | Overlay::Xray { .. } | Overlay::Triage { .. } => {}
             }
         }
         let tab = self.current_tab();
@@ -845,7 +853,7 @@ impl App {
                 } => {
                     *overlay_filter = filter;
                 }
-                Overlay::Text { .. } | Overlay::Xray { .. } => {}
+                Overlay::Text { .. } | Overlay::Xray { .. } | Overlay::Triage { .. } => {}
             }
             return;
         }
@@ -875,7 +883,7 @@ impl App {
                 Overlay::Contexts { .. }
                 | Overlay::Containers { .. }
                 | Overlay::LogSources { .. } => "Filter",
-                Overlay::Text { .. } | Overlay::Xray { .. } => "Search",
+                Overlay::Text { .. } | Overlay::Xray { .. } | Overlay::Triage { .. } => "Search",
             };
         }
         if self.current_tab().pane == Pane::Table {
@@ -1378,6 +1386,27 @@ impl App {
                             .join("\n"),
                     )
                 }
+                Overlay::Triage { namespace, .. } => {
+                    let (items, _) = self.triage_items(namespace.as_deref());
+                    Some(
+                        items
+                            .iter()
+                            .map(|i| {
+                                format!(
+                                    "{} {}/{}  {}  restarts:{}  ready:{}  {}",
+                                    severity_tag(i.severity),
+                                    i.namespace,
+                                    i.name,
+                                    i.reason,
+                                    i.restarts,
+                                    if i.ready { "yes" } else { "no" },
+                                    i.age
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                }
                 Overlay::Contexts {
                     contexts,
                     selected,
@@ -1827,6 +1856,16 @@ impl App {
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
+            }
+        }
+        // The triage board scans pods for problems, so it needs pods watched in its scope.
+        if let Some(Overlay::Triage { namespace, .. }) = &self.overlay {
+            let target = WatchTarget {
+                kind: ResourceKind::Pods,
+                namespace: namespace.clone(),
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
             }
         }
         if let Err(err) = self
@@ -2560,14 +2599,15 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        App, ColorSupport, ResourceAlias, base64_decode, base64_encode, classify_status_severity,
-        color_support_label, command_names, decoded_secret_text, detect_color_support_from_env,
-        highlighted_json_text, highlighted_text, highlighted_yaml_text, is_auth_refresh_log_error,
-        is_retryable_log_error, is_visible_log_line, json_spans_for_line,
-        next_log_reconnect_backoff_ms, parse_log_source, parse_resource_alias,
-        resolved_active_match_line, resource_alias_names, search_match_lines_in_logs, severity_tag,
-        slice_chars, step_match_line, sync_table_viewport, table_viewport_rows,
-        truncate_for_clipboard, ui_theme_for, yaml_spans_for_line,
+        App, ColorSupport, ResourceAlias, Severity, base64_decode, base64_encode,
+        classify_status_severity, color_support_label, command_names, decoded_secret_text,
+        detect_color_support_from_env, highlighted_json_text, highlighted_text,
+        highlighted_yaml_text, is_auth_refresh_log_error, is_retryable_log_error,
+        is_visible_log_line, json_spans_for_line, next_log_reconnect_backoff_ms, parse_log_source,
+        parse_resource_alias, resolved_active_match_line, resource_alias_names,
+        search_match_lines_in_logs, severity_tag, slice_chars, step_match_line,
+        sync_table_viewport, table_viewport_rows, truncate_for_clipboard, ui_theme_for,
+        yaml_spans_for_line,
     };
     use crate::{
         cluster::{
@@ -3196,10 +3236,13 @@ mod tests {
             mem_request_b: 128 * 1024 * 1024,
             mem_limit_b: 512 * 1024 * 1024,
         });
+        entity.extracted.restarts = 7;
+        entity.extracted.pod_ip = Some("10.0.1.23".to_string());
+        entity.extracted.node_name = Some("ip-10-0-1-9.ec2.internal".to_string());
         app.store.apply(StateDelta::Upsert(entity));
         app.seed_pod_metrics_for_test("default", "pod-a", 1500, 256 * 1024 * 1024);
 
-        let snap = render_snapshot(&mut app, 160, 20);
+        let snap = render_snapshot(&mut app, 200, 20);
         // actual usage
         assert!(snap.contains("1.50c"), "cpu used: {snap}");
         assert!(snap.contains("256Mi"), "mem used: {snap}");
@@ -3212,6 +3255,11 @@ mod tests {
             snap.contains("200%") && snap.contains("50%"),
             "mem %R/%L: {snap}"
         ); // 256/128, 256/512
+        // restarts, IP, and node columns
+        assert!(snap.contains("RST"), "restarts header: {snap}");
+        assert!(snap.contains('7'), "restart count: {snap}");
+        assert!(snap.contains("10.0.1.23"), "pod ip: {snap}");
+        assert!(snap.contains("ip-10-0-1-9.ec2.internal"), "node: {snap}");
     }
 
     #[test]
@@ -3381,6 +3429,63 @@ mod tests {
         let rows = app.xray_rows(Some("default"), &collapsed);
         assert_eq!(rows.len(), 1, "only the collapsed namespace remains");
         assert_eq!(rows[0].marker, '▸', "collapsed marker");
+    }
+
+    #[test]
+    fn triage_surfaces_unhealthy_pods_worst_first() {
+        let mut app = test_app();
+        let mut healthy = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "ok",
+            "Running",
+        );
+        healthy.extracted.ready = true;
+        app.store.apply(StateDelta::Upsert(healthy));
+
+        let mut crash = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "crash",
+            "CrashLoopBackOff",
+        );
+        crash.extracted.ready = false;
+        crash.extracted.restarts = 9;
+        app.store.apply(StateDelta::Upsert(crash));
+
+        let mut pending = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pending",
+            "Pending",
+        );
+        pending.extracted.ready = false;
+        app.store.apply(StateDelta::Upsert(pending));
+
+        let mut notready = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "slow",
+            "Running",
+        );
+        notready.extracted.ready = false; // Running but failing readiness
+        app.store.apply(StateDelta::Upsert(notready));
+
+        let (items, total) = app.triage_items(Some("default"));
+        let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(total, 3, "healthy pod excluded: {names:?}");
+        assert!(!names.contains(&"ok"), "healthy excluded: {names:?}");
+        // Worst-first: the crashloop (Err) ranks above the warnings.
+        assert_eq!(items[0].name, "crash");
+        assert_eq!(items[0].severity, Severity::Err);
+        let (errs, warns) = App::triage_counts(&items);
+        assert_eq!((errs, warns), (1, 2));
+        let slow = items.iter().find(|i| i.name == "slow").expect("slow");
+        assert_eq!(slow.reason, "NotReady");
     }
 
     #[test]
@@ -3561,7 +3666,7 @@ mod tests {
             "CrashLoopBackOff",
         )));
 
-        let snap = render_snapshot(&mut app, 120, 32);
+        let snap = render_snapshot(&mut app, 200, 32);
         assert!(snap.contains("[CTX]"));
         assert!(snap.contains("[PULSE] Cluster Pulse"));
         assert!(snap.contains("[LIVE]"));

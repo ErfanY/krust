@@ -477,6 +477,11 @@ impl App {
         } else {
             None
         };
+        let triage_data = if let Some(Overlay::Triage { namespace, .. }) = &self.overlay {
+            Some(self.triage_items(namespace.as_deref()))
+        } else {
+            None
+        };
 
         if let Some(overlay) = &mut self.overlay {
             match overlay {
@@ -557,6 +562,83 @@ impl App {
                             })
                             .collect();
                         let table = Table::new(table_rows, [Constraint::Percentage(100)])
+                            .block(block)
+                            .row_highlight_style(theme.row_highlight);
+                        let mut state =
+                            ratatui::widgets::TableState::default().with_selected(Some(*selected));
+                        frame.render_stateful_widget(table, chunks[2], &mut state);
+                    }
+                }
+                Overlay::Triage {
+                    namespace,
+                    selected,
+                } => {
+                    let scope = namespace.as_deref().unwrap_or("all namespaces");
+                    let (items, total) = triage_data.unwrap_or_default();
+                    let (errs, warns) = App::triage_counts(&items);
+                    let shown = items.len();
+                    let title = if total == 0 {
+                        format!("[TRIAGE] {scope} · ✓ nothing needs attention")
+                    } else {
+                        let capped = if total > shown {
+                            format!(" · showing {shown}/{total}")
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "[TRIAGE] {scope} · {errs} critical · {warns} warning{capped} | j/k move · esc close"
+                        )
+                    };
+                    let block = Block::default().borders(Borders::ALL).title(title);
+                    if items.is_empty() {
+                        frame.render_widget(
+                            Paragraph::new(
+                                "✓ no crashloops, OOMs, pending, not-ready, or restart-hot pods in scope",
+                            )
+                            .block(block)
+                            .style(theme.block),
+                            chunks[2],
+                        );
+                    } else {
+                        *selected = (*selected).min(items.len().saturating_sub(1));
+                        let header = Row::new(vec![
+                            Cell::from(""),
+                            Cell::from("NAMESPACE"),
+                            Cell::from("POD"),
+                            Cell::from("REASON"),
+                            Cell::from("RESTARTS"),
+                            Cell::from("READY"),
+                            Cell::from("AGE"),
+                        ])
+                        .style(theme.table_header);
+                        let rows: Vec<Row<'_>> = items
+                            .iter()
+                            .map(|item| {
+                                let style = severity_style(&theme, item.severity);
+                                Row::new(vec![
+                                    Cell::from(severity_tag(item.severity)),
+                                    Cell::from(item.namespace.clone()),
+                                    Cell::from(item.name.clone()),
+                                    Cell::from(item.reason.clone()),
+                                    Cell::from(item.restarts.to_string()),
+                                    Cell::from(if item.ready { "yes" } else { "no" }),
+                                    Cell::from(item.age.clone()),
+                                ])
+                                .style(style)
+                            })
+                            .collect();
+                        let widths = [
+                            Constraint::Length(4),
+                            Constraint::Length(20),
+                            Constraint::Min(24),
+                            Constraint::Length(20),
+                            Constraint::Length(8),
+                            Constraint::Length(5),
+                            Constraint::Length(6),
+                        ];
+                        let table = Table::new(rows, widths)
+                            .header(header)
+                            .column_spacing(2)
                             .block(block)
                             .row_highlight_style(theme.row_highlight);
                         let mut state =
@@ -730,8 +812,23 @@ impl App {
                             let status = format!("{} {}", severity_tag(sev), row.status);
                             let cells = if pods_view {
                                 let usage = self.pod_usage(key.namespace.as_deref(), &key.name);
-                                let res =
-                                    self.store.get(key).and_then(|e| e.extracted.pod_resources);
+                                let entity = self.store.get(key);
+                                let res = entity.and_then(|e| e.extracted.pod_resources);
+                                let restarts = entity.map(|e| e.extracted.restarts).unwrap_or(0);
+                                let restart_sev = if restarts >= 10 {
+                                    Severity::Err
+                                } else if restarts >= 3 {
+                                    Severity::Warn
+                                } else {
+                                    Severity::Ok
+                                };
+                                let dash = || "-".to_string();
+                                let ip = entity
+                                    .and_then(|e| e.extracted.pod_ip.clone())
+                                    .unwrap_or_else(dash);
+                                let node = entity
+                                    .and_then(|e| e.extracted.node_name.clone())
+                                    .unwrap_or_else(dash);
                                 let cpu = pod_usage_cells(
                                     usage.map(|(c, _)| c),
                                     res.map(|r| r.cpu_request_m).unwrap_or(0),
@@ -754,12 +851,15 @@ impl App {
                                     Cell::from(row.name),
                                     Cell::from(status),
                                     Cell::from(row.age),
+                                    num(restarts.to_string(), restart_sev),
                                     num(cpu.used, Severity::Ok),
                                     num(cpu.req_pct, cpu.req_sev),
                                     num(cpu.lim_pct, cpu.lim_sev),
                                     num(mem.used, Severity::Ok),
                                     num(mem.req_pct, mem.req_sev),
                                     num(mem.lim_pct, mem.lim_sev),
+                                    Cell::from(ip),
+                                    Cell::from(node),
                                 ]
                             } else {
                                 let mut cells = vec![
@@ -797,24 +897,30 @@ impl App {
                                 mark("Name", SortColumn::Name),
                                 mark("Status", SortColumn::Status),
                                 mark("Age", SortColumn::Age),
+                                num_head("RST"),
                                 num_head("CPU"),
-                                num_head("CR"),
-                                num_head("CL"),
+                                num_head("%CPU/R"),
+                                num_head("%CPU/L"),
                                 num_head("MEM"),
-                                num_head("MR"),
-                                num_head("ML"),
+                                num_head("%MEM/R"),
+                                num_head("%MEM/L"),
+                                Cell::from("IP"),
+                                Cell::from("NODE"),
                             ],
                             vec![
                                 Constraint::Length(16),
-                                Constraint::Min(20),
+                                Constraint::Min(18),
                                 Constraint::Length(16),
                                 Constraint::Length(6),
+                                Constraint::Length(4),
                                 Constraint::Length(8),
-                                Constraint::Length(6),
-                                Constraint::Length(6),
+                                Constraint::Length(7),
+                                Constraint::Length(7),
                                 Constraint::Length(9),
-                                Constraint::Length(6),
-                                Constraint::Length(6),
+                                Constraint::Length(7),
+                                Constraint::Length(7),
+                                Constraint::Length(16),
+                                Constraint::Min(18),
                             ],
                         )
                     } else {
@@ -849,7 +955,7 @@ impl App {
                             let legend = if self.pod_metrics.is_empty() {
                                 "CPU/MEM: metrics-server n/a"
                             } else {
-                                "CPU/MEM used · CR/CL = cpu %req/%lim · MR/ML = mem %req/%lim"
+                                "CPU/MEM = live usage · %·/R vs request · %·/L vs limit"
                             };
                             format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
                         }
@@ -1204,6 +1310,13 @@ impl App {
                     "overlay:xray-graph",
                     "j/k move",
                     "←/→ or Enter collapse/expand",
+                    "g/G top/bottom",
+                    "Esc close",
+                ]
+                .join(" | "),
+                Overlay::Triage { .. } => [
+                    "overlay:triage",
+                    "j/k or up/down move",
                     "g/G top/bottom",
                     "Esc close",
                 ]

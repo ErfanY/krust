@@ -172,6 +172,8 @@ pub(crate) fn classify_status_severity(status: &str) -> Severity {
         || lower.contains("fail")
         || lower.contains("crash")
         || lower.contains("oom")
+        || lower.contains("backoff")
+        || lower.contains("imagepull")
         || lower.contains("forbidden")
         || lower.contains("denied")
         || lower.contains("blocked")

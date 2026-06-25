@@ -16,6 +16,13 @@ pub(crate) fn extracted_for(kind: ResourceKind, raw: &Value) -> Extracted {
                 .map(str::to_string),
             _ => None,
         },
+        pod_ip: match kind {
+            ResourceKind::Pods => raw
+                .pointer("/status/podIP")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        },
         containers: match kind {
             ResourceKind::Pods => container_names(raw),
             _ => Vec::new(),
@@ -29,7 +36,43 @@ pub(crate) fn extracted_for(kind: ResourceKind, raw: &Value) -> Extracted {
             ResourceKind::Nodes => Some(node_capacity(raw)),
             _ => None,
         },
+        restarts: match kind {
+            ResourceKind::Pods => pod_restarts(raw),
+            _ => 0,
+        },
+        // Non-pod kinds don't have pod readiness; treat them as ready so they're never flagged.
+        ready: match kind {
+            ResourceKind::Pods => pod_ready(raw),
+            _ => true,
+        },
     }
+}
+
+/// Sum of container restart counts across a pod's containers.
+fn pod_restarts(raw: &Value) -> u32 {
+    raw.pointer("/status/containerStatuses")
+        .and_then(Value::as_array)
+        .map(|statuses| {
+            statuses
+                .iter()
+                .filter_map(|s| s.get("restartCount").and_then(Value::as_u64))
+                .map(|c| c as u32)
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Whether the pod's `Ready` condition is True.
+fn pod_ready(raw: &Value) -> bool {
+    raw.pointer("/status/conditions")
+        .and_then(Value::as_array)
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.get("type").and_then(Value::as_str) == Some("Ready")
+                    && c.get("status").and_then(Value::as_str) == Some("True")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn container_names(raw: &Value) -> Vec<String> {
@@ -284,6 +327,26 @@ mod tests {
         let r = e.pod_resources.expect("pod resources");
         assert_eq!(r.cpu_request_m, 150);
         assert_eq!(r.mem_request_b, (64 + 32) * 1024 * 1024);
+    }
+
+    #[test]
+    fn extracts_pod_restarts_and_readiness() {
+        let raw = json!({
+            "status": {
+                "conditions": [ { "type": "Ready", "status": "False" } ],
+                "containerStatuses": [
+                    { "name": "app", "restartCount": 5 },
+                    { "name": "side", "restartCount": 2 }
+                ]
+            }
+        });
+        let e = extracted_for(ResourceKind::Pods, &raw);
+        assert_eq!(e.restarts, 7);
+        assert!(!e.ready);
+
+        // Non-pods are treated as ready with no restarts (never triaged on those signals).
+        let svc = extracted_for(ResourceKind::Services, &json!({}));
+        assert!(svc.ready && svc.restarts == 0);
     }
 
     #[test]

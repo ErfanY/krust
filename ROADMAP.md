@@ -249,6 +249,16 @@ Root problem: full object JSON kept for every entity.
   or `sh.helm.release.v1.*` name); filtered at the projection layer. Tests: model detection,
   projector hide/show, render+toggle integration.
   Remaining: revisit when new views/commands land (e.g. interactive dynamic-list overlay).
+- [x] **5.6 Triage board** — operator daily-driver "what needs attention" view (`:triage`/`:issues
+  [ns|all]`): a live, worst-first board of only the pods needing an eye — CrashLoopBackOff/OOMKilled/
+  ImagePullBackOff/Error (critical), Pending/NotReady/restart-hot ≥3 (warning). Reuses existing
+  severity + adds `restarts`/`ready` to `Extracted` (crashloop + readiness signals the status string
+  hides). Title summarizes `N critical · M warning`; healthy pods omitted; capped at 500 rows
+  worst-first. Also fixed `classify_status_severity` to flag `ImagePullBackOff`/`*BackOff` (was Ok)
+  — improves table coloring too. The pods table also gained `RST` (restarts, colored ≥3/≥10),
+  `IP`, and `NODE` columns (pod IP added to `Extracted`); metric headers are now the explicit
+  `%CPU/R`/`%CPU/L`/`%MEM/R`/`%MEM/L`. Next: per-tenant (namespace) health rollup; workload rollout
+  health (ready≠desired).
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.
 - [ ] **5.4 Docs refresh** — architecture/performance/operator guides updated to new model.

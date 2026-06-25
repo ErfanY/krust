@@ -99,20 +99,24 @@ each kind shows columns tailored to it (like `kubectl get`), e.g.:
 Kinds without distinctive columns show just the four universal ones. Pods are special — see Metrics.
 Filtering and `:dump`/copy operate over all visible columns.
 
+The **Pods table** adds, beyond the universal four:
+`RST` (container restarts) · `CPU %CPU/R %CPU/L` · `MEM %MEM/R %MEM/L` · `IP` · `NODE`. `RST` turns
+yellow at ≥3 restarts, red at ≥10 (crashloop signal); the metric columns are described below.
+
 ## Metrics
 
 If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage and right-sizing.
-The **Pods table** splits this into six right-aligned, fixed-width columns — `CPU CR CL` then
-`MEM MR ML`:
+The **Pods table** splits this into six right-aligned columns — `CPU %CPU/R %CPU/L` then
+`MEM %MEM/R %MEM/L`:
 - **CPU** / **MEM** — actual usage (e.g. `1.50c`, `256Mi`).
-- **CR** / **MR** — usage as a percentage of the CPU/memory **request** (the right-sizing signal:
-  low = over-provisioned, ≥100 = under-requested). Turns yellow at ≥100%.
-- **CL** / **ML** — usage as a percentage of the CPU/memory **limit** (the risk signal). Turns red
-  at ≥90% (throttle/OOM risk).
+- **%CPU/R** / **%MEM/R** — usage as a percentage of the CPU/memory **request** (the right-sizing
+  signal: low = over-provisioned, ≥100 = under-requested). Turns yellow at ≥100%.
+- **%CPU/L** / **%MEM/L** — usage as a percentage of the CPU/memory **limit** (the risk signal).
+  Turns red at ≥90% (throttle/OOM risk).
 
-So a pod showing CPU `1.50c`, CR `150%`, CL `75%` is using 1.5 cores, 150% of its CPU request, and
-75% of its CPU limit. Missing pieces (no request/limit, or no metrics) render as `-`. The **Cluster
-Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%.
+So a pod showing CPU `1.50c`, %CPU/R `150%`, %CPU/L `75%` is using 1.5 cores, 150% of its CPU
+request, and 75% of its CPU limit. Missing pieces (no request/limit, or no metrics) render as `-`.
+The **Cluster Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%.
 
 Without a metrics-server these degrade gracefully (columns show `-`, the table title notes
 `metrics-server n/a`, and the pulse falls back to request/limit-based numbers).
@@ -154,12 +158,28 @@ Common command mode entries:
 - `:ns` namespaces
 - `:po`, `:deploy`, `:svc`, `:ing`, `:cm`, `:sec`, etc.
 - `:api [filter]` list all API resources/CRDs discovered on the context
+- `:triage [namespace|all]` (alias `:issues`) board of pods needing attention, worst first
 - `:xray [namespace|all]` open the namespace ownership graph (workloads → pods → containers)
 - `:<resource>` browse any discovered resource/CRD (e.g. `:endpoints`, `:widgets`); `:<resource> <name>` describes one
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
 - `:sort <name|namespace|status|age> [asc|desc]` set the table sort column/direction
 - `:helm [show|hide]` toggle (or set) visibility of Helm release secrets in the Secrets list
+
+## Triage (what needs attention)
+
+`:triage [namespace|all]` (alias `:issues`; defaults to the current namespace, `all` = whole cluster)
+opens a live board of only the pods that need an operator's eye, worst severity first:
+
+- **Critical** (`[XX]`): CrashLoopBackOff, OOMKilled, ImagePullBackOff, Error, Evicted, Failed, …
+- **Warning** (`[!!]`): Pending/Unschedulable, NotReady (Running but failing its readiness probe —
+  e.g. a slow JVM start), and restart hotspots (≥3 container restarts)
+
+Columns: severity · namespace · pod · reason · restarts · ready · age. Healthy pods
+(Running + Ready + few restarts) are omitted entirely, so the board is empty when nothing is wrong.
+The title summarizes counts (`N critical · M warning`). It rebuilds from live cluster state each
+frame; navigate with `j`/`k` (+ `g`/`G`), `esc` closes. Large incidents are capped at 500 rows
+(worst-first) with the count shown.
 
 ## XRay (relationship graph)
 

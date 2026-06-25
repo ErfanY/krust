@@ -278,6 +278,8 @@ pub struct ResourceEntity {
 pub struct Extracted {
     /// Pod's scheduled node (pods only).
     pub node_name: Option<String>,
+    /// Pod IP (pods only) — shown in the pods table.
+    pub pod_ip: Option<String>,
     /// Pod container names (pods only) — used by the container picker and log fan-in.
     pub containers: Vec<String>,
     /// ownerReferences (kind,name) — used to map Deployment -> ReplicaSet -> Pod for logs.
@@ -286,6 +288,11 @@ pub struct Extracted {
     pub pod_resources: Option<PodResources>,
     /// Node capacity/condition summary (nodes only) — used by the cluster pulse.
     pub node_capacity: Option<NodeCapacity>,
+    /// Total container restarts (pods only) — crashloop signal for the triage board.
+    pub restarts: u32,
+    /// Whether the pod's Ready condition holds (pods only; true for kinds where it doesn't apply).
+    /// A Running-but-not-Ready pod (failing readiness probe / slow JVM start) is a triage signal.
+    pub ready: bool,
 }
 
 impl ResourceEntity {
