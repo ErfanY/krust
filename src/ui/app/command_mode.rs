@@ -181,6 +181,39 @@ impl App {
                 self.status_line = "Namespace: all".to_string();
                 false
             }
+            "sort" => {
+                if let Some(token) = args.first() {
+                    let column = match token.to_ascii_lowercase().as_str() {
+                        "name" => Some(SortColumn::Name),
+                        "namespace" | "ns" => Some(SortColumn::Namespace),
+                        "status" => Some(SortColumn::Status),
+                        "age" => Some(SortColumn::Age),
+                        _ => None,
+                    };
+                    let Some(column) = column else {
+                        self.status_line =
+                            "Usage: :sort name|namespace|status|age [asc|desc]".to_string();
+                        return false;
+                    };
+                    let tab = self.current_tab_mut();
+                    tab.sort = column;
+                    match args.get(1).map(|d| d.to_ascii_lowercase()) {
+                        Some(d) if d == "desc" => tab.descending = true,
+                        Some(d) if d == "asc" => tab.descending = false,
+                        _ => {}
+                    }
+                }
+                let tab = self.current_tab();
+                let col = match tab.sort {
+                    SortColumn::Name => "name",
+                    SortColumn::Namespace => "namespace",
+                    SortColumn::Status => "status",
+                    SortColumn::Age => "age",
+                };
+                let dir = if tab.descending { "desc" } else { "asc" };
+                self.status_line = format!("Sort: {col} {dir}");
+                false
+            }
             "kind" => {
                 let Some(token) = args.first() else {
                     self.status_line = "Usage: :kind <pods|deploy|svc|...>".to_string();

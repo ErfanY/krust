@@ -180,7 +180,9 @@ Root problem: full object JSON kept for every entity.
   on-demand + cached per selected key (`events_cache`), like detail. Event-kind selections still show
   the Event's own manifest. Hidden `--events <ns>/<name>` probe. **Verified against a real cluster
   (correlated a live Warning/PolicyViolation event); unit-tested render.**
-- [ ] **4.4 Rendered describe** — kubectl-style human `describe` output alongside YAML/JSON.
+- [-] **4.4 Rendered describe** — SKIPPED. Prototype (kubectl-style human `describe` alongside
+  YAML/JSON) was implemented and rejected by the user; reverted in full. Raw YAML/JSON describe on
+  `d`/`v` stays the canonical detail view. Do not reintroduce without a new explicit ask.
 - [~] **4.5 Filter parity** — table filter now parses k9s-style: `!term` inverse, and label
   selectors `key=value`/`key==value`/`key!=value` (comma-separated, all must hold) matched against
   entity labels — this also fixes `:<kind> -l app=foo`, which previously substring-matched the
@@ -209,6 +211,10 @@ Root problem: full object JSON kept for every entity.
   detail-only `ctrl+d/u` paging or `gg`; added namespace/sort/reverse/events/help/close hints);
   help is now **keymap-aware** (`Keymap::hint`, reflects remapped bindings); operator-guide +
   README reconciled (incl. `:api`/dynamic browse). Tests: keymap hint + per-pane help accuracy.
+  **Sort indicator**: the active sort column is now marked in the table header with a direction
+  arrow (`Name ↑` / `Status ↓`), the top bar carries a `[SORT] <col><arrow>` field, and `:sort
+  <name|namespace|status|age> [asc|desc]` sets it explicitly (added to command autocomplete). Tests:
+  header-arrow render snapshot + `:sort` column/direction parsing.
   Remaining: revisit when new views/commands land (e.g. interactive dynamic-list overlay).
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.
