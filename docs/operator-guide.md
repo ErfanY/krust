@@ -56,6 +56,7 @@ krust --all-contexts
 - `d`: describe selected resource (toggles back to table)
 - `v`: view YAML; `t`: back to table; `E`: events pane (this resource's events); `l`: logs
 - `n`: cycle namespace; `s`: cycle sort column; `r`: reverse sort order
+- `H`: show/hide Helm release secrets (Secrets view; hidden by default)
 
 The active sort column is marked in the table header with a direction arrow (`Name ↑` ascending,
 `Status ↓` descending), and the top status bar shows `[SORT] <col><arrow>`. You can also set sort
@@ -151,6 +152,7 @@ Common command mode entries:
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
 - `:sort <name|namespace|status|age> [asc|desc]` set the table sort column/direction
+- `:helm [show|hide]` toggle (or set) visibility of Helm release secrets in the Secrets list
 
 ## Detail Pane Behavior
 
@@ -171,6 +173,11 @@ Detail supports:
 - decoded view shows decoded values in YAML
 - edit from decoded view re-encodes values to base64 on apply
 - edit from raw describe expects base64 input
+
+Helm release secrets (`type: helm.sh/release.v1`, named `sh.helm.release.v1.<release>.v<n>`) are
+**hidden by default** to cut clutter. Press `H` (or run `:helm`) to toggle them; the Secrets table
+title shows whether they're currently hidden or shown. `:helm show` / `:helm hide` set the state
+explicitly. The toggle is per-context-tab.
 
 ## Configuration
 

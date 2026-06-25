@@ -181,6 +181,26 @@ impl App {
                 self.status_line = "Namespace: all".to_string();
                 false
             }
+            "helm" => {
+                match args.first().map(|a| a.to_ascii_lowercase()) {
+                    Some(a) if a == "show" || a == "on" => {
+                        let tab = self.current_tab_mut();
+                        tab.show_helm_secrets = true;
+                        tab.selected = 0;
+                        tab.table_offset = 0;
+                        self.status_line = "Helm release secrets: shown".to_string();
+                    }
+                    Some(a) if a == "hide" || a == "off" => {
+                        let tab = self.current_tab_mut();
+                        tab.show_helm_secrets = false;
+                        tab.selected = 0;
+                        tab.table_offset = 0;
+                        self.status_line = "Helm release secrets: hidden".to_string();
+                    }
+                    _ => self.toggle_helm_secrets(),
+                }
+                false
+            }
             "sort" => {
                 if let Some(token) = args.first() {
                     let column = match token.to_ascii_lowercase().as_str() {

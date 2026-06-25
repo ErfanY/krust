@@ -222,7 +222,13 @@ Root problem: full object JSON kept for every entity.
   both header and `extract_columns()` row values; a contract test asserts they stay in lockstep for
   all 24 kinds. Entity model: `summary: String` → `columns: Vec<String>` (pods now carry an empty
   vec — drops the unused per-pod `node=` string on the 10k-pod hot path). Filter + `:dump`/copy span
-  all columns.
+  all columns. ServiceAccounts (SECRETS/PULL-SECRETS) and (Cluster)RoleBindings (ROLE/SUBJECTS)
+  enriched beyond the initial pass.
+  **Hide Helm secrets**: Helm release secrets (`type: helm.sh/release.v1`) are hidden from the
+  Secrets list by default (clutter) — toggle with `H` or `:helm [show|hide]`, per-tab, with the
+  Secrets title advertising current state. Detection via `ResourceEntity::is_helm_release()` (type
+  or `sh.helm.release.v1.*` name); filtered at the projection layer. Tests: model detection,
+  projector hide/show, render+toggle integration.
   Remaining: revisit when new views/commands land (e.g. interactive dynamic-list overlay).
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.

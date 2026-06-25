@@ -13,6 +13,9 @@ pub struct ViewRequest {
     pub filter: String,
     pub sort: SortColumn,
     pub descending: bool,
+    /// When false (default), Helm release secrets (`type: helm.sh/release.v1`) are hidden from the
+    /// Secrets list to cut clutter. No effect on other kinds.
+    pub show_helm_secrets: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +65,11 @@ impl ViewProjector for SimpleViewProjector {
 
         let filter = Filter::parse(&request.filter);
         entities.retain(|entity| filter.matches(entity));
+
+        // Helm release secrets are noise in day-to-day browsing; hidden unless explicitly shown.
+        if request.kind == ResourceKind::Secrets && !request.show_helm_secrets {
+            entities.retain(|entity| !entity.is_helm_release());
+        }
 
         entities.sort_by(|a, b| {
             let ord = match request.sort {
@@ -279,12 +287,55 @@ mod tests {
                 filter: "work".to_string(),
                 sort: SortColumn::Name,
                 descending: false,
+                show_helm_secrets: false,
             },
         );
 
         assert_eq!(vm.len(), 1);
         let row = materialize_row(&store, vm.key(0).expect("one match")).expect("row materializes");
         assert_eq!(row.name, "worker");
+    }
+
+    fn put_secret(store: &mut StateStore, name: &str, secret_type: &str) {
+        store.apply(StateDelta::Upsert(ResourceEntity {
+            key: ResourceKey::new("ctx", ResourceKind::Secrets, Some("ns".to_string()), name),
+            status: "-".to_string(),
+            age: Some(Utc::now()),
+            labels: vec![],
+            columns: vec![secret_type.to_string(), "1".to_string()],
+            extracted: Default::default(),
+        }));
+    }
+
+    #[test]
+    fn helm_release_secrets_hidden_by_default_and_shown_on_request() {
+        let mut store = StateStore::default();
+        put_secret(&mut store, "app-config", "Opaque");
+        put_secret(
+            &mut store,
+            "sh.helm.release.v1.myapp.v3",
+            "helm.sh/release.v1",
+        );
+
+        let projector = SimpleViewProjector;
+        let req = |show_helm_secrets: bool| ViewRequest {
+            context: "ctx".to_string(),
+            kind: ResourceKind::Secrets,
+            namespace: None,
+            filter: String::new(),
+            sort: SortColumn::Name,
+            descending: false,
+            show_helm_secrets,
+        };
+
+        // Default: the helm release secret is filtered out.
+        let hidden = projector.project(&store, &req(false));
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden.key(0).expect("one row").name, "app-config");
+
+        // Opt-in: both secrets show.
+        let shown = projector.project(&store, &req(true));
+        assert_eq!(shown.len(), 2);
     }
 
     fn put_labeled(store: &mut StateStore, name: &str, labels: &[(&str, &str)]) {
@@ -312,6 +363,7 @@ mod tests {
                     filter: filter.to_string(),
                     sort: SortColumn::Name,
                     descending: false,
+                    show_helm_secrets: false,
                 },
             )
             .order
@@ -379,6 +431,7 @@ mod tests {
             filter: "pod-09".to_string(),
             sort: SortColumn::Name,
             descending: false,
+            show_helm_secrets: false,
         };
 
         let start = Instant::now();
