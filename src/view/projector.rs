@@ -22,7 +22,8 @@ pub struct ViewRow {
     pub name: String,
     pub status: String,
     pub age: String,
-    pub summary: String,
+    /// Kind-specific column values, in [`crate::model::ResourceKind::extra_columns`] order.
+    pub columns: Vec<String>,
 }
 
 /// Ordered, filtered view of a resource list. Holds only row *identities* (keys); display rows are
@@ -91,7 +92,7 @@ impl ViewProjector for SimpleViewProjector {
 /// - empty                  → match everything
 /// - `!<rest>`              → invert the result of `<rest>`
 /// - `k=v`, `k==v`, `k!=v`  → label selector (comma-separated requirements, all must hold)
-/// - anything else          → case-insensitive substring over name/namespace/status/summary
+/// - anything else          → case-insensitive substring over name/namespace/status/columns
 #[derive(Debug, Clone)]
 enum Filter {
     All,
@@ -201,7 +202,7 @@ fn substring_match(entity: &crate::model::ResourceEntity, needle_lower: &str) ->
             .as_deref()
             .is_some_and(|ns| contains(ns))
         || contains(&entity.status)
-        || contains(&entity.summary)
+        || entity.columns.iter().any(|c| contains(c))
 }
 
 /// Build the display row for a single key (visible-window materialization). Returns None if the
@@ -218,7 +219,7 @@ pub fn materialize_row(store: &StateStore, key: &ResourceKey) -> Option<ViewRow>
         name: entity.key.name.clone(),
         status: entity.status.clone(),
         age: human_age(entity.age),
-        summary: entity.summary.clone(),
+        columns: entity.columns.clone(),
     })
 }
 
@@ -257,7 +258,7 @@ mod tests {
             status: status.to_string(),
             age: Some(Utc::now() - Duration::minutes(5)),
             labels: vec![],
-            summary: format!("{name}-summary"),
+            columns: vec![format!("{name}-summary")],
             extracted: Default::default(),
         }));
     }
@@ -295,7 +296,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            summary: String::new(),
+            columns: vec![],
             extracted: Default::default(),
         }));
     }

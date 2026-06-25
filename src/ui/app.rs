@@ -1365,14 +1365,24 @@ impl App {
                 let request = self.view_request_for_tab(&active);
                 let vm = self.projected_view(&request);
                 let mut lines = Vec::with_capacity(vm.len().saturating_add(1));
-                lines.push("namespace\tname\tstatus\tage\tsummary".to_string());
+                let mut header = String::from("namespace\tname\tstatus\tage");
+                for col in active.kind().extra_columns() {
+                    header.push('\t');
+                    header.push_str(col.header);
+                }
+                lines.push(header);
                 // Copy/dump materializes the full list (user-initiated, not a hot path).
                 for key in &vm.order {
                     if let Some(row) = materialize_row(&self.store, key) {
-                        lines.push(format!(
-                            "{}\t{}\t{}\t{}\t{}",
-                            row.namespace, row.name, row.status, row.age, row.summary
-                        ));
+                        let mut line = format!(
+                            "{}\t{}\t{}\t{}",
+                            row.namespace, row.name, row.status, row.age
+                        );
+                        for cell in &row.columns {
+                            line.push('\t');
+                            line.push_str(cell);
+                        }
+                        lines.push(line);
                     }
                 }
                 Some(lines.join("\n"))
@@ -2594,7 +2604,12 @@ mod tests {
             status: status.to_string(),
             age: Some(Utc::now()),
             labels: vec![("app".to_string(), "demo".to_string())],
-            summary: "snapshot".to_string(),
+            // Match the kind's column count so header/cell widths line up in render tests.
+            columns: kind
+                .extra_columns()
+                .iter()
+                .map(|_| "-".to_string())
+                .collect(),
             extracted: Default::default(),
         }
     }
@@ -3098,6 +3113,33 @@ mod tests {
         assert!(snap.contains("Status ↓"), "status desc header: {snap}");
         assert!(!snap.contains("Name ↑"), "name no longer marked: {snap}");
         assert!(snap.contains("[SORT] status↓"), "sort top bar: {snap}");
+    }
+
+    #[test]
+    fn non_pod_table_renders_kind_specific_columns() {
+        let mut app = test_app();
+        let kind_idx = ResourceKind::ORDERED
+            .iter()
+            .position(|k| *k == ResourceKind::Deployments)
+            .expect("deployments in ORDERED");
+        app.current_tab_mut().kind_idx = kind_idx;
+
+        let mut entity = mk_entity(
+            "ctx-dev",
+            ResourceKind::Deployments,
+            Some("default"),
+            "api",
+            "3/3 ready",
+        );
+        entity.columns = vec!["3".to_string(), "3".to_string()]; // UP-TO-DATE, AVAILABLE
+        app.store.apply(StateDelta::Upsert(entity));
+
+        let snap = render_snapshot(&mut app, 160, 20);
+        // kind-specific headers replace the old generic "Summary"
+        assert!(snap.contains("UP-TO-DATE"), "header: {snap}");
+        assert!(snap.contains("AVAILABLE"), "header: {snap}");
+        assert!(!snap.contains("Summary"), "no generic summary col: {snap}");
+        assert!(snap.contains("api"), "row name: {snap}");
     }
 
     #[test]

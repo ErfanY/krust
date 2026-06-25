@@ -215,6 +215,14 @@ Root problem: full object JSON kept for every entity.
   arrow (`Name ↑` / `Status ↓`), the top bar carries a `[SORT] <col><arrow>` field, and `:sort
   <name|namespace|status|age> [asc|desc]` sets it explicitly (added to command autocomplete). Tests:
   header-arrow render snapshot + `:sort` column/direction parsing.
+  **Per-kind columns**: non-pod views no longer collapse to a loose `Summary` string — each kind
+  renders meaningful, fixed-width columns after the universal Namespace/Name/Status/Age (deploy
+  UP-TO-DATE/AVAILABLE, svc TYPE/CLUSTER-IP/PORTS, pvc VOLUME/CAPACITY/ACCESS/STORAGECLASS, hpa,
+  cronjob, node ROLES/VERSION, etc.). Single source of truth `ResourceKind::extra_columns()` drives
+  both header and `extract_columns()` row values; a contract test asserts they stay in lockstep for
+  all 24 kinds. Entity model: `summary: String` → `columns: Vec<String>` (pods now carry an empty
+  vec — drops the unused per-pod `node=` string on the 10k-pod hot path). Filter + `:dump`/copy span
+  all columns.
   Remaining: revisit when new views/commands land (e.g. interactive dynamic-list overlay).
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.
