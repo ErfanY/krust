@@ -1745,6 +1745,18 @@ impl App {
             });
         }
 
+        // A Deployment drill-down resolves pods transitively through their ReplicaSet, so the RS
+        // for the drilled namespace must be watched too (otherwise the chain finds nothing).
+        if tab.kind() == ResourceKind::Pods
+            && let Some(drill) = &tab.drill
+            && drill.owner_kind == ResourceKind::Deployments
+        {
+            set.insert(WatchTarget {
+                kind: ResourceKind::ReplicaSets,
+                namespace: tab.namespace.clone(),
+            });
+        }
+
         let mut out: Vec<WatchTarget> = set.into_iter().collect();
         out.sort_by(|a, b| {
             a.kind

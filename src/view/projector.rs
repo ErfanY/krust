@@ -44,22 +44,33 @@ impl DrillFilter {
             ResourceKind::Nodes => {
                 pod.extracted.node_name.as_deref() == Some(self.owner_name.as_str())
             }
-            ResourceKind::Deployments => pod
-                .extracted
-                .owners
-                .iter()
-                .filter(|owner| owner.kind == "ReplicaSet")
-                .any(|owner| {
-                    let rs_key = ResourceKey::new(
-                        context,
-                        ResourceKind::ReplicaSets,
-                        pod.key.namespace.clone(),
-                        owner.name.clone(),
-                    );
-                    store
-                        .get(&rs_key)
-                        .is_some_and(|rs| rs.extracted.owned_by("Deployment", &self.owner_name))
-                }),
+            ResourceKind::Deployments => {
+                let prefix = format!("{}-", self.owner_name);
+                pod.extracted
+                    .owners
+                    .iter()
+                    .filter(|owner| owner.kind == "ReplicaSet")
+                    .any(|owner| {
+                        // Authoritative: the RS is in the store and owned by this deployment.
+                        let rs_key = ResourceKey::new(
+                            context,
+                            ResourceKind::ReplicaSets,
+                            pod.key.namespace.clone(),
+                            owner.name.clone(),
+                        );
+                        let by_store = store.get(&rs_key).is_some_and(|rs| {
+                            rs.extracted.owned_by("Deployment", &self.owner_name)
+                        });
+                        // Fallback when the RS isn't loaded yet (or RBAC-denied): a deployment's
+                        // RS is always named `<deploy>-<pod-template-hash>`, hash having no `-`,
+                        // which keeps `web` from matching `web-api`'s ReplicaSets.
+                        let by_name = owner
+                            .name
+                            .strip_prefix(&prefix)
+                            .is_some_and(|hash| !hash.is_empty() && !hash.contains('-'));
+                        by_store || by_name
+                    })
+            }
             _ => true,
         }
     }
@@ -407,6 +418,16 @@ mod tests {
                 ..Default::default()
             },
         );
+        // p4's ReplicaSet ("dep1-77c") isn't in the store — must still match dep1 by name convention.
+        put_entity(
+            &mut store,
+            ResourceKind::Pods,
+            "p4",
+            Extracted {
+                owners: vec![owner("ReplicaSet", "dep1-77c")],
+                ..Default::default()
+            },
+        );
 
         let projector = SimpleViewProjector;
         let req = |drill: Option<DrillFilter>| ViewRequest {
@@ -422,7 +443,7 @@ mod tests {
         let names =
             |vm: ViewModel| -> Vec<String> { vm.order.iter().map(|k| k.name.clone()).collect() };
 
-        // Transitive deployment ownership: only p1.
+        // Deployment ownership: p1 (transitive via stored rs1) + p4 (RS not stored, name fallback).
         let dep = projector.project(
             &store,
             &req(Some(DrillFilter {
@@ -430,7 +451,7 @@ mod tests {
                 owner_name: "dep1".to_string(),
             })),
         );
-        assert_eq!(names(dep), vec!["p1".to_string()]);
+        assert_eq!(names(dep), vec!["p1".to_string(), "p4".to_string()]);
 
         // Direct ReplicaSet ownership: only p1.
         let rs = projector.project(
@@ -452,8 +473,8 @@ mod tests {
         );
         assert_eq!(names(node), vec!["p3".to_string()]);
 
-        // No drill: all three pods.
-        assert_eq!(names(projector.project(&store, &req(None))).len(), 3);
+        // No drill: all four pods.
+        assert_eq!(names(projector.project(&store, &req(None))).len(), 4);
     }
 
     fn put_secret(store: &mut StateStore, name: &str, secret_type: &str) {
