@@ -198,7 +198,9 @@ Root problem: full object JSON kept for every entity.
     scheduled-node). Live filter on the Pods view (`DrillFilter` in `ViewRequest`), `[DRILL]` title,
     `esc` pops back to the owner list; cleared on any kind/namespace change. (svc→endpoints deferred
     — needs the service selector, not currently extracted.)
-  - **Previous logs** (`--previous` toggle) for crashloops.
+  - [x] **Previous logs** — DONE. `P` in the logs pane toggles the previous (terminated) container
+    instance (`kubectl logs -p`) as a one-shot fetch (no follow/reconnect); status line shows
+    `instance:current|previous`. Plumbing (`PodLogRequest.previous`) already existed.
   - **xray** relationship-tree view (replace stub).
   - Medium: jump-to-owner (`Shift-J`), UsedBy/dependents (`U`), log timestamps, pod metric-column
     sort, inline `:pod /term`/`@ctx`.

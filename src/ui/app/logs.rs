@@ -187,20 +187,22 @@ impl App {
         let mut tasks = Vec::new();
         let mut opened = 0usize;
 
+        let previous = self.logs.previous;
         for target in &selection.targets {
             let request = PodLogRequest {
                 context: target.context.clone(),
                 namespace: target.namespace.clone(),
                 pod: target.pod.clone(),
                 container: target.container.clone(),
-                follow: true,
-                tail_lines: if initial {
+                // The previous container instance is gone, so there's nothing to follow.
+                follow: !previous,
+                tail_lines: if previous || initial {
                     Some(LOG_DEFAULT_TAIL_LINES)
                 } else {
                     None
                 },
-                since_seconds: if initial { None } else { Some(15) },
-                previous: false,
+                since_seconds: if previous || initial { None } else { Some(15) },
+                previous,
                 timestamps: true,
             };
             match self.resource_provider.stream_pod_logs(request).await {
@@ -296,6 +298,8 @@ impl App {
         if desired != self.logs.selection {
             self.stop_log_session();
             self.reset_log_buffer();
+            // A fresh log view starts on the current (followed) instance, not previous.
+            self.logs.previous = false;
             self.logs.selection = desired.clone();
             let Some(selection) = desired else {
                 return true;
@@ -306,6 +310,8 @@ impl App {
         if self.logs.selection.is_none()
             || self.logs.session.is_some()
             || self.logs.reconnect_blocked
+            // Previous-instance logs are a one-shot fetch — don't auto-reconnect after close.
+            || self.logs.previous
         {
             return false;
         }
@@ -478,6 +484,11 @@ impl App {
         } else {
             "idle"
         };
+        let instance = if self.logs.previous {
+            "previous"
+        } else {
+            "current"
+        };
         let target = self
             .logs
             .selection
@@ -503,8 +514,9 @@ impl App {
         };
 
         format!(
-            "Logs | target:{} | streams:{} | state:{} | src:{} | lines:{} | dropped:{} | paused-drop:{}{} | wrap:{}",
+            "Logs | target:{} | instance:{} | streams:{} | state:{} | src:{} | lines:{} | dropped:{} | paused-drop:{}{} | wrap:{}",
             target,
+            instance,
             streams,
             state,
             source_filters,
@@ -528,6 +540,23 @@ impl App {
         } else {
             self.status_line = "Log stream resumed".to_string();
         }
+    }
+
+    /// Toggle between the current and previous (terminated) container instance's logs and refetch.
+    pub(super) async fn toggle_previous_logs(&mut self) {
+        let Some(selection) = self.logs.selection.clone() else {
+            self.status_line = "No active log stream".to_string();
+            return;
+        };
+        self.logs.previous = !self.logs.previous;
+        self.stop_log_session();
+        self.reset_log_buffer();
+        self.start_log_session(selection, true).await;
+        self.status_line = if self.logs.previous {
+            "Logs: previous container instance (-p) — one-shot".to_string()
+        } else {
+            "Logs: current container instance".to_string()
+        };
     }
 
     pub(super) fn jump_logs_to_latest(&mut self) {

@@ -539,6 +539,9 @@ struct LogViewState {
     reconnect_after: Option<Instant>,
     reconnect_blocked: bool,
     paused: bool,
+    /// Stream the previous (terminated) container instance's logs (`kubectl logs -p`) — a one-shot
+    /// fetch (no follow/reconnect), used for crashloop debugging.
+    previous: bool,
     paused_skipped_lines: u64,
     container_override_pod: Option<ResourceKey>,
     container_override: Option<String>,
@@ -576,6 +579,7 @@ impl Default for LogViewState {
             reconnect_after: None,
             reconnect_blocked: false,
             paused: false,
+            previous: false,
             paused_skipped_lines: 0,
             container_override_pod: None,
             container_override: None,
@@ -1148,6 +1152,14 @@ impl App {
             && key.code == KeyCode::Char('p')
         {
             self.set_log_paused(!self.logs.paused);
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
+        if self.current_tab().pane == Pane::Logs
+            && ((key.code == KeyCode::Char('P'))
+                || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            self.toggle_previous_logs().await;
             self.ensure_active_watch().await;
             return Ok(false);
         }
@@ -3548,6 +3560,47 @@ mod tests {
         assert!(snap.contains("[LG]"));
         assert!(snap.contains("Logs | target:pod default/pod-a"));
         assert!(snap.contains("[default/pod-a/main] line-1"));
+        // Defaults to the current container instance.
+        assert!(snap.contains("instance:current"), "instance: {snap}");
+    }
+
+    #[tokio::test]
+    async fn toggle_previous_logs_flips_instance_and_resets() {
+        let mut app = test_app();
+        app.current_tab_mut().pane = Pane::Logs;
+        app.logs.selection = Some(super::LogSelection {
+            scope: "pod default/pod-a".to_string(),
+            targets: vec![super::LogTarget {
+                context: "ctx-dev".to_string(),
+                namespace: "default".to_string(),
+                pod: "pod-a".to_string(),
+                container: Some("main".to_string()),
+            }],
+        });
+        app.push_log_line("[default/pod-a/main] old".to_string());
+
+        assert!(!app.logs.previous);
+        app.toggle_previous_logs().await;
+        assert!(app.logs.previous, "toggled to previous");
+        // Switching instances refetches: the prior buffer is cleared.
+        assert!(
+            !app.logs.lines.iter().any(|l| l.contains("old")),
+            "buffer reset on toggle: {:?}",
+            app.logs.lines
+        );
+        assert!(
+            app.logs_title().contains("instance:previous"),
+            "{}",
+            app.logs_title()
+        );
+
+        app.toggle_previous_logs().await;
+        assert!(!app.logs.previous, "toggled back to current");
+        assert!(
+            app.logs_title().contains("instance:current"),
+            "{}",
+            app.logs_title()
+        );
     }
 
     #[test]
