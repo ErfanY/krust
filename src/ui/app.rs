@@ -25,7 +25,7 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
 };
@@ -2180,32 +2180,52 @@ fn percent(numerator: u64, denominator: u64) -> String {
     format!("{pct:.0}%")
 }
 
-/// Format a pod's per-resource usage cell as `‹used› R‹%req› L‹%limit›` and pick a severity:
-/// red when usage is ≥90% of the limit (throttle/OOM risk), yellow when ≥100% of the request
-/// (under-requested). A low `R%` shows over-provisioning. Missing pieces render as `R-`/`L-`,
-/// and no usage at all renders as `-`.
-fn pod_usage_cell(
+/// A pod's per-resource usage broken into three independently-rendered, right-aligned columns:
+/// actual `used`, usage as a percentage of the request (`req_pct`), and of the limit (`lim_pct`).
+/// Each percentage carries its own severity: `lim` turns red at ≥90% (throttle/OOM risk), `req`
+/// turns yellow at ≥100% (under-requested); a low `req_pct` flags over-provisioning. Missing
+/// pieces render as `-`.
+struct UsageCells {
+    used: String,
+    req_pct: String,
+    lim_pct: String,
+    req_sev: Severity,
+    lim_sev: Severity,
+}
+
+fn pod_usage_cells(
     used: Option<u64>,
     request: u64,
     limit: u64,
     render: fn(u64) -> String,
-) -> (String, Severity) {
+) -> UsageCells {
     let Some(used) = used else {
-        return ("-".to_string(), Severity::Ok);
+        return UsageCells {
+            used: "-".to_string(),
+            req_pct: "-".to_string(),
+            lim_pct: "-".to_string(),
+            req_sev: Severity::Ok,
+            lim_sev: Severity::Ok,
+        };
     };
     let pct = |denom: u64| (denom > 0).then(|| used.saturating_mul(100) / denom);
     let req_pct = pct(request);
     let lim_pct = pct(limit);
-    let req_s = req_pct.map_or_else(|| "R-".to_string(), |v| format!("R{v}"));
-    let lim_s = lim_pct.map_or_else(|| "L-".to_string(), |v| format!("L{v}"));
-    let severity = if lim_pct.is_some_and(|v| v >= 90) {
-        Severity::Err
-    } else if req_pct.is_some_and(|v| v >= 100) {
-        Severity::Warn
-    } else {
-        Severity::Ok
-    };
-    (format!("{} {req_s} {lim_s}", render(used)), severity)
+    UsageCells {
+        used: render(used),
+        req_pct: req_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
+        lim_pct: lim_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
+        req_sev: if req_pct.is_some_and(|v| v >= 100) {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        },
+        lim_sev: if lim_pct.is_some_and(|v| v >= 90) {
+            Severity::Err
+        } else {
+            Severity::Ok
+        },
+    }
 }
 
 /// Compact age (e.g. "3d", "5h", "12m") for dynamic-resource rows.
@@ -2419,7 +2439,7 @@ mod tests {
             ResourceProvider, WatchTarget,
         },
         keymap::Keymap,
-        model::{Pane, ResourceEntity, ResourceKey, ResourceKind, StateDelta},
+        model::{Pane, ResourceEntity, ResourceKey, ResourceKind, SortColumn, StateDelta},
     };
 
     struct NoopProvider {
@@ -3042,15 +3062,42 @@ mod tests {
         // actual usage
         assert!(snap.contains("1.50c"), "cpu used: {snap}");
         assert!(snap.contains("256Mi"), "mem used: {snap}");
-        // right-sizing vs request and limit
+        // right-sizing percentages vs request and limit, in their own columns
         assert!(
-            snap.contains("R150") && snap.contains("L75"),
-            "cpu R/L: {snap}"
+            snap.contains("150%") && snap.contains("75%"),
+            "cpu %R/%L: {snap}"
         ); // 1500/1000, 1500/2000
         assert!(
-            snap.contains("R200") && snap.contains("L50"),
-            "mem R/L: {snap}"
+            snap.contains("200%") && snap.contains("50%"),
+            "mem %R/%L: {snap}"
         ); // 256/128, 256/512
+    }
+
+    #[test]
+    fn table_header_marks_active_sort_column_and_direction() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "pod-a",
+            "Running",
+        )));
+
+        // Default sort is Name ascending: header shows "Name ↑" and the top bar [SORT] name↑.
+        app.current_tab_mut().sort = SortColumn::Name;
+        app.current_tab_mut().descending = false;
+        let snap = render_snapshot(&mut app, 160, 20);
+        assert!(snap.contains("Name ↑"), "name asc header: {snap}");
+        assert!(snap.contains("[SORT] name↑"), "sort top bar: {snap}");
+
+        // Switch to Status descending: arrow flips and moves to the Status column.
+        app.current_tab_mut().sort = SortColumn::Status;
+        app.current_tab_mut().descending = true;
+        let snap = render_snapshot(&mut app, 160, 20);
+        assert!(snap.contains("Status ↓"), "status desc header: {snap}");
+        assert!(!snap.contains("Name ↑"), "name no longer marked: {snap}");
+        assert!(snap.contains("[SORT] status↓"), "sort top bar: {snap}");
     }
 
     #[test]
@@ -3167,6 +3214,33 @@ mod tests {
 
         // Unknown token does not resolve.
         assert!(!app.browse_dynamic("definitely-not-a-resource", None).await);
+    }
+
+    #[tokio::test]
+    async fn sort_command_sets_column_and_direction() {
+        let mut app = test_app();
+
+        // Column + explicit direction.
+        app.execute_colon_command("sort age desc").await;
+        assert_eq!(app.current_tab().sort, SortColumn::Age);
+        assert!(app.current_tab().descending);
+        assert_eq!(app.status_line, "Sort: age desc");
+
+        // `ns` alias maps to Namespace; ascending.
+        app.execute_colon_command("sort ns asc").await;
+        assert_eq!(app.current_tab().sort, SortColumn::Namespace);
+        assert!(!app.current_tab().descending);
+        assert_eq!(app.status_line, "Sort: namespace asc");
+
+        // No args reports current state without changing it.
+        app.execute_colon_command("sort").await;
+        assert_eq!(app.current_tab().sort, SortColumn::Namespace);
+        assert_eq!(app.status_line, "Sort: namespace asc");
+
+        // Unknown column is rejected and leaves sort unchanged.
+        app.execute_colon_command("sort bogus").await;
+        assert_eq!(app.current_tab().sort, SortColumn::Namespace);
+        assert!(app.status_line.starts_with("Usage: :sort"));
     }
 
     #[test]

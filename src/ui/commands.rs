@@ -16,6 +16,7 @@ pub(crate) fn command_names() -> &'static [&'static str] {
         "namespace",
         "all",
         "0",
+        "sort",
         "kind",
         "resources",
         "res",

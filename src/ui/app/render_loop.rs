@@ -36,8 +36,15 @@ impl App {
         let selected_human = if visible_rows == 0 { 0 } else { selected + 1 };
         let hb = activity_icon(revision);
         let ctx_short = compact_context_name(&active.context);
+        let sort_col = match active.sort {
+            SortColumn::Name => "name",
+            SortColumn::Namespace => "ns",
+            SortColumn::Status => "status",
+            SortColumn::Age => "age",
+        };
+        let sort_arrow = if active.descending { "↓" } else { "↑" };
         let mut top_line = format!(
-            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [CLR] {}  [REV] +{}  [STALE] {}s  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
+            "{} {}  [CTX] {} ({}/{})  [NS] {}  [K] {}  [P] {} {}  [SORT] {sort_col}{sort_arrow}  [CLR] {}  [REV] +{}  [STALE] {}s  [SEL] {selected_human}/{}  [VIS] {}  [CACHE] {}  [ERR] {}",
             hb,
             now,
             ctx_short,
@@ -657,25 +664,34 @@ impl App {
                                 let usage = self.pod_usage(key.namespace.as_deref(), &key.name);
                                 let res =
                                     self.store.get(key).and_then(|e| e.extracted.pod_resources);
-                                let (cpu_str, cpu_sev) = pod_usage_cell(
+                                let cpu = pod_usage_cells(
                                     usage.map(|(c, _)| c),
                                     res.map(|r| r.cpu_request_m).unwrap_or(0),
                                     res.map(|r| r.cpu_limit_m).unwrap_or(0),
                                     format_millicpu,
                                 );
-                                let (mem_str, mem_sev) = pod_usage_cell(
+                                let mem = pod_usage_cells(
                                     usage.map(|(_, m)| m),
                                     res.map(|r| r.mem_request_b).unwrap_or(0),
                                     res.map(|r| r.mem_limit_b).unwrap_or(0),
                                     format_bytes,
                                 );
+                                // Right-aligned numeric cell, optionally severity-colored.
+                                let num = |s: String, sev: Severity| {
+                                    Cell::from(Line::from(s).alignment(Alignment::Right))
+                                        .style(severity_style(&theme, sev))
+                                };
                                 vec![
                                     Cell::from(row.namespace),
                                     Cell::from(row.name),
                                     Cell::from(status),
-                                    Cell::from(cpu_str).style(severity_style(&theme, cpu_sev)),
-                                    Cell::from(mem_str).style(severity_style(&theme, mem_sev)),
                                     Cell::from(row.age),
+                                    num(cpu.used, Severity::Ok),
+                                    num(cpu.req_pct, cpu.req_sev),
+                                    num(cpu.lim_pct, cpu.lim_sev),
+                                    num(mem.used, Severity::Ok),
+                                    num(mem.req_pct, mem.req_sev),
+                                    num(mem.lim_pct, mem.lim_sev),
                                 ]
                             } else {
                                 vec![
@@ -690,26 +706,62 @@ impl App {
                         })
                         .collect();
 
-                    let (header, widths): (Vec<&str>, Vec<Constraint>) = if pods_view {
+                    // Mark the active sort column in the header with a direction arrow.
+                    let arrow = if active.descending { " ↓" } else { " ↑" };
+                    // Left-aligned, sortable text header.
+                    let mark = |label: &str, col: SortColumn| {
+                        let text = if active.sort == col {
+                            format!("{label}{arrow}")
+                        } else {
+                            label.to_string()
+                        };
+                        Cell::from(text)
+                    };
+                    // Right-aligned numeric header (matches the right-aligned numeric cells).
+                    let num_head = |label: &str| {
+                        Cell::from(Line::from(label.to_string()).alignment(Alignment::Right))
+                    };
+                    let (header, widths): (Vec<Cell>, Vec<Constraint>) = if pods_view {
                         (
-                            vec!["Namespace", "Name", "Status", "CPU", "MEM", "Age"],
+                            vec![
+                                mark("Namespace", SortColumn::Namespace),
+                                mark("Name", SortColumn::Name),
+                                mark("Status", SortColumn::Status),
+                                mark("Age", SortColumn::Age),
+                                num_head("CPU"),
+                                num_head("CR"),
+                                num_head("CL"),
+                                num_head("MEM"),
+                                num_head("MR"),
+                                num_head("ML"),
+                            ],
                             vec![
                                 Constraint::Length(16),
-                                Constraint::Min(18),
-                                Constraint::Length(18),
-                                Constraint::Length(17),
-                                Constraint::Length(17),
+                                Constraint::Min(20),
+                                Constraint::Length(16),
+                                Constraint::Length(6),
+                                Constraint::Length(8),
+                                Constraint::Length(6),
+                                Constraint::Length(6),
+                                Constraint::Length(9),
+                                Constraint::Length(6),
                                 Constraint::Length(6),
                             ],
                         )
                     } else {
                         (
-                            vec!["Namespace", "Name", "Status", "Age", "Summary"],
                             vec![
-                                Constraint::Length(18),
-                                Constraint::Length(38),
+                                mark("Namespace", SortColumn::Namespace),
+                                mark("Name", SortColumn::Name),
+                                mark("Status", SortColumn::Status),
+                                mark("Age", SortColumn::Age),
+                                Cell::from("Summary"),
+                            ],
+                            vec![
                                 Constraint::Length(20),
-                                Constraint::Length(10),
+                                Constraint::Min(24),
+                                Constraint::Length(18),
+                                Constraint::Length(8),
                                 Constraint::Min(10),
                             ],
                         )
@@ -718,7 +770,7 @@ impl App {
                         let legend = if self.pod_metrics.is_empty() {
                             "CPU/MEM: metrics-server n/a"
                         } else {
-                            "CPU/MEM = used R%req L%limit"
+                            "CPU/MEM used · CR/CL = cpu %req/%lim · MR/ML = mem %req/%lim"
                         };
                         format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
                     } else {
@@ -726,6 +778,7 @@ impl App {
                     };
                     let table = Table::new(rows, widths)
                         .header(Row::new(header).style(theme.table_header))
+                        .column_spacing(2)
                         .block(Block::default().borders(Borders::ALL).title(title))
                         .row_highlight_style(theme.row_highlight);
 

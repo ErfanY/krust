@@ -56,6 +56,10 @@ krust --all-contexts
 - `d`: describe selected resource (toggles back to table)
 - `v`: view YAML; `t`: back to table; `E`: events pane (this resource's events); `l`: logs
 - `n`: cycle namespace; `s`: cycle sort column; `r`: reverse sort order
+
+The active sort column is marked in the table header with a direction arrow (`Name ↑` ascending,
+`Status ↓` descending), and the top status bar shows `[SORT] <col><arrow>`. You can also set sort
+explicitly with `:sort <name|namespace|status|age> [asc|desc]`.
 - `ctrl+d`: delete (guarded, table only); `ctrl+k`: kill (delete)
 - `?`: toggle help (table) / search (detail panes)
 - `esc`: clear filter (table) / close view (detail) / cancel pending action
@@ -70,12 +74,18 @@ like the Events section of `kubectl describe`. Selecting an Event resource itsel
 
 ## Metrics
 
-If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage and right-sizing:
-- the **Pods table** **CPU** and **MEM** columns show `‹used› R‹%req› L‹%limit›` per pod — e.g.
-  `1.50c R150 L75` means using 1.5 cores, 150% of its request, 75% of its limit. `R%` is the
-  right-sizing signal (low = over-provisioned, ≥100 = under-requested); `L%` is the risk signal.
-  Cells turn yellow at ≥100% of request and red at ≥90% of limit (throttle/OOM risk).
-- the **Cluster Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%.
+If the cluster has a metrics-server (`metrics.k8s.io`), krust shows live usage and right-sizing.
+The **Pods table** splits this into six right-aligned, fixed-width columns — `CPU CR CL` then
+`MEM MR ML`:
+- **CPU** / **MEM** — actual usage (e.g. `1.50c`, `256Mi`).
+- **CR** / **MR** — usage as a percentage of the CPU/memory **request** (the right-sizing signal:
+  low = over-provisioned, ≥100 = under-requested). Turns yellow at ≥100%.
+- **CL** / **ML** — usage as a percentage of the CPU/memory **limit** (the risk signal). Turns red
+  at ≥90% (throttle/OOM risk).
+
+So a pod showing CPU `1.50c`, CR `150%`, CL `75%` is using 1.5 cores, 150% of its CPU request, and
+75% of its CPU limit. Missing pieces (no request/limit, or no metrics) render as `-`. The **Cluster
+Pulse** panel shows a `[USE]` row: cluster cpu/mem used vs allocatable + util%.
 
 Without a metrics-server these degrade gracefully (columns show `-`, the table title notes
 `metrics-server n/a`, and the pulse falls back to request/limit-based numbers).
@@ -116,6 +126,7 @@ Common command mode entries:
 - `:<resource>` browse any discovered resource/CRD (e.g. `:endpoints`, `:widgets`); `:<resource> <name>` describes one
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
+- `:sort <name|namespace|status|age> [asc|desc]` set the table sort column/direction
 
 ## Detail Pane Behavior
 
