@@ -288,6 +288,19 @@ pub struct Extracted {
     pub node_capacity: Option<NodeCapacity>,
 }
 
+impl ResourceEntity {
+    /// True for Helm 3 release-state secrets (`type: helm.sh/release.v1`, names like
+    /// `sh.helm.release.v1.<release>.v<n>`). Used to hide them from the Secrets list by default.
+    pub fn is_helm_release(&self) -> bool {
+        self.key.kind == ResourceKind::Secrets
+            && (self
+                .columns
+                .first()
+                .is_some_and(|t| t == "helm.sh/release.v1")
+                || self.key.name.starts_with("sh.helm.release.v1."))
+    }
+}
+
 impl Extracted {
     pub fn owned_by(&self, kind: &str, name: &str) -> bool {
         self.owners
@@ -379,4 +392,37 @@ pub enum SortColumn {
     Namespace,
     Status,
     Age,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn secret(name: &str, columns: Vec<String>) -> ResourceEntity {
+        ResourceEntity {
+            key: ResourceKey::new("ctx", ResourceKind::Secrets, Some("ns".to_string()), name),
+            status: "-".to_string(),
+            age: None,
+            labels: vec![],
+            columns,
+            extracted: Default::default(),
+        }
+    }
+
+    #[test]
+    fn is_helm_release_detects_type_and_name_but_not_plain_secrets() {
+        // Detected by helm type column.
+        assert!(secret("anything", vec!["helm.sh/release.v1".to_string()]).is_helm_release());
+        // Detected by name prefix even without the type column.
+        assert!(secret("sh.helm.release.v1.app.v2", vec![]).is_helm_release());
+        // Plain secret is not a helm release.
+        assert!(!secret("db-credentials", vec!["Opaque".to_string()]).is_helm_release());
+    }
+
+    #[test]
+    fn is_helm_release_only_applies_to_secrets() {
+        let mut cm = secret("sh.helm.release.v1.app.v2", vec![]);
+        cm.key.kind = ResourceKind::ConfigMaps;
+        assert!(!cm.is_helm_release());
+    }
 }

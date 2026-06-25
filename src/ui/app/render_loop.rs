@@ -775,6 +775,19 @@ impl App {
                             "CPU/MEM used · CR/CL = cpu %req/%lim · MR/ML = mem %req/%lim"
                         };
                         format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
+                    } else if active.kind() == ResourceKind::Secrets {
+                        let helm = if active.show_helm_secrets {
+                            format!(
+                                "helm shown ({} hide)",
+                                self.keymap.hint(Action::ToggleHelmSecrets)
+                            )
+                        } else {
+                            format!(
+                                "helm hidden ({} show)",
+                                self.keymap.hint(Action::ToggleHelmSecrets)
+                            )
+                        };
+                        format!("[KIND] {} ({}) · {helm}", active.kind(), vm.len())
                     } else {
                         format!("[KIND] {} ({})", active.kind(), vm.len())
                     };

@@ -97,6 +97,8 @@ struct ContextTabState {
     last_non_namespace_kind_idx: usize,
     sort: SortColumn,
     descending: bool,
+    /// Show Helm release secrets in the Secrets list (default false — they're hidden clutter).
+    show_helm_secrets: bool,
     pane: Pane,
 }
 
@@ -619,6 +621,7 @@ impl App {
             filter: tab.filter.clone(),
             sort: tab.sort,
             descending: tab.descending,
+            show_helm_secrets: tab.show_helm_secrets,
         }
     }
 
@@ -900,6 +903,7 @@ impl App {
                 last_non_namespace_kind_idx: 0,
                 sort: SortColumn::Name,
                 descending: false,
+                show_helm_secrets: false,
                 pane: Pane::Table,
             })
             .collect();
@@ -1227,6 +1231,8 @@ impl App {
             self.cycle_namespace();
         } else if self.keymap.is(Action::ToggleHelp, &key) {
             self.show_help = !self.show_help;
+        } else if self.keymap.is(Action::ToggleHelmSecrets, &key) {
+            self.toggle_helm_secrets();
         } else if self.keymap.is(Action::ToTable, &key) {
             let tab = self.current_tab_mut();
             tab.pane = Pane::Table;
@@ -1592,6 +1598,22 @@ impl App {
             SortColumn::Namespace => SortColumn::Status,
             SortColumn::Status => SortColumn::Age,
             SortColumn::Age => SortColumn::Name,
+        };
+    }
+
+    fn toggle_helm_secrets(&mut self) {
+        let tab = self.current_tab_mut();
+        tab.show_helm_secrets = !tab.show_helm_secrets;
+        // Selection offsets can point past the now-shorter/longer list; reset to the top.
+        tab.selected = 0;
+        tab.table_offset = 0;
+        let showing = tab.show_helm_secrets;
+        let on_secrets = tab.kind() == ResourceKind::Secrets;
+        self.status_line = match (on_secrets, showing) {
+            (true, true) => "Helm release secrets: shown".to_string(),
+            (true, false) => "Helm release secrets: hidden".to_string(),
+            (false, true) => "Helm release secrets: shown (applies to Secrets view)".to_string(),
+            (false, false) => "Helm release secrets: hidden (applies to Secrets view)".to_string(),
         };
     }
 
@@ -3140,6 +3162,53 @@ mod tests {
         assert!(snap.contains("AVAILABLE"), "header: {snap}");
         assert!(!snap.contains("Summary"), "no generic summary col: {snap}");
         assert!(snap.contains("api"), "row name: {snap}");
+    }
+
+    #[test]
+    fn helm_release_secrets_hidden_by_default_and_toggle_shows_them() {
+        let mut app = test_app();
+        let kind_idx = ResourceKind::ORDERED
+            .iter()
+            .position(|k| *k == ResourceKind::Secrets)
+            .expect("secrets in ORDERED");
+        app.current_tab_mut().kind_idx = kind_idx;
+
+        let mut plain = mk_entity(
+            "ctx-dev",
+            ResourceKind::Secrets,
+            Some("default"),
+            "app-config",
+            "-",
+        );
+        plain.columns = vec!["Opaque".to_string(), "2".to_string()];
+        app.store.apply(StateDelta::Upsert(plain));
+        let mut helm = mk_entity(
+            "ctx-dev",
+            ResourceKind::Secrets,
+            Some("default"),
+            "sh.helm.release.v1.myapp.v3",
+            "-",
+        );
+        helm.columns = vec!["helm.sh/release.v1".to_string(), "2".to_string()];
+        app.store.apply(StateDelta::Upsert(helm));
+
+        // Default: helm release hidden, title advertises the toggle.
+        let snap = render_snapshot(&mut app, 140, 20);
+        assert!(snap.contains("app-config"), "plain secret shown: {snap}");
+        assert!(
+            !snap.contains("sh.helm.release.v1"),
+            "helm hidden by default: {snap}"
+        );
+        assert!(snap.contains("helm hidden"), "title hint: {snap}");
+
+        // Toggle on: helm release becomes visible.
+        app.toggle_helm_secrets();
+        let snap = render_snapshot(&mut app, 140, 20);
+        assert!(
+            snap.contains("sh.helm.release.v1"),
+            "helm shown after toggle: {snap}"
+        );
+        assert!(snap.contains("helm shown"), "title hint: {snap}");
     }
 
     #[test]
