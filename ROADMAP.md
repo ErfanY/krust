@@ -190,9 +190,18 @@ Root problem: full object JSON kept for every entity.
   Compiled once per projection (`Filter`). Tests cover label eq/neq/absent, inverse, substring
   fallback. Deferred (dep-free for now): fuzzy + regex matching; detail/log search still substring.
 - [ ] **4.6 Port-forward** — readonly-adjacent inspection; decide in/out of v1 scope.
-- [ ] **4.7 k9s readonly surface audit** — enumerate k9s readonly commands/keybindings; close
-  remaining gaps or explicitly mark out-of-scope (pulses/xray/popeye are stubbed,
-  command_mode.rs:286).
+- [~] **4.7 k9s readonly surface audit** — DONE (audit): `docs/k9s-parity-audit.md` enumerates the
+  full k9s readonly surface vs krust (grounded in the k9s README keybindings + commands docs) and
+  marks each ✅/🟡/❌/⛔. Mutations explicitly scoped out (readonly-first v1). Prioritized gaps to
+  close next, highest value first:
+  - **Enter drill-down** (deploy/rs/sts/ds→pods, node→pods, svc→endpoints/pods) — biggest gap; the
+    owner→pod mapping already exists (log fan-in).
+  - **Previous logs** (`--previous` toggle) for crashloops.
+  - **xray** relationship-tree view (replace stub).
+  - Medium: jump-to-owner (`Shift-J`), UsedBy/dependents (`U`), log timestamps, pod metric-column
+    sort, inline `:pod /term`/`@ctx`.
+  - Decide: popeye sanitizer (large, separable); pulses dashboard (likely redundant with the
+    always-on pulse → lean scope-out); regex/fuzzy filter (4.5).
 
 ---
 
