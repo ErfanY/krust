@@ -86,6 +86,8 @@ each kind shows columns tailored to it (like `kubectl get`), e.g.:
 - **Jobs** — `COMPLETIONS`, `DURATION`
 - **CronJobs** — `SCHEDULE`, `SUSPEND`, `ACTIVE`
 - **ConfigMaps** — `DATA`; **Secrets** — `TYPE`, `DATA`
+- **ServiceAccounts** — `SECRETS`, `PULL-SECRETS`
+- **RoleBindings / ClusterRoleBindings** — `ROLE` (e.g. `ClusterRole/view`), `SUBJECTS` (e.g. `sa:build,u:alice`)
 - **Nodes** — `ROLES`, `VERSION`
 - **PVCs** — `VOLUME`, `CAPACITY`, `ACCESS`, `STORAGECLASS`; **PVs** add `RECLAIM`, `CLAIM`
 - **HPAs** — `REFERENCE`, `MINPODS`, `MAXPODS`, `REPLICAS`

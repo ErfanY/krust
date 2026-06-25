@@ -156,7 +156,8 @@ impl ResourceKind {
             C::new("MAXPODS", 8),
             C::new("REPLICAS", 9),
         ];
-        const SA: &[ExtraColumn] = &[C::new("SECRETS", 8)];
+        const SA: &[ExtraColumn] = &[C::new("SECRETS", 8), C::new("PULL-SECRETS", 13)];
+        const BINDING: &[ExtraColumn] = &[C::new("ROLE", 26), C::new("SUBJECTS", 34)];
         const PDB: &[ExtraColumn] = &[
             C::new("MIN-AVAIL", 10),
             C::new("MAX-UNAVAIL", 12),
@@ -178,6 +179,7 @@ impl ResourceKind {
             ResourceKind::PersistentVolumes => PV,
             ResourceKind::HorizontalPodAutoscalers => HPA,
             ResourceKind::ServiceAccounts => SA,
+            ResourceKind::RoleBindings | ResourceKind::ClusterRoleBindings => BINDING,
             ResourceKind::PodDisruptionBudgets => PDB,
             _ => &[],
         }

@@ -1214,7 +1214,10 @@ fn extract_columns(kind: ResourceKind, raw: &serde_json::Value) -> Vec<String> {
             int_cell("/spec/maxReplicas"),
             int_cell("/status/currentReplicas"),
         ],
-        ResourceKind::ServiceAccounts => vec![count("/secrets")],
+        ResourceKind::ServiceAccounts => vec![count("/secrets"), count("/imagePullSecrets")],
+        ResourceKind::RoleBindings | ResourceKind::ClusterRoleBindings => {
+            vec![role_ref(raw), subjects_summary(raw)]
+        }
         ResourceKind::PodDisruptionBudgets => vec![
             int_or_str("/spec/minAvailable", raw),
             int_or_str("/spec/maxUnavailable", raw),
@@ -1354,6 +1357,49 @@ fn pv_claim(raw: &serde_json::Value) -> String {
         (Some(ns), Some(name)) => format!("{ns}/{name}"),
         (None, Some(name)) => name.to_string(),
         _ => "-".to_string(),
+    }
+}
+
+/// Role/ClusterRole referenced by a (Cluster)RoleBinding, as `kind/name` (e.g. `ClusterRole/view`).
+fn role_ref(raw: &serde_json::Value) -> String {
+    let kind = raw
+        .pointer("/roleRef/kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    let name = raw
+        .pointer("/roleRef/name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("-");
+    format!("{kind}/{name}")
+}
+
+/// Binding subjects as `abbrev:name` joined by commas (sa/u/g for ServiceAccount/User/Group).
+fn subjects_summary(raw: &serde_json::Value) -> String {
+    let Some(subjects) = raw.pointer("/subjects").and_then(|v| v.as_array()) else {
+        return "-".to_string();
+    };
+    let parts: Vec<String> = subjects
+        .iter()
+        .map(|s| {
+            let kind = s.pointer("/kind").and_then(serde_json::Value::as_str);
+            let name = s
+                .pointer("/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let abbr = match kind {
+                Some("ServiceAccount") => "sa",
+                Some("User") => "u",
+                Some("Group") => "g",
+                Some(other) => other,
+                None => "?",
+            };
+            format!("{abbr}:{name}")
+        })
+        .collect();
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(",")
     }
 }
 
@@ -1810,6 +1856,25 @@ mod tests {
                 "10Gi".to_string(),
                 "RWO".to_string(),
                 "gp3".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_columns_summarizes_rolebinding_role_and_subjects() {
+        let rb = json!({
+            "roleRef": { "kind": "ClusterRole", "name": "view" },
+            "subjects": [
+                { "kind": "ServiceAccount", "name": "build", "namespace": "ci" },
+                { "kind": "User", "name": "alice" }
+            ]
+        });
+        // headers: ROLE, SUBJECTS
+        assert_eq!(
+            extract_columns(ResourceKind::RoleBindings, &rb),
+            vec![
+                "ClusterRole/view".to_string(),
+                "sa:build,u:alice".to_string()
             ]
         );
     }
