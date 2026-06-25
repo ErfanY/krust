@@ -412,6 +412,8 @@ struct App {
     pod_metrics: HashMap<(String, String), (u64, u64)>,
     /// (context, namespace-scope, fetched-at) guarding the 15s metrics refresh.
     metrics_fetched: Option<(String, Option<String>, Instant)>,
+    /// Bumped whenever `pod_metrics` is replaced, so metric-sorted views recompute on refresh.
+    metrics_gen: u64,
 }
 
 /// Cluster-wide actual usage summed from node metrics (Phase 4.2).
@@ -574,6 +576,8 @@ struct LogViewState {
 struct CachedViewModel {
     revision: u64,
     request: ViewRequest,
+    /// Metrics generation the cached order was sorted against (only matters for metric sorts).
+    metrics_gen: u64,
     model: Arc<ViewModel>,
 }
 
@@ -613,18 +617,33 @@ impl Default for LogViewState {
 impl App {
     fn projected_view(&mut self, request: &ViewRequest) -> Arc<ViewModel> {
         let revision = self.store.revision();
+        // Metric-sorted views must also recompute when the usage map refreshes (~15s), which
+        // doesn't bump the store revision.
+        let metrics_gen = if request.sort.is_metric() {
+            self.metrics_gen
+        } else {
+            0
+        };
         let needs_recompute = self
             .view_cache
             .as_ref()
-            .map(|cached| cached.revision != revision || cached.request != *request)
+            .map(|cached| {
+                cached.revision != revision
+                    || cached.request != *request
+                    || cached.metrics_gen != metrics_gen
+            })
             .unwrap_or(true);
 
         if needs_recompute {
-            let model = Arc::new(self.projector.project(&self.store, request));
+            let mut model = self.projector.project(&self.store, request);
+            if request.sort.is_metric() {
+                self.sort_by_metric(&mut model.order, request.sort, request.descending);
+            }
             self.view_cache = Some(CachedViewModel {
                 revision,
                 request: request.clone(),
-                model,
+                metrics_gen,
+                model: Arc::new(model),
             });
         }
 
@@ -633,6 +652,37 @@ impl App {
             .expect("view cache must be set")
             .model
             .clone()
+    }
+
+    /// Re-order keys by a live metric column (CPU/MEM usage or request/limit %). Pods without
+    /// metrics sort as 0. Runs only on the (small) visible kind's key list for a metric sort.
+    fn sort_by_metric(&self, order: &mut [ResourceKey], sort: SortColumn, descending: bool) {
+        let key_value = |key: &ResourceKey| -> u64 {
+            let (cpu, mem) = self
+                .pod_usage(key.namespace.as_deref(), &key.name)
+                .unwrap_or((0, 0));
+            let res = self.store.get(key).and_then(|e| e.extracted.pod_resources);
+            let pct = |used: u64, denom: u64| {
+                if denom > 0 {
+                    used.saturating_mul(100) / denom
+                } else {
+                    0
+                }
+            };
+            match sort {
+                SortColumn::Cpu => cpu,
+                SortColumn::Mem => mem,
+                SortColumn::CpuReqPct => pct(cpu, res.map(|r| r.cpu_request_m).unwrap_or(0)),
+                SortColumn::CpuLimPct => pct(cpu, res.map(|r| r.cpu_limit_m).unwrap_or(0)),
+                SortColumn::MemReqPct => pct(mem, res.map(|r| r.mem_request_b).unwrap_or(0)),
+                SortColumn::MemLimPct => pct(mem, res.map(|r| r.mem_limit_b).unwrap_or(0)),
+                _ => 0,
+            }
+        };
+        order.sort_by(|a, b| {
+            let ord = key_value(a).cmp(&key_value(b)).then(a.name.cmp(&b.name));
+            if descending { ord.reverse() } else { ord }
+        });
     }
 
     fn view_request_for_tab(&self, tab: &ContextTabState) -> ViewRequest {
@@ -645,7 +695,12 @@ impl App {
                 None
             },
             filter: tab.filter.clone(),
-            sort: tab.sort,
+            // Pod-only sort columns don't apply to other kinds.
+            sort: if tab.kind() != ResourceKind::Pods && tab.sort.is_pod_only() {
+                SortColumn::Name
+            } else {
+                tab.sort
+            },
             descending: tab.descending,
             show_helm_secrets: tab.show_helm_secrets,
             // Drill-down only applies to the Pods view.
@@ -984,6 +1039,7 @@ impl App {
             discovery_cache: HashMap::new(),
             metrics: None,
             pod_metrics: HashMap::new(),
+            metrics_gen: 0,
             metrics_fetched: None,
         }
     }
@@ -1622,6 +1678,9 @@ impl App {
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
         tab.drill = None;
+        if tab.kind() != ResourceKind::Pods && tab.sort.is_pod_only() {
+            tab.sort = SortColumn::Name;
+        }
         tab.pane = Pane::Table;
         self.overlay = None;
     }
@@ -1640,6 +1699,9 @@ impl App {
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
         tab.drill = None;
+        if tab.kind() != ResourceKind::Pods && tab.sort.is_pod_only() {
+            tab.sort = SortColumn::Name;
+        }
         tab.pane = Pane::Table;
         self.overlay = None;
     }
@@ -1686,14 +1748,15 @@ impl App {
     }
 
     fn cycle_sort(&mut self) {
+        // Step to the next column in left-to-right display order for the current kind.
+        let cols = sortable_columns(self.current_tab().kind());
         let tab = self.current_tab_mut();
-        // Advance to the next column in left-to-right table order (not an arbitrary jump).
-        tab.sort = match tab.sort {
-            SortColumn::Namespace => SortColumn::Name,
-            SortColumn::Name => SortColumn::Status,
-            SortColumn::Status => SortColumn::Age,
-            SortColumn::Age => SortColumn::Namespace,
-        };
+        let next = cols
+            .iter()
+            .position(|c| *c == tab.sort)
+            .map(|i| (i + 1) % cols.len())
+            .unwrap_or(0);
+        tab.sort = cols[next];
     }
 
     fn toggle_helm_secrets(&mut self) {
@@ -1768,6 +1831,9 @@ impl App {
                 tab.detail_scroll = 0;
                 tab.detail_hscroll = 0;
                 tab.drill = None;
+                if tab.kind() != ResourceKind::Pods && tab.sort.is_pod_only() {
+                    tab.sort = SortColumn::Name;
+                }
                 tab.pane = Pane::Table;
                 tab.kind().to_string()
             };
@@ -1970,6 +2036,7 @@ impl App {
                 .collect(),
             Err(_) => HashMap::new(),
         };
+        self.metrics_gen = self.metrics_gen.wrapping_add(1);
 
         self.metrics_fetched = Some((context, namespace, Instant::now()));
     }
@@ -2313,6 +2380,37 @@ fn context_filtered_indices(contexts: &[String], filter: &str) -> Vec<usize> {
     list_filtered_indices(contexts, filter)
 }
 
+/// Columns the `s`/`:sort` cycle steps through, in left-to-right display order. Pods expose the
+/// metric and identity columns too; other kinds only the universal four.
+fn sortable_columns(kind: ResourceKind) -> &'static [SortColumn] {
+    const UNIVERSAL: &[SortColumn] = &[
+        SortColumn::Namespace,
+        SortColumn::Name,
+        SortColumn::Status,
+        SortColumn::Age,
+    ];
+    const PODS: &[SortColumn] = &[
+        SortColumn::Namespace,
+        SortColumn::Name,
+        SortColumn::Status,
+        SortColumn::Age,
+        SortColumn::Restarts,
+        SortColumn::Cpu,
+        SortColumn::CpuReqPct,
+        SortColumn::CpuLimPct,
+        SortColumn::Mem,
+        SortColumn::MemReqPct,
+        SortColumn::MemLimPct,
+        SortColumn::Ip,
+        SortColumn::Node,
+    ];
+    if kind == ResourceKind::Pods {
+        PODS
+    } else {
+        UNIVERSAL
+    }
+}
+
 /// Kinds the xray ownership forest draws — watched while an xray overlay is open so it populates.
 const XRAY_WATCH_KINDS: [ResourceKind; 7] = [
     ResourceKind::Deployments,
@@ -2578,6 +2676,7 @@ impl App {
     fn seed_pod_metrics_for_test(&mut self, namespace: &str, name: &str, cpu_m: u64, mem_b: u64) {
         self.pod_metrics
             .insert((namespace.to_string(), name.to_string()), (cpu_m, mem_b));
+        self.metrics_gen = self.metrics_gen.wrapping_add(1);
     }
 
     /// Inject correlated events directly (tests don't run the async events fetch).
@@ -3724,20 +3823,66 @@ mod tests {
     }
 
     #[test]
-    fn cycle_sort_follows_left_to_right_column_order() {
-        let mut app = test_app();
-        // Default is Name; `s` should advance in visual column order, not jump around.
+    fn cycle_sort_steps_through_columns_in_display_order() {
+        let mut app = test_app(); // default kind is Pods
         app.current_tab_mut().sort = SortColumn::Namespace;
-        let order = [
+        // `s` advances left-to-right through every pod column, then wraps.
+        let pod_order = [
             SortColumn::Name,
             SortColumn::Status,
             SortColumn::Age,
-            SortColumn::Namespace,
+            SortColumn::Restarts,
+            SortColumn::Cpu,
+            SortColumn::CpuReqPct,
+            SortColumn::CpuLimPct,
+            SortColumn::Mem,
+            SortColumn::MemReqPct,
+            SortColumn::MemLimPct,
+            SortColumn::Ip,
+            SortColumn::Node,
+            SortColumn::Namespace, // wrap
         ];
-        for expected in order {
+        for expected in pod_order {
             app.cycle_sort();
             assert_eq!(app.current_tab().sort, expected);
         }
+
+        // On a non-pod kind the cycle is just the four universal columns, and a pod-only sort
+        // is normalized away when switching kinds.
+        app.current_tab_mut().sort = SortColumn::Cpu;
+        let dep = ResourceKind::ORDERED
+            .iter()
+            .position(|k| *k == ResourceKind::Deployments)
+            .unwrap();
+        app.current_tab_mut().kind_idx = dep; // direct set, then normalize via cycle
+        app.cycle_sort();
+        assert!(
+            !app.current_tab().sort.is_pod_only(),
+            "pod-only sort dropped on non-pod"
+        );
+    }
+
+    #[test]
+    fn metric_sort_orders_pods_by_live_usage() {
+        let mut app = test_app();
+        for (name, cpu) in [("low", 100u64), ("high", 900u64), ("mid", 500u64)] {
+            app.store.apply(StateDelta::Upsert(mk_entity(
+                "ctx-dev",
+                ResourceKind::Pods,
+                Some("default"),
+                name,
+                "Running",
+            )));
+            app.seed_pod_metrics_for_test("default", name, cpu, 0);
+        }
+        app.current_tab_mut().sort = SortColumn::Cpu;
+        app.current_tab_mut().descending = true;
+
+        let tab = app.current_tab().clone();
+        let req = app.view_request_for_tab(&tab);
+        let vm = app.projected_view(&req);
+        let names: Vec<String> = vm.order.iter().map(|k| k.name.clone()).collect();
+        assert_eq!(names, vec!["high", "mid", "low"], "sorted by cpu desc");
     }
 
     #[tokio::test]
@@ -3754,16 +3899,21 @@ mod tests {
         app.execute_colon_command("sort ns asc").await;
         assert_eq!(app.current_tab().sort, SortColumn::Namespace);
         assert!(!app.current_tab().descending);
-        assert_eq!(app.status_line, "Sort: namespace asc");
+        assert_eq!(app.status_line, "Sort: ns asc");
 
         // No args reports current state without changing it.
         app.execute_colon_command("sort").await;
         assert_eq!(app.current_tab().sort, SortColumn::Namespace);
-        assert_eq!(app.status_line, "Sort: namespace asc");
+        assert_eq!(app.status_line, "Sort: ns asc");
 
-        // Unknown column is rejected and leaves sort unchanged.
+        // A metric column sorts the pods view (default kind is Pods).
+        app.execute_colon_command("sort cpu desc").await;
+        assert_eq!(app.current_tab().sort, SortColumn::Cpu);
+        assert_eq!(app.status_line, "Sort: cpu desc");
+
+        // Unknown column is rejected and leaves sort unchanged (still Cpu from above).
         app.execute_colon_command("sort bogus").await;
-        assert_eq!(app.current_tab().sort, SortColumn::Namespace);
+        assert_eq!(app.current_tab().sort, SortColumn::Cpu);
         assert!(app.status_line.starts_with("Usage: :sort"));
     }
 

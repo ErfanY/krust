@@ -61,8 +61,11 @@ krust --all-contexts
 - `H`: show/hide Helm release secrets (Secrets view; hidden by default)
 
 The active sort column is marked in the table header with a direction arrow (`Name ↑` ascending,
-`Status ↓` descending), and the top status bar shows `[SORT] <col><arrow>`. You can also set sort
-explicitly with `:sort <name|namespace|status|age> [asc|desc]`.
+`Status ↓` descending), and the top status bar shows `[SORT] <col><arrow>`. `s` steps left-to-right
+through every column of the current view — for pods that includes `Restarts`, the live `CPU`/`MEM`
+usage, the `%CPU/R %CPU/L %MEM/R %MEM/L` right-sizing columns, `IP`, and `Node`. Set sort explicitly
+with `:sort <ns|name|status|age|restarts|cpu|cpu/r|cpu/l|mem|mem/r|mem/l|ip|node> [asc|desc]`.
+(Metric sorts reorder on each metrics refresh, so the order is stable between refreshes.)
 - `ctrl+d`: delete (guarded, table only); `ctrl+k`: kill (delete)
 - `?`: toggle help (table) / search (detail panes)
 - `esc`: clear filter (table) / close view (detail) / cancel pending action
@@ -165,7 +168,7 @@ Common command mode entries:
 - `:<resource>` browse any discovered resource/CRD (e.g. `:endpoints`, `:widgets`); `:<resource> <name>` describes one
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
-- `:sort <name|namespace|status|age> [asc|desc]` set the table sort column/direction
+- `:sort <ns|name|status|age|restarts|cpu|cpu/r|cpu/l|mem|mem/r|mem/l|ip|node> [asc|desc]` set sort
 - `:helm [show|hide]` toggle (or set) visibility of Helm release secrets in the Secrets list
 
 ## Triage (what needs attention)

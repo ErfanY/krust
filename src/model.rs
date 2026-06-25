@@ -395,10 +395,84 @@ pub enum Pane {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
-    Name,
+    // Universal columns (all kinds), in display order.
     Namespace,
+    Name,
     Status,
     Age,
+    // Pods-only columns. Restarts/Ip/Node sort from entity fields; the metric columns
+    // (Cpu/Mem and the request/limit percentages) are sorted by the live usage map.
+    Restarts,
+    Cpu,
+    CpuReqPct,
+    CpuLimPct,
+    Mem,
+    MemReqPct,
+    MemLimPct,
+    Ip,
+    Node,
+}
+
+impl SortColumn {
+    /// True if this column is sorted from the live metrics map rather than store fields.
+    pub fn is_metric(self) -> bool {
+        matches!(
+            self,
+            SortColumn::Cpu
+                | SortColumn::CpuReqPct
+                | SortColumn::CpuLimPct
+                | SortColumn::Mem
+                | SortColumn::MemReqPct
+                | SortColumn::MemLimPct
+        )
+    }
+
+    /// True if this column only exists in the Pods view.
+    pub fn is_pod_only(self) -> bool {
+        !matches!(
+            self,
+            SortColumn::Namespace | SortColumn::Name | SortColumn::Status | SortColumn::Age
+        )
+    }
+
+    /// Canonical short label (shown in the `[SORT]` indicator and accepted by `:sort`).
+    pub fn label(self) -> &'static str {
+        match self {
+            SortColumn::Namespace => "ns",
+            SortColumn::Name => "name",
+            SortColumn::Status => "status",
+            SortColumn::Age => "age",
+            SortColumn::Restarts => "restarts",
+            SortColumn::Cpu => "cpu",
+            SortColumn::CpuReqPct => "cpu/r",
+            SortColumn::CpuLimPct => "cpu/l",
+            SortColumn::Mem => "mem",
+            SortColumn::MemReqPct => "mem/r",
+            SortColumn::MemLimPct => "mem/l",
+            SortColumn::Ip => "ip",
+            SortColumn::Node => "node",
+        }
+    }
+
+    /// Parse a `:sort` column token (case-insensitive; accepts a few aliases).
+    pub fn parse(token: &str) -> Option<SortColumn> {
+        match token.to_ascii_lowercase().as_str() {
+            "name" => Some(SortColumn::Name),
+            "namespace" | "ns" => Some(SortColumn::Namespace),
+            "status" => Some(SortColumn::Status),
+            "age" => Some(SortColumn::Age),
+            "restarts" | "rst" => Some(SortColumn::Restarts),
+            "cpu" => Some(SortColumn::Cpu),
+            "cpu/r" | "%cpu/r" | "cpureq" => Some(SortColumn::CpuReqPct),
+            "cpu/l" | "%cpu/l" | "cpulim" => Some(SortColumn::CpuLimPct),
+            "mem" => Some(SortColumn::Mem),
+            "mem/r" | "%mem/r" | "memreq" => Some(SortColumn::MemReqPct),
+            "mem/l" | "%mem/l" | "memlim" => Some(SortColumn::MemLimPct),
+            "ip" => Some(SortColumn::Ip),
+            "node" => Some(SortColumn::Node),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

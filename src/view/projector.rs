@@ -142,6 +142,12 @@ impl ViewProjector for SimpleViewProjector {
                 SortColumn::Namespace => a.key.namespace.cmp(&b.key.namespace),
                 SortColumn::Status => a.status.cmp(&b.status),
                 SortColumn::Age => a.age.cmp(&b.age),
+                SortColumn::Restarts => a.extracted.restarts.cmp(&b.extracted.restarts),
+                SortColumn::Ip => a.extracted.pod_ip.cmp(&b.extracted.pod_ip),
+                SortColumn::Node => a.extracted.node_name.cmp(&b.extracted.node_name),
+                // Metric columns are re-sorted by the App (which holds the usage map); use a
+                // stable name base here.
+                _ => a.key.name.cmp(&b.key.name),
             };
             if request.descending {
                 ord.reverse()

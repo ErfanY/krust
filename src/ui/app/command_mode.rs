@@ -252,18 +252,15 @@ impl App {
             }
             "sort" => {
                 if let Some(token) = args.first() {
-                    let column = match token.to_ascii_lowercase().as_str() {
-                        "name" => Some(SortColumn::Name),
-                        "namespace" | "ns" => Some(SortColumn::Namespace),
-                        "status" => Some(SortColumn::Status),
-                        "age" => Some(SortColumn::Age),
-                        _ => None,
-                    };
-                    let Some(column) = column else {
-                        self.status_line =
-                            "Usage: :sort name|namespace|status|age [asc|desc]".to_string();
+                    let Some(column) = SortColumn::parse(token) else {
+                        self.status_line = "Usage: :sort <ns|name|status|age|restarts|cpu|cpu/r|cpu/l|mem|mem/r|mem/l|ip|node> [asc|desc]".to_string();
                         return false;
                     };
+                    if column.is_pod_only() && self.current_tab().kind() != ResourceKind::Pods {
+                        self.status_line =
+                            format!("Sort by {} only applies to pods", column.label());
+                        return false;
+                    }
                     let tab = self.current_tab_mut();
                     tab.sort = column;
                     match args.get(1).map(|d| d.to_ascii_lowercase()) {
@@ -273,14 +270,8 @@ impl App {
                     }
                 }
                 let tab = self.current_tab();
-                let col = match tab.sort {
-                    SortColumn::Name => "name",
-                    SortColumn::Namespace => "namespace",
-                    SortColumn::Status => "status",
-                    SortColumn::Age => "age",
-                };
                 let dir = if tab.descending { "desc" } else { "asc" };
-                self.status_line = format!("Sort: {col} {dir}");
+                self.status_line = format!("Sort: {} {dir}", tab.sort.label());
                 false
             }
             "kind" => {
