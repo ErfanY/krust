@@ -194,8 +194,10 @@ Root problem: full object JSON kept for every entity.
   full k9s readonly surface vs krust (grounded in the k9s README keybindings + commands docs) and
   marks each ✅/🟡/❌/⛔. Mutations explicitly scoped out (readonly-first v1). Prioritized gaps to
   close next, highest value first:
-  - **Enter drill-down** (deploy/rs/sts/ds→pods, node→pods, svc→endpoints/pods) — biggest gap; the
-    owner→pod mapping already exists (log fan-in).
+  - [x] **Enter drill-down** — DONE (deploy/rs/sts/ds→pods via owner chain, node→pods via
+    scheduled-node). Live filter on the Pods view (`DrillFilter` in `ViewRequest`), `[DRILL]` title,
+    `esc` pops back to the owner list; cleared on any kind/namespace change. (svc→endpoints deferred
+    — needs the service selector, not currently extracted.)
   - **Previous logs** (`--previous` toggle) for crashloops.
   - **xray** relationship-tree view (replace stub).
   - Medium: jump-to-owner (`Shift-J`), UsedBy/dependents (`U`), log timestamps, pod metric-column

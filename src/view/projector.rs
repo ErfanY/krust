@@ -16,6 +16,64 @@ pub struct ViewRequest {
     /// When false (default), Helm release secrets (`type: helm.sh/release.v1`) are hidden from the
     /// Secrets list to cut clutter. No effect on other kinds.
     pub show_helm_secrets: bool,
+    /// When set (Pods view only), restrict the list to pods belonging to an owning resource —
+    /// a workload (Deployment/ReplicaSet/StatefulSet/DaemonSet) or a Node. Drives Enter drill-down.
+    pub drill: Option<DrillFilter>,
+}
+
+/// Identifies an owner whose child pods a drill-down view should show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrillFilter {
+    pub owner_kind: ResourceKind,
+    pub owner_name: String,
+}
+
+impl DrillFilter {
+    /// True if `pod` belongs to this owner. For Deployments the ownership is transitive through
+    /// the pod's ReplicaSet (resolved via `store`); other workloads and Nodes match directly.
+    fn matches(
+        &self,
+        store: &StateStore,
+        context: &str,
+        pod: &crate::model::ResourceEntity,
+    ) -> bool {
+        match self.owner_kind {
+            ResourceKind::ReplicaSets => pod.extracted.owned_by("ReplicaSet", &self.owner_name),
+            ResourceKind::StatefulSets => pod.extracted.owned_by("StatefulSet", &self.owner_name),
+            ResourceKind::DaemonSets => pod.extracted.owned_by("DaemonSet", &self.owner_name),
+            ResourceKind::Nodes => {
+                pod.extracted.node_name.as_deref() == Some(self.owner_name.as_str())
+            }
+            ResourceKind::Deployments => {
+                let prefix = format!("{}-", self.owner_name);
+                pod.extracted
+                    .owners
+                    .iter()
+                    .filter(|owner| owner.kind == "ReplicaSet")
+                    .any(|owner| {
+                        // Authoritative: the RS is in the store and owned by this deployment.
+                        let rs_key = ResourceKey::new(
+                            context,
+                            ResourceKind::ReplicaSets,
+                            pod.key.namespace.clone(),
+                            owner.name.clone(),
+                        );
+                        let by_store = store.get(&rs_key).is_some_and(|rs| {
+                            rs.extracted.owned_by("Deployment", &self.owner_name)
+                        });
+                        // Fallback when the RS isn't loaded yet (or RBAC-denied): a deployment's
+                        // RS is always named `<deploy>-<pod-template-hash>`, hash having no `-`,
+                        // which keeps `web` from matching `web-api`'s ReplicaSets.
+                        let by_name = owner
+                            .name
+                            .strip_prefix(&prefix)
+                            .is_some_and(|hash| !hash.is_empty() && !hash.contains('-'));
+                        by_store || by_name
+                    })
+            }
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +127,13 @@ impl ViewProjector for SimpleViewProjector {
         // Helm release secrets are noise in day-to-day browsing; hidden unless explicitly shown.
         if request.kind == ResourceKind::Secrets && !request.show_helm_secrets {
             entities.retain(|entity| !entity.is_helm_release());
+        }
+
+        // Enter drill-down: restrict the Pods view to one owner's pods.
+        if request.kind == ResourceKind::Pods
+            && let Some(drill) = &request.drill
+        {
+            entities.retain(|entity| drill.matches(store, &request.context, entity));
         }
 
         entities.sort_by(|a, b| {
@@ -288,12 +353,128 @@ mod tests {
                 sort: SortColumn::Name,
                 descending: false,
                 show_helm_secrets: false,
+                drill: None,
             },
         );
 
         assert_eq!(vm.len(), 1);
         let row = materialize_row(&store, vm.key(0).expect("one match")).expect("row materializes");
         assert_eq!(row.name, "worker");
+    }
+
+    fn put_entity(
+        store: &mut StateStore,
+        kind: ResourceKind,
+        name: &str,
+        extracted: crate::model::Extracted,
+    ) {
+        store.apply(StateDelta::Upsert(ResourceEntity {
+            key: ResourceKey::new("ctx", kind, Some("ns".to_string()), name),
+            status: "-".to_string(),
+            age: Some(Utc::now()),
+            labels: vec![],
+            columns: vec![],
+            extracted,
+        }));
+    }
+
+    fn owner(kind: &str, name: &str) -> crate::model::OwnerRef {
+        crate::model::OwnerRef {
+            kind: kind.to_string(),
+            name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn drill_down_filters_pods_by_owner_chain_and_node() {
+        use crate::model::Extracted;
+        let mut store = StateStore::default();
+        // dep1 -> rs1 -> p1 ; unrelated p2 ; p3 on node-a
+        put_entity(
+            &mut store,
+            ResourceKind::ReplicaSets,
+            "rs1",
+            Extracted {
+                owners: vec![owner("Deployment", "dep1")],
+                ..Default::default()
+            },
+        );
+        put_entity(
+            &mut store,
+            ResourceKind::Pods,
+            "p1",
+            Extracted {
+                owners: vec![owner("ReplicaSet", "rs1")],
+                ..Default::default()
+            },
+        );
+        put_entity(&mut store, ResourceKind::Pods, "p2", Extracted::default());
+        put_entity(
+            &mut store,
+            ResourceKind::Pods,
+            "p3",
+            Extracted {
+                node_name: Some("node-a".to_string()),
+                ..Default::default()
+            },
+        );
+        // p4's ReplicaSet ("dep1-77c") isn't in the store — must still match dep1 by name convention.
+        put_entity(
+            &mut store,
+            ResourceKind::Pods,
+            "p4",
+            Extracted {
+                owners: vec![owner("ReplicaSet", "dep1-77c")],
+                ..Default::default()
+            },
+        );
+
+        let projector = SimpleViewProjector;
+        let req = |drill: Option<DrillFilter>| ViewRequest {
+            context: "ctx".to_string(),
+            kind: ResourceKind::Pods,
+            namespace: None,
+            filter: String::new(),
+            sort: SortColumn::Name,
+            descending: false,
+            show_helm_secrets: false,
+            drill,
+        };
+        let names =
+            |vm: ViewModel| -> Vec<String> { vm.order.iter().map(|k| k.name.clone()).collect() };
+
+        // Deployment ownership: p1 (transitive via stored rs1) + p4 (RS not stored, name fallback).
+        let dep = projector.project(
+            &store,
+            &req(Some(DrillFilter {
+                owner_kind: ResourceKind::Deployments,
+                owner_name: "dep1".to_string(),
+            })),
+        );
+        assert_eq!(names(dep), vec!["p1".to_string(), "p4".to_string()]);
+
+        // Direct ReplicaSet ownership: only p1.
+        let rs = projector.project(
+            &store,
+            &req(Some(DrillFilter {
+                owner_kind: ResourceKind::ReplicaSets,
+                owner_name: "rs1".to_string(),
+            })),
+        );
+        assert_eq!(names(rs), vec!["p1".to_string()]);
+
+        // Node scheduling: only p3.
+        let node = projector.project(
+            &store,
+            &req(Some(DrillFilter {
+                owner_kind: ResourceKind::Nodes,
+                owner_name: "node-a".to_string(),
+            })),
+        );
+        assert_eq!(names(node), vec!["p3".to_string()]);
+
+        // No drill: all four pods.
+        assert_eq!(names(projector.project(&store, &req(None))).len(), 4);
     }
 
     fn put_secret(store: &mut StateStore, name: &str, secret_type: &str) {
@@ -326,6 +507,7 @@ mod tests {
             sort: SortColumn::Name,
             descending: false,
             show_helm_secrets,
+            drill: None,
         };
 
         // Default: the helm release secret is filtered out.
@@ -364,6 +546,7 @@ mod tests {
                     sort: SortColumn::Name,
                     descending: false,
                     show_helm_secrets: false,
+                    drill: None,
                 },
             )
             .order
@@ -432,6 +615,7 @@ mod tests {
             sort: SortColumn::Name,
             descending: false,
             show_helm_secrets: false,
+            drill: None,
         };
 
         let start = Instant::now();

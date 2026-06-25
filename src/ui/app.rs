@@ -70,7 +70,9 @@ use crate::{
         StateDelta,
     },
     state::StateStore,
-    view::{SimpleViewProjector, ViewModel, ViewProjector, ViewRequest, materialize_row},
+    view::{
+        DrillFilter, SimpleViewProjector, ViewModel, ViewProjector, ViewRequest, materialize_row,
+    },
 };
 
 mod bench;
@@ -99,6 +101,9 @@ struct ContextTabState {
     descending: bool,
     /// Show Helm release secrets in the Secrets list (default false — they're hidden clutter).
     show_helm_secrets: bool,
+    /// Active Enter drill-down (Pods view scoped to an owner). Cleared on kind/namespace change
+    /// or Esc in the table.
+    drill: Option<DrillFilter>,
     pane: Pane,
 }
 
@@ -622,6 +627,12 @@ impl App {
             sort: tab.sort,
             descending: tab.descending,
             show_helm_secrets: tab.show_helm_secrets,
+            // Drill-down only applies to the Pods view.
+            drill: if tab.kind() == ResourceKind::Pods {
+                tab.drill.clone()
+            } else {
+                None
+            },
         }
     }
 
@@ -904,6 +915,7 @@ impl App {
                 sort: SortColumn::Name,
                 descending: false,
                 show_helm_secrets: false,
+                drill: None,
                 pane: Pane::Table,
             })
             .collect();
@@ -1275,6 +1287,11 @@ impl App {
                 self.status_line = "Closed view".to_string();
             } else if self.clear_active_filter_value() {
                 self.status_line = self.filter_status_message("");
+            } else if let Some(owner_kind) = self.current_tab().drill.as_ref().map(|d| d.owner_kind)
+            {
+                // Pop the drill-down back to the owner's list (krust has no view stack).
+                self.set_active_kind(owner_kind);
+                self.status_line = format!("Drill-down cleared → {owner_kind}");
             } else {
                 self.status_line = "Nothing to cancel".to_string();
             }
@@ -1531,6 +1548,7 @@ impl App {
         tab.selected = 0;
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
+        tab.drill = None;
         tab.pane = Pane::Table;
         self.overlay = None;
     }
@@ -1548,6 +1566,7 @@ impl App {
         tab.selected = 0;
         tab.detail_scroll = 0;
         tab.detail_hscroll = 0;
+        tab.drill = None;
         tab.pane = Pane::Table;
         self.overlay = None;
     }
@@ -1561,6 +1580,7 @@ impl App {
             let tab = self.current_tab_mut();
             tab.namespace = None;
             tab.selected = 0;
+            tab.drill = None;
             tab.pane = Pane::Table;
             self.status_line = "Namespace filter cleared".to_string();
             return;
@@ -1584,6 +1604,7 @@ impl App {
                 }
             }
             tab.selected = 0;
+            tab.drill = None;
             tab.pane = Pane::Table;
             tab.namespace.clone()
         };
@@ -1672,6 +1693,7 @@ impl App {
                 tab.selected = 0;
                 tab.detail_scroll = 0;
                 tab.detail_hscroll = 0;
+                tab.drill = None;
                 tab.pane = Pane::Table;
                 tab.kind().to_string()
             };
@@ -1719,6 +1741,18 @@ impl App {
         if tab.pane == Pane::Events {
             set.insert(WatchTarget {
                 kind: ResourceKind::Events,
+                namespace: tab.namespace.clone(),
+            });
+        }
+
+        // A Deployment drill-down resolves pods transitively through their ReplicaSet, so the RS
+        // for the drilled namespace must be watched too (otherwise the chain finds nothing).
+        if tab.kind() == ResourceKind::Pods
+            && let Some(drill) = &tab.drill
+            && drill.owner_kind == ResourceKind::Deployments
+        {
+            set.insert(WatchTarget {
+                kind: ResourceKind::ReplicaSets,
                 namespace: tab.namespace.clone(),
             });
         }
@@ -3209,6 +3243,73 @@ mod tests {
             "helm shown after toggle: {snap}"
         );
         assert!(snap.contains("helm shown"), "title hint: {snap}");
+    }
+
+    #[test]
+    fn enter_on_deployment_drills_into_its_pods() {
+        let mut app = test_app();
+        let dep_idx = ResourceKind::ORDERED
+            .iter()
+            .position(|k| *k == ResourceKind::Deployments)
+            .expect("deployments in ORDERED");
+        app.current_tab_mut().kind_idx = dep_idx;
+
+        // dep1 -> rs1 -> p1 ; unrelated p2
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Deployments,
+            Some("default"),
+            "dep1",
+            "1/1 ready",
+        )));
+        let mut rs = mk_entity(
+            "ctx-dev",
+            ResourceKind::ReplicaSets,
+            Some("default"),
+            "rs1",
+            "-",
+        );
+        rs.extracted.owners = vec![crate::model::OwnerRef {
+            kind: "Deployment".to_string(),
+            name: "dep1".to_string(),
+        }];
+        app.store.apply(StateDelta::Upsert(rs));
+        let mut p1 = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "p1",
+            "Running",
+        );
+        p1.extracted.owners = vec![crate::model::OwnerRef {
+            kind: "ReplicaSet".to_string(),
+            name: "rs1".to_string(),
+        }];
+        app.store.apply(StateDelta::Upsert(p1));
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "p2",
+            "Running",
+        )));
+
+        app.handle_enter_key();
+
+        // Switched to a Pods view scoped to dep1.
+        assert_eq!(app.current_tab().kind(), ResourceKind::Pods);
+        let drill = app.current_tab().drill.as_ref().expect("drill set");
+        assert_eq!(drill.owner_kind, ResourceKind::Deployments);
+        assert_eq!(drill.owner_name, "dep1");
+
+        let snap = render_snapshot(&mut app, 140, 20);
+        assert!(
+            snap.contains("[DRILL] deploy/dep1"),
+            "drill indicator: {snap}"
+        );
+        // p1 (owned by dep1 via rs1) shows; the unrelated p2 is filtered out.
+        assert!(snap.contains("default"), "owned pod row present: {snap}");
+        assert!(!snap.contains("p2"), "unrelated pod hidden: {snap}");
     }
 
     #[test]

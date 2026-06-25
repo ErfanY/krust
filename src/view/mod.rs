@@ -1,5 +1,6 @@
 mod projector;
 
 pub use projector::{
-    SimpleViewProjector, ViewModel, ViewProjector, ViewRequest, ViewRow, materialize_row,
+    DrillFilter, SimpleViewProjector, ViewModel, ViewProjector, ViewRequest, ViewRow,
+    materialize_row,
 };
