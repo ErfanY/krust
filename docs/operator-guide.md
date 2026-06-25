@@ -154,11 +154,37 @@ Common command mode entries:
 - `:ns` namespaces
 - `:po`, `:deploy`, `:svc`, `:ing`, `:cm`, `:sec`, etc.
 - `:api [filter]` list all API resources/CRDs discovered on the context
+- `:xray [namespace|all]` open the namespace ownership graph (workloads → pods → containers)
 - `:<resource>` browse any discovered resource/CRD (e.g. `:endpoints`, `:widgets`); `:<resource> <name>` describes one
 - `:fmt yaml|json`
 - `:edit [yaml|json]`
 - `:sort <name|namespace|status|age> [asc|desc]` set the table sort column/direction
 - `:helm [show|hide]` toggle (or set) visibility of Helm release secrets in the Secrets list
+
+## XRay (relationship graph)
+
+`:xray [namespace]` opens a live ownership graph of a namespace — a single forest rooted at the
+namespace, grouping every workload down to its pods and containers:
+
+```
+ns/default
+├─ deploy/api → rs/api-7d9 → po/… → ctr/…
+├─ sts/db → po/db-0 → ctr/…
+├─ ds/agent → po/…
+├─ cj/backup → job/… → po/…
+├─ job/migrate → po/…
+└─ po/debug                 (standalone — no controller)
+```
+
+`:xray` defaults to the current namespace; `:xray all` covers the whole cluster (grouped by
+namespace). It renders as a real tree with box-drawing connectors (`├──`/`└──`/`│`) and `▾`/`▸`
+expand markers; each node carries a severity-colored status. Navigate with `j`/`k` (or up/down),
+`g`/`G` for top/bottom; `→`/`←` expand/collapse the node under the cursor (`Enter` toggles), `esc`
+to close.
+
+The graph rebuilds from live cluster state each frame and opening it watches the workload kinds it
+draws, so it populates within a moment and tracks the cluster as it changes. Large graphs are
+truncated with `… N more` nodes (collapse subtrees to keep it manageable).
 
 ## Detail Pane Behavior
 

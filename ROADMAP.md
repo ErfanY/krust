@@ -201,7 +201,13 @@ Root problem: full object JSON kept for every entity.
   - [x] **Previous logs** — DONE. `P` in the logs pane toggles the previous (terminated) container
     instance (`kubectl logs -p`) as a one-shot fetch (no follow/reconnect); status line shows
     `instance:current|previous`. Plumbing (`PodLogRequest.previous`) already existed.
-  - **xray** relationship-tree view (replace stub).
+  - [x] **xray** — DONE. `:xray [ns|all]` opens a live **cluster ownership graph** — a
+    namespace-rooted forest (ns → deploy/rs, sts, ds, cj/job, bare rs, standalone pods → pods →
+    containers), not a per-kind tree. Rebuilt from store state each frame; opening it watches the
+    workload kinds it draws. Proper tree rendering: box-drawing connectors (`├──`/`└──`/`│`),
+    `▾`/`▸` expand markers, severity-colored status, selectable cursor (`j`/`k`/`g`/`G`), `Enter`
+    expand/collapse (state keyed by node id, survives rebuild). Truncates with `… N more` (no silent
+    caps). Cross-cutting relations (node, PVC, service) intentionally left to Enter-drill/describe.
   - Medium: jump-to-owner (`Shift-J`), UsedBy/dependents (`U`), log timestamps, pod metric-column
     sort, inline `:pod /term`/`@ctx`.
   - Decide: popeye sanitizer (large, separable); pulses dashboard (likely redundant with the

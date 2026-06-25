@@ -187,6 +187,10 @@ impl App {
                         };
                     }
                 }
+
+                if matches!(self.overlay, Some(Overlay::Xray { .. })) {
+                    self.toggle_xray_collapse();
+                }
             }
             KeyCode::Char(' ') => {
                 if let Some(Overlay::LogSources {
@@ -224,10 +228,18 @@ impl App {
                 self.scroll_overlay_or_select(1);
             }
             KeyCode::Left => {
-                self.scroll_overlay_horizontal(-4);
+                if matches!(self.overlay, Some(Overlay::Xray { .. })) {
+                    self.set_xray_collapsed(true);
+                } else {
+                    self.scroll_overlay_horizontal(-4);
+                }
             }
             KeyCode::Right => {
-                self.scroll_overlay_horizontal(4);
+                if matches!(self.overlay, Some(Overlay::Xray { .. })) {
+                    self.set_xray_collapsed(false);
+                } else {
+                    self.scroll_overlay_horizontal(4);
+                }
             }
             KeyCode::PageUp => {
                 self.scroll_overlay_or_select(-10);
@@ -252,6 +264,13 @@ impl App {
                     *scroll = scroll.saturating_sub(delta.unsigned_abs() as u16);
                 } else {
                     *scroll = scroll.saturating_add(delta as u16);
+                }
+            }
+            Some(Overlay::Xray { selected, .. }) => {
+                if delta < 0 {
+                    *selected = selected.saturating_sub(delta.unsigned_abs() as usize);
+                } else {
+                    *selected = selected.saturating_add(delta as usize);
                 }
             }
             Some(Overlay::Contexts {
@@ -340,6 +359,7 @@ impl App {
     pub(super) fn overlay_home(&mut self) {
         match &mut self.overlay {
             Some(Overlay::Text { scroll, .. }) => *scroll = 0,
+            Some(Overlay::Xray { selected, .. }) => *selected = 0,
             Some(Overlay::Contexts {
                 contexts,
                 selected,
@@ -374,6 +394,8 @@ impl App {
     pub(super) fn overlay_end(&mut self) {
         match &mut self.overlay {
             Some(Overlay::Text { scroll, .. }) => *scroll = u16::MAX,
+            // Clamped to the row count in render.
+            Some(Overlay::Xray { selected, .. }) => *selected = usize::MAX,
             Some(Overlay::Contexts {
                 contexts,
                 selected,

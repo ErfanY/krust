@@ -465,6 +465,19 @@ impl App {
             .style(theme.block);
         frame.render_widget(pulse_widget, chunks[1]);
 
+        // The xray tree is rebuilt from store state each frame; compute its rows before the
+        // mutable borrow of `self.overlay` below (building them needs `&self`).
+        let xray_rows = if let Some(Overlay::Xray {
+            namespace,
+            collapsed,
+            ..
+        }) = &self.overlay
+        {
+            Some(self.xray_rows(namespace.as_deref(), collapsed))
+        } else {
+            None
+        };
+
         if let Some(overlay) = &mut self.overlay {
             match overlay {
                 Overlay::Text {
@@ -495,6 +508,61 @@ impl App {
                         paragraph = paragraph.wrap(Wrap { trim: false });
                     }
                     frame.render_widget(paragraph, chunks[2]);
+                }
+                Overlay::Xray {
+                    namespace,
+                    selected,
+                    ..
+                } => {
+                    let scope = namespace.as_deref().unwrap_or("all namespaces");
+                    let rows = xray_rows.unwrap_or_default();
+                    let title = format!(
+                        "[XRAY] {scope} ({}) | j/k move · enter expand/collapse · esc close",
+                        rows.len()
+                    );
+                    let block = Block::default().borders(Borders::ALL).title(title);
+                    if rows.is_empty() {
+                        frame.render_widget(
+                            Paragraph::new("(loading… resources appear as their watches populate)")
+                                .block(block)
+                                .style(theme.block),
+                            chunks[2],
+                        );
+                    } else {
+                        *selected = (*selected).min(rows.len().saturating_sub(1));
+                        let dim = Style::default().fg(Color::DarkGray);
+                        let table_rows: Vec<Row<'_>> = rows
+                            .iter()
+                            .map(|r| {
+                                let mut spans = vec![Span::styled(r.connectors.clone(), dim)];
+                                spans.push(Span::raw(if r.has_children {
+                                    format!("{} ", r.marker)
+                                } else {
+                                    "  ".to_string()
+                                }));
+                                if r.kind.is_empty() {
+                                    spans.push(Span::styled(r.name.clone(), dim));
+                                } else {
+                                    spans.push(Span::styled(format!("{}/", r.kind), dim));
+                                    spans.push(Span::raw(r.name.clone()));
+                                }
+                                if let Some(status) = &r.status {
+                                    spans.push(Span::raw("  "));
+                                    spans.push(Span::styled(
+                                        format!("{} {status}", severity_tag(r.severity)),
+                                        severity_style(&theme, r.severity),
+                                    ));
+                                }
+                                Row::new(vec![Cell::from(Line::from(spans))])
+                            })
+                            .collect();
+                        let table = Table::new(table_rows, [Constraint::Percentage(100)])
+                            .block(block)
+                            .row_highlight_style(theme.row_highlight);
+                        let mut state =
+                            ratatui::widgets::TableState::default().with_selected(Some(*selected));
+                        frame.render_stateful_widget(table, chunks[2], &mut state);
+                    }
                 }
                 Overlay::Contexts {
                     title,
@@ -1129,6 +1197,14 @@ impl App {
                     "j/k or up/down scroll",
                     "w wrap",
                     "left/right h-scroll",
+                    "Esc close",
+                ]
+                .join(" | "),
+                Overlay::Xray { .. } => [
+                    "overlay:xray-graph",
+                    "j/k move",
+                    "←/→ or Enter collapse/expand",
+                    "g/G top/bottom",
                     "Esc close",
                 ]
                 .join(" | "),
