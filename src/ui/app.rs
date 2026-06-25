@@ -26,6 +26,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
+    style::{Color, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
 };
@@ -81,6 +82,7 @@ mod detail_pane;
 mod logs;
 mod overlay;
 mod render_loop;
+mod xray;
 
 #[derive(Debug, Clone)]
 struct ContextTabState {
@@ -176,6 +178,15 @@ enum Overlay {
         scroll: u16,
         hscroll: u16,
         wrap: bool,
+    },
+    /// Live cluster relationship graph (`:xray`): a namespace-rooted ownership forest
+    /// (ns → controllers → pods → containers). Holds the scope + view state (cursor, collapsed
+    /// nodes), not the rows — rows are rebuilt from the store each frame so the tree tracks the
+    /// cluster. `namespace` is None for the whole cluster. Collapsed nodes are keyed by stable id.
+    Xray {
+        namespace: Option<String>,
+        selected: usize,
+        collapsed: HashSet<String>,
     },
     Contexts {
         title: String,
@@ -806,7 +817,7 @@ impl App {
                 | Overlay::LogSources { filter, .. } => {
                     return filter.clone();
                 }
-                Overlay::Text { .. } => {}
+                Overlay::Text { .. } | Overlay::Xray { .. } => {}
             }
         }
         let tab = self.current_tab();
@@ -834,7 +845,7 @@ impl App {
                 } => {
                     *overlay_filter = filter;
                 }
-                Overlay::Text { .. } => {}
+                Overlay::Text { .. } | Overlay::Xray { .. } => {}
             }
             return;
         }
@@ -864,7 +875,7 @@ impl App {
                 Overlay::Contexts { .. }
                 | Overlay::Containers { .. }
                 | Overlay::LogSources { .. } => "Filter",
-                Overlay::Text { .. } => "Search",
+                Overlay::Text { .. } | Overlay::Xray { .. } => "Search",
             };
         }
         if self.current_tab().pane == Pane::Table {
@@ -1344,6 +1355,29 @@ impl App {
         if let Some(overlay) = &self.overlay {
             return match overlay {
                 Overlay::Text { lines, .. } => Some(lines.join("\n")),
+                Overlay::Xray {
+                    namespace,
+                    collapsed,
+                    ..
+                } => {
+                    let rows = self.xray_rows(namespace.as_deref(), collapsed);
+                    Some(
+                        rows.iter()
+                            .map(|r| {
+                                let status = r
+                                    .status
+                                    .as_deref()
+                                    .map(|s| format!("  {s}"))
+                                    .unwrap_or_default();
+                                format!(
+                                    "{}{} {}/{}{status}",
+                                    r.connectors, r.marker, r.kind, r.name
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    )
+                }
                 Overlay::Contexts {
                     contexts,
                     selected,
@@ -1781,7 +1815,20 @@ impl App {
 
     async fn ensure_active_watch(&mut self) {
         let tab = self.current_tab().clone();
-        let targets = Self::active_watch_targets(&tab);
+        let mut targets = Self::active_watch_targets(&tab);
+        // An open xray graph spans the whole ownership forest, so watch every kind it draws,
+        // scoped to its namespace (None = whole cluster).
+        if let Some(Overlay::Xray { namespace, .. }) = &self.overlay {
+            for kind in XRAY_WATCH_KINDS {
+                let target = WatchTarget {
+                    kind,
+                    namespace: namespace.clone(),
+                };
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
         if let Err(err) = self
             .resource_provider
             .replace_watch_plan(&tab.context, &targets)
@@ -2227,6 +2274,17 @@ fn health_icon(failed: usize, pending: usize) -> &'static str {
 fn context_filtered_indices(contexts: &[String], filter: &str) -> Vec<usize> {
     list_filtered_indices(contexts, filter)
 }
+
+/// Kinds the xray ownership forest draws — watched while an xray overlay is open so it populates.
+const XRAY_WATCH_KINDS: [ResourceKind; 7] = [
+    ResourceKind::Deployments,
+    ResourceKind::ReplicaSets,
+    ResourceKind::StatefulSets,
+    ResourceKind::DaemonSets,
+    ResourceKind::CronJobs,
+    ResourceKind::Jobs,
+    ResourceKind::Pods,
+];
 
 fn format_millicpu(value: u64) -> String {
     if value >= 1000 {
@@ -3255,6 +3313,111 @@ mod tests {
             "helm shown after toggle: {snap}"
         );
         assert!(snap.contains("helm shown"), "title hint: {snap}");
+    }
+
+    #[test]
+    fn xray_builds_owner_child_tree() {
+        let mut app = test_app();
+
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Deployments,
+            Some("default"),
+            "dep1",
+            "1/1 ready",
+        )));
+        let mut rs = mk_entity(
+            "ctx-dev",
+            ResourceKind::ReplicaSets,
+            Some("default"),
+            "rs1",
+            "-",
+        );
+        rs.extracted.owners = vec![crate::model::OwnerRef {
+            kind: "Deployment".to_string(),
+            name: "dep1".to_string(),
+        }];
+        app.store.apply(StateDelta::Upsert(rs));
+        let mut pod = mk_entity(
+            "ctx-dev",
+            ResourceKind::Pods,
+            Some("default"),
+            "p1",
+            "Running",
+        );
+        pod.extracted.owners = vec![crate::model::OwnerRef {
+            kind: "ReplicaSet".to_string(),
+            name: "rs1".to_string(),
+        }];
+        pod.extracted.containers = vec!["app".to_string()];
+        app.store.apply(StateDelta::Upsert(pod));
+
+        let empty = std::collections::HashSet::new();
+        let rows = app.xray_rows(Some("default"), &empty);
+        let labels: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{}/{}", r.kind, r.name))
+            .collect();
+        // Namespace-rooted forest: ns → deploy → rs → pod → container.
+        assert!(labels.contains(&"ns/default".to_string()), "{labels:?}");
+        assert!(labels.contains(&"deploy/dep1".to_string()), "{labels:?}");
+        assert!(labels.contains(&"rs/rs1".to_string()), "{labels:?}");
+        assert!(labels.contains(&"po/p1".to_string()), "{labels:?}");
+        assert!(labels.contains(&"ctr/app".to_string()), "{labels:?}");
+
+        let ns = rows.iter().find(|r| r.name == "default").expect("ns row");
+        assert!(ns.connectors.is_empty(), "ns root is flush-left");
+        let dep = rows.iter().find(|r| r.name == "dep1").expect("deploy row");
+        assert!(dep.has_children && dep.marker == '▾', "deploy expandable");
+        assert!(
+            dep.connectors.contains('─'),
+            "deploy nested under ns: {:?}",
+            dep.connectors
+        );
+
+        // Collapsing the namespace hides its whole subtree.
+        let mut collapsed = std::collections::HashSet::new();
+        collapsed.insert(ns.id.clone());
+        let rows = app.xray_rows(Some("default"), &collapsed);
+        assert_eq!(rows.len(), 1, "only the collapsed namespace remains");
+        assert_eq!(rows[0].marker, '▸', "collapsed marker");
+    }
+
+    #[test]
+    fn xray_arrow_keys_collapse_and_expand() {
+        let mut app = test_app();
+        app.store.apply(StateDelta::Upsert(mk_entity(
+            "ctx-dev",
+            ResourceKind::Deployments,
+            Some("default"),
+            "dep1",
+            "1/1 ready",
+        )));
+        app.show_xray_overlay(Some("default".to_string()));
+        // Cursor starts on the ns root (selected = 0), which has the deployment as a child.
+
+        let visible = |app: &App| -> usize {
+            let Some(super::Overlay::Xray {
+                namespace,
+                collapsed,
+                ..
+            }) = &app.overlay
+            else {
+                panic!("xray overlay");
+            };
+            app.xray_rows(namespace.as_deref(), collapsed).len()
+        };
+
+        let expanded = visible(&app);
+        assert!(expanded > 1, "ns starts expanded: {expanded}");
+
+        // Left collapses the namespace → only the ns row remains.
+        app.set_xray_collapsed(true);
+        assert_eq!(visible(&app), 1, "collapsed to ns root only");
+
+        // Right expands it again.
+        app.set_xray_collapsed(false);
+        assert_eq!(visible(&app), expanded, "re-expanded");
     }
 
     #[test]

@@ -389,7 +389,17 @@ impl App {
                 self.show_api_catalog(args.first().copied()).await;
                 false
             }
-            "pulse" | "pulses" | "pu" | "xray" | "popeye" | "pop" | "plugins" | "plugin" => {
+            "xray" => {
+                // :xray [namespace|all] — default to the current namespace; `all` = whole cluster.
+                let namespace = match args.first() {
+                    Some(token) if token.eq_ignore_ascii_case("all") => None,
+                    Some(token) => Some(token.to_string()),
+                    None => self.current_tab().namespace.clone(),
+                };
+                self.show_xray_overlay(namespace);
+                false
+            }
+            "pulse" | "pulses" | "pu" | "popeye" | "pop" | "plugins" | "plugin" => {
                 self.status_line =
                     format!("Command ':{cmd}' is recognized but not implemented yet");
                 false
