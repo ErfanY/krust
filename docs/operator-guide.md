@@ -52,7 +52,9 @@ krust --all-contexts
 - `tab` / `shift+tab`: switch context tabs
 - `j` / `k` (or arrows): move selection (table) / scroll (detail, logs)
 - `g` / `G`: top / bottom (in detail panes use `gg` for top)
-- `Enter`: select namespace in namespace view; otherwise open describe
+- `Enter`: drill down where it makes sense — namespace → its resources; Deployment/ReplicaSet/
+  StatefulSet/DaemonSet → their pods; Node → pods scheduled on it. Other kinds open describe.
+  In a drill-down the title shows `[DRILL] <owner> → Pods`; `esc` pops back to the owner list.
 - `d`: describe selected resource (toggles back to table)
 - `v`: view YAML; `t`: back to table; `E`: events pane (this resource's events); `l`: logs
 - `n`: cycle namespace; `s`: cycle sort column; `r`: reverse sort order

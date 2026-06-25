@@ -769,12 +769,22 @@ impl App {
                         (header, widths)
                     };
                     let title = if pods_view {
-                        let legend = if self.pod_metrics.is_empty() {
-                            "CPU/MEM: metrics-server n/a"
+                        if let Some(drill) = &active.drill {
+                            // Drill-down: lead with the owner so it's always visible (esc clears).
+                            format!(
+                                "[DRILL] {}/{} → Pods ({}) · esc clears",
+                                drill.owner_kind.short_name(),
+                                drill.owner_name,
+                                vm.len()
+                            )
                         } else {
-                            "CPU/MEM used · CR/CL = cpu %req/%lim · MR/ML = mem %req/%lim"
-                        };
-                        format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
+                            let legend = if self.pod_metrics.is_empty() {
+                                "CPU/MEM: metrics-server n/a"
+                            } else {
+                                "CPU/MEM used · CR/CL = cpu %req/%lim · MR/ML = mem %req/%lim"
+                            };
+                            format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
+                        }
                     } else if active.kind() == ResourceKind::Secrets {
                         let helm = if active.show_helm_secrets {
                             format!(

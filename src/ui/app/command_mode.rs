@@ -1,5 +1,19 @@
 use super::*;
 
+/// Kinds whose Enter drills into a filtered Pods view. Returns the owner kind itself when it
+/// supports drill-down, else None (leaf kinds fall through to describe).
+fn drill_owner_kind(kind: ResourceKind) -> Option<ResourceKind> {
+    matches!(
+        kind,
+        ResourceKind::Deployments
+            | ResourceKind::ReplicaSets
+            | ResourceKind::StatefulSets
+            | ResourceKind::DaemonSets
+            | ResourceKind::Nodes
+    )
+    .then_some(kind)
+}
+
 impl App {
     pub(super) fn handle_enter_key(&mut self) {
         if self.current_tab().pane != Pane::Table {
@@ -41,10 +55,45 @@ impl App {
             return;
         }
 
+        // Drill-down: Enter on a workload or node opens its pods (filtered Pods view).
+        if drill_owner_kind(row.key.kind).is_some() {
+            self.drill_into(&row);
+            return;
+        }
+
         self.current_tab_mut().pane = Pane::Describe;
         self.current_tab_mut().detail_scroll = 0;
         self.current_tab_mut().detail_hscroll = 0;
         self.status_line = format!("Describe: {} {}", row.key.kind.short_name(), row.key.name);
+    }
+
+    /// Switch to the Pods view scoped to the selected owner (Deployment/RS/STS/DS/Node).
+    fn drill_into(&mut self, row: &crate::view::ViewRow) {
+        let pods_idx = ResourceKind::ORDERED
+            .iter()
+            .position(|kind| *kind == ResourceKind::Pods)
+            .unwrap_or(0);
+        let owner_kind = row.key.kind;
+        let owner_name = row.key.name.clone();
+        let label = format!("{}/{}", owner_kind.short_name(), owner_name);
+        let tab = self.current_tab_mut();
+        // Node pods span namespaces; workload pods live in the owner's namespace.
+        if owner_kind != ResourceKind::Nodes {
+            tab.namespace = row.key.namespace.clone();
+        } else {
+            tab.namespace = None;
+        }
+        tab.drill = Some(DrillFilter {
+            owner_kind,
+            owner_name,
+        });
+        tab.kind_idx = pods_idx;
+        tab.last_non_namespace_kind_idx = pods_idx;
+        tab.selected = 0;
+        tab.table_offset = 0;
+        tab.pane = Pane::Table;
+        self.overlay = None;
+        self.status_line = format!("Drill-down: pods of {label} (esc to clear)");
     }
 
     pub(super) async fn handle_command_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
