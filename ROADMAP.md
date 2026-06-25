@@ -257,8 +257,14 @@ Root problem: full object JSON kept for every entity.
   worst-first. Also fixed `classify_status_severity` to flag `ImagePullBackOff`/`*BackOff` (was Ok)
   — improves table coloring too. The pods table also gained `RST` (restarts, colored ≥3/≥10),
   `IP`, and `NODE` columns (pod IP added to `Extracted`); metric headers are now the explicit
-  `%CPU/R`/`%CPU/L`/`%MEM/R`/`%MEM/L`. Next: per-tenant (namespace) health rollup; workload rollout
-  health (ready≠desired).
+  `%CPU/R`/`%CPU/L`/`%MEM/R`/`%MEM/L`. Right-sizing % columns now graduate green→yellow→red
+  (%R: ≥100 warn, ≥200 err; %L: ≥75 warn, ≥90 err). Next: per-tenant (namespace) health rollup;
+  workload rollout health (ready≠desired).
+- [ ] **5.7 Per-pod usage history (p95/max)** — keep a short rolling window of per-pod usage so
+  right-sizing reads from p95/max, not an instantaneous snapshot. Unblocks a reliable
+  **over-provisioned** (low-%R) signal — deliberately deferred from the high-side colors because a
+  snapshot-based "you're wasting resources" flag cries wolf on momentary idle dips. Also steadies
+  the high-side colors.
 - [ ] **5.3 Config defaults for large fleets** — review fps_limit / delta_channel_capacity /
   warm_contexts / TTL defaults; document tuning.
 - [ ] **5.4 Docs refresh** — architecture/performance/operator guides updated to new model.

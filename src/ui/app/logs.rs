@@ -505,7 +505,7 @@ impl App {
             .logs
             .last_error
             .as_ref()
-            .map(|_| " | err".to_string())
+            .map(|_| " · err".to_string())
             .unwrap_or_default();
         let source_filters = if self.logs.hidden_sources.is_empty() {
             "all".to_string()
@@ -514,7 +514,7 @@ impl App {
         };
 
         format!(
-            "Logs | target:{} | instance:{} | streams:{} | state:{} | src:{} | lines:{} | dropped:{} | paused-drop:{}{} | wrap:{}",
+            "[LOGS] {} · instance: {} · streams: {} · state: {} · src: {} · lines: {} · dropped: {} · paused-drop: {}{} · wrap: {}",
             target,
             instance,
             streams,

@@ -197,7 +197,6 @@ enum Overlay {
         selected: usize,
     },
     Contexts {
-        title: String,
         contexts: Vec<String>,
         selected: usize,
         filter: String,
@@ -210,7 +209,6 @@ enum Overlay {
         filter: String,
     },
     LogSources {
-        title: String,
         sources: Vec<String>,
         selected: usize,
         filter: String,
@@ -1463,7 +1461,7 @@ impl App {
                 let request = self.view_request_for_tab(&active);
                 let vm = self.projected_view(&request);
                 let mut lines = Vec::with_capacity(vm.len().saturating_add(1));
-                let mut header = String::from("namespace\tname\tstatus\tage");
+                let mut header = String::from("Namespace\tName\tStatus\tAge");
                 for col in active.kind().extra_columns() {
                     header.push('\t');
                     header.push_str(col.header);
@@ -1689,11 +1687,12 @@ impl App {
 
     fn cycle_sort(&mut self) {
         let tab = self.current_tab_mut();
+        // Advance to the next column in left-to-right table order (not an arbitrary jump).
         tab.sort = match tab.sort {
-            SortColumn::Name => SortColumn::Namespace,
-            SortColumn::Namespace => SortColumn::Status,
+            SortColumn::Namespace => SortColumn::Name,
+            SortColumn::Name => SortColumn::Status,
             SortColumn::Status => SortColumn::Age,
-            SortColumn::Age => SortColumn::Name,
+            SortColumn::Age => SortColumn::Namespace,
         };
     }
 
@@ -1920,13 +1919,13 @@ impl App {
             format!("Events for {kind} {} ({})", key.name, rows.len()),
             String::new(),
             format!(
-                "{:<8}  {:<8}  {:<26}  {:>4}  {:<10}  MESSAGE",
-                "LAST", "TYPE", "REASON", "CNT", "SOURCE"
+                "{:<8}  {:<8}  {:<26}  {:>5}  {:<10}  Message",
+                "Last", "Type", "Reason", "Count", "Source"
             ),
         ];
         for event in rows {
             out.push(format!(
-                "{:<8}  {:<8}  {:<26}  {:>4}  {:<10}  {}",
+                "{:<8}  {:<8}  {:<26}  {:>5}  {:<10}  {}",
                 short_age(event.last),
                 event.type_,
                 event.reason,
@@ -2390,15 +2389,17 @@ fn pod_usage_cells(
         used: render(used),
         req_pct: req_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
         lim_pct: lim_pct.map_or_else(|| "-".to_string(), |v| format!("{v}%")),
-        req_sev: if req_pct.is_some_and(|v| v >= 100) {
-            Severity::Warn
-        } else {
-            Severity::Ok
+        // Graduated green→yellow→red. Request (right-sizing): warn when over-requested, red when
+        // severely so. Limit (risk): warn when approaching, red at throttle/OOM range.
+        req_sev: match req_pct {
+            Some(v) if v >= 200 => Severity::Err,
+            Some(v) if v >= 100 => Severity::Warn,
+            _ => Severity::Ok,
         },
-        lim_sev: if lim_pct.is_some_and(|v| v >= 90) {
-            Severity::Err
-        } else {
-            Severity::Ok
+        lim_sev: match lim_pct {
+            Some(v) if v >= 90 => Severity::Err,
+            Some(v) if v >= 75 => Severity::Warn,
+            _ => Severity::Ok,
         },
     }
 }
@@ -3256,10 +3257,24 @@ mod tests {
             "mem %R/%L: {snap}"
         ); // 256/128, 256/512
         // restarts, IP, and node columns
-        assert!(snap.contains("RST"), "restarts header: {snap}");
+        assert!(snap.contains("Restarts"), "restarts header: {snap}");
         assert!(snap.contains('7'), "restart count: {snap}");
         assert!(snap.contains("10.0.1.23"), "pod ip: {snap}");
         assert!(snap.contains("ip-10-0-1-9.ec2.internal"), "node: {snap}");
+    }
+
+    #[test]
+    fn pod_usage_cell_severity_is_graduated() {
+        let cell =
+            |used, req, lim| super::pod_usage_cells(Some(used), req, lim, super::format_millicpu);
+        // %R (vs request): <100 ok · ≥100 warn · ≥200 err
+        assert_eq!(cell(50, 100, 100_000).req_sev, Severity::Ok);
+        assert_eq!(cell(150, 100, 100_000).req_sev, Severity::Warn);
+        assert_eq!(cell(250, 100, 100_000).req_sev, Severity::Err);
+        // %L (vs limit): <75 ok · ≥75 warn · ≥90 err
+        assert_eq!(cell(50, 100_000, 100).lim_sev, Severity::Ok);
+        assert_eq!(cell(80, 100_000, 100).lim_sev, Severity::Warn);
+        assert_eq!(cell(95, 100_000, 100).lim_sev, Severity::Err);
     }
 
     #[test]
@@ -3310,8 +3325,8 @@ mod tests {
 
         let snap = render_snapshot(&mut app, 160, 20);
         // kind-specific headers replace the old generic "Summary"
-        assert!(snap.contains("UP-TO-DATE"), "header: {snap}");
-        assert!(snap.contains("AVAILABLE"), "header: {snap}");
+        assert!(snap.contains("Up-to-date"), "header: {snap}");
+        assert!(snap.contains("Available"), "header: {snap}");
         assert!(!snap.contains("Summary"), "no generic summary col: {snap}");
         assert!(snap.contains("api"), "row name: {snap}");
     }
@@ -3708,6 +3723,23 @@ mod tests {
         assert!(!app.browse_dynamic("definitely-not-a-resource", None).await);
     }
 
+    #[test]
+    fn cycle_sort_follows_left_to_right_column_order() {
+        let mut app = test_app();
+        // Default is Name; `s` should advance in visual column order, not jump around.
+        app.current_tab_mut().sort = SortColumn::Namespace;
+        let order = [
+            SortColumn::Name,
+            SortColumn::Status,
+            SortColumn::Age,
+            SortColumn::Namespace,
+        ];
+        for expected in order {
+            app.cycle_sort();
+            assert_eq!(app.current_tab().sort, expected);
+        }
+    }
+
     #[tokio::test]
     async fn sort_command_sets_column_and_direction() {
         let mut app = test_app();
@@ -3778,8 +3810,8 @@ mod tests {
         app.current_tab_mut().detail_filter = "metadata".to_string();
 
         let snap = render_snapshot(&mut app, 120, 32);
-        assert!(snap.contains("Describe (yaml) | NORMAL"));
-        assert!(snap.contains("search:/metadata"));
+        assert!(snap.contains("[DESCRIBE] (yaml)"));
+        assert!(snap.contains("search: /metadata"));
     }
 
     #[test]
@@ -3826,10 +3858,10 @@ mod tests {
 
         let snap = render_snapshot(&mut app, 120, 32);
         assert!(snap.contains("[LG]"));
-        assert!(snap.contains("Logs | target:pod default/pod-a"));
+        assert!(snap.contains("[LOGS] pod default/pod-a"));
         assert!(snap.contains("[default/pod-a/main] line-1"));
         // Defaults to the current container instance.
-        assert!(snap.contains("instance:current"), "instance: {snap}");
+        assert!(snap.contains("instance: current"), "instance: {snap}");
     }
 
     #[tokio::test]
@@ -3857,7 +3889,7 @@ mod tests {
             app.logs.lines
         );
         assert!(
-            app.logs_title().contains("instance:previous"),
+            app.logs_title().contains("instance: previous"),
             "{}",
             app.logs_title()
         );
@@ -3865,7 +3897,7 @@ mod tests {
         app.toggle_previous_logs().await;
         assert!(!app.logs.previous, "toggled back to current");
         assert!(
-            app.logs_title().contains("instance:current"),
+            app.logs_title().contains("instance: current"),
             "{}",
             app.logs_title()
         );

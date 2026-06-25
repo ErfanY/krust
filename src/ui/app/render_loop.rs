@@ -503,7 +503,7 @@ impl App {
 
                     let mut paragraph = Paragraph::new(body)
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "[TXT] {} | wrap:{}",
+                            "[TEXT] {} · wrap: {} · esc close",
                             title,
                             if *wrap { "on" } else { "off" }
                         )))
@@ -522,7 +522,7 @@ impl App {
                     let scope = namespace.as_deref().unwrap_or("all namespaces");
                     let rows = xray_rows.unwrap_or_default();
                     let title = format!(
-                        "[XRAY] {scope} ({}) | j/k move · enter expand/collapse · esc close",
+                        "[XRAY] {scope} ({}) · j/k move · ←/→ collapse/expand · esc close",
                         rows.len()
                     );
                     let block = Block::default().borders(Borders::ALL).title(title);
@@ -586,7 +586,7 @@ impl App {
                             String::new()
                         };
                         format!(
-                            "[TRIAGE] {scope} · {errs} critical · {warns} warning{capped} | j/k move · esc close"
+                            "[TRIAGE] {scope} ({total}) · {errs} critical · {warns} warning{capped} · j/k move · esc close"
                         )
                     };
                     let block = Block::default().borders(Borders::ALL).title(title);
@@ -603,12 +603,12 @@ impl App {
                         *selected = (*selected).min(items.len().saturating_sub(1));
                         let header = Row::new(vec![
                             Cell::from(""),
-                            Cell::from("NAMESPACE"),
-                            Cell::from("POD"),
-                            Cell::from("REASON"),
-                            Cell::from("RESTARTS"),
-                            Cell::from("READY"),
-                            Cell::from("AGE"),
+                            Cell::from("Namespace"),
+                            Cell::from("Pod"),
+                            Cell::from("Reason"),
+                            Cell::from("Restarts"),
+                            Cell::from("Ready"),
+                            Cell::from("Age"),
                         ])
                         .style(theme.table_header);
                         let rows: Vec<Row<'_>> = items
@@ -647,7 +647,6 @@ impl App {
                     }
                 }
                 Overlay::Contexts {
-                    title,
                     contexts,
                     selected,
                     filter,
@@ -677,11 +676,12 @@ impl App {
                     let table = Table::new(rows, [Constraint::Length(2), Constraint::Min(10)])
                         .header(Row::new(vec!["", "Context"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "[CTX] {title} (Enter switch, '/' filter, Esc close) | filter:{}",
+                            "[CONTEXTS] ({}){} · enter switch · / filter · esc close",
+                            contexts.len(),
                             if filter.is_empty() {
-                                "-"
+                                String::new()
                             } else {
-                                filter.as_str()
+                                format!(" · filter: {filter}")
                             }
                         )))
                         .row_highlight_style(theme.row_highlight);
@@ -723,11 +723,12 @@ impl App {
                     let table = Table::new(rows, [Constraint::Min(10)])
                         .header(Row::new(vec!["Container"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "[CTR] {title} (Enter select, '/' filter, Esc close) | filter:{}",
+                            "[CONTAINERS] {title} ({}){} · enter select · / filter · esc close",
+                            containers.len(),
                             if filter.is_empty() {
-                                "-"
+                                String::new()
                             } else {
-                                filter.as_str()
+                                format!(" · filter: {filter}")
                             }
                         )))
                         .row_highlight_style(theme.row_highlight);
@@ -742,7 +743,6 @@ impl App {
                     frame.render_stateful_widget(table, chunks[2], &mut state);
                 }
                 Overlay::LogSources {
-                    title,
                     sources,
                     selected,
                     filter,
@@ -776,11 +776,12 @@ impl App {
                     let table = Table::new(rows, [Constraint::Length(4), Constraint::Min(10)])
                         .header(Row::new(vec!["Use", "Source"]).style(theme.table_header))
                         .block(Block::default().borders(Borders::ALL).title(format!(
-                            "[SRC] {title} (Enter/Space toggle, 'a' show all, '/' filter, Esc close) | filter:{}",
+                            "[SOURCES] ({}){} · enter/space toggle · a all · / filter · esc close",
+                            sources.len(),
                             if filter.is_empty() {
-                                "-"
+                                String::new()
                             } else {
-                                filter.as_str()
+                                format!(" · filter: {filter}")
                             }
                         )))
                         .row_highlight_style(theme.row_highlight);
@@ -897,7 +898,7 @@ impl App {
                                 mark("Name", SortColumn::Name),
                                 mark("Status", SortColumn::Status),
                                 mark("Age", SortColumn::Age),
-                                num_head("RST"),
+                                num_head("Restarts"),
                                 num_head("CPU"),
                                 num_head("%CPU/R"),
                                 num_head("%CPU/L"),
@@ -905,14 +906,14 @@ impl App {
                                 num_head("%MEM/R"),
                                 num_head("%MEM/L"),
                                 Cell::from("IP"),
-                                Cell::from("NODE"),
+                                Cell::from("Node"),
                             ],
                             vec![
                                 Constraint::Length(16),
                                 Constraint::Min(18),
                                 Constraint::Length(16),
                                 Constraint::Length(6),
-                                Constraint::Length(4),
+                                Constraint::Length(8),
                                 Constraint::Length(8),
                                 Constraint::Length(7),
                                 Constraint::Length(7),
@@ -942,22 +943,23 @@ impl App {
                         }
                         (header, widths)
                     };
+                    // Panel-title convention: [TAG] subject (count) · meta… · hints…
+                    let kind_tag = active.kind().to_string().to_uppercase();
                     let title = if pods_view {
                         if let Some(drill) = &active.drill {
-                            // Drill-down: lead with the owner so it's always visible (esc clears).
                             format!(
-                                "[DRILL] {}/{} → Pods ({}) · esc clears",
+                                "[DRILL] {}/{} → pods ({}) · esc close",
                                 drill.owner_kind.short_name(),
                                 drill.owner_name,
                                 vm.len()
                             )
                         } else {
                             let legend = if self.pod_metrics.is_empty() {
-                                "CPU/MEM: metrics-server n/a"
+                                "CPU/MEM = metrics-server n/a"
                             } else {
                                 "CPU/MEM = live usage · %·/R vs request · %·/L vs limit"
                             };
-                            format!("[KIND] {} ({}) · {legend}", active.kind(), vm.len())
+                            format!("[{kind_tag}] ({}) · {legend}", vm.len())
                         }
                     } else if active.kind() == ResourceKind::Secrets {
                         let helm = if active.show_helm_secrets {
@@ -971,9 +973,9 @@ impl App {
                                 self.keymap.hint(Action::ToggleHelmSecrets)
                             )
                         };
-                        format!("[KIND] {} ({}) · {helm}", active.kind(), vm.len())
+                        format!("[{kind_tag}] ({}) · {helm}", vm.len())
                     } else {
-                        format!("[KIND] {} ({})", active.kind(), vm.len())
+                        format!("[{kind_tag}] ({})", vm.len())
                     };
                     let table = Table::new(rows, widths)
                         .header(Row::new(header).style(theme.table_header))
@@ -1014,14 +1016,14 @@ impl App {
                         };
                         (tab.detail_scroll, tab.detail_hscroll, tab.detail_wrap)
                     };
-                    let pane_title = match active.pane {
-                        Pane::Describe => "Describe",
-                        Pane::SecretDecode => "Decode",
-                        Pane::Events => "Events",
-                        Pane::Logs => "Logs",
-                        Pane::Table => "Table",
+                    let pane_tag = match active.pane {
+                        Pane::Describe => "DESCRIBE",
+                        Pane::SecretDecode => "DECODE",
+                        Pane::Events => "EVENTS",
+                        Pane::Logs => "LOGS",
+                        Pane::Table => "TABLE",
                     };
-                    let pane_title = format!("{pane_title} ({})", active.detail_format.label());
+                    let pane_title = format!("[{pane_tag}] ({})", active.detail_format.label());
                     let search_query = active.detail_filter.trim();
                     let match_lines = search_match_lines(&body, search_query);
                     let active_line = resolved_active_match_line(
@@ -1125,10 +1127,10 @@ impl App {
                     }
                     let total_lines = logs_line_count.max(1);
                     let title = format!(
-                        "{} | {}",
+                        "{} · {}",
                         self.logs_title(),
                         detail_viewer_title(
-                            "VIEWER",
+                            "find",
                             detail_wrap,
                             search_query,
                             match_lines.as_slice(),
