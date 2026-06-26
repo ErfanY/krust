@@ -114,6 +114,7 @@ pub async fn run() -> anyhow::Result<()> {
         cli.readonly,
         app_config.runtime.fps_limit,
         app_config.ui.show_help,
+        app_config.runtime.metrics_interval_secs,
     )
     .await
 }

@@ -228,6 +228,7 @@ pub async fn run(
     readonly: bool,
     fps_limit: u16,
     show_help: bool,
+    metrics_interval_secs: u64,
 ) -> anyhow::Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -249,6 +250,7 @@ pub async fn run(
         keymap,
         readonly,
         show_help,
+        metrics_interval_secs,
     );
 
     app.ensure_active_watch().await;
@@ -354,6 +356,7 @@ pub async fn run_bench(
         keymap,
         readonly,
         false,
+        5,
     );
     app.run_bench(
         delta_rx,
@@ -414,6 +417,8 @@ struct App {
     metrics_fetched: Option<(String, Option<String>, Instant)>,
     /// Bumped whenever `pod_metrics` is replaced, so metric-sorted views recompute on refresh.
     metrics_gen: u64,
+    /// How often live metrics are re-fetched (config `runtime.metrics_interval_secs`).
+    metrics_interval: Duration,
 }
 
 /// Cluster-wide actual usage summed from node metrics (Phase 4.2).
@@ -965,6 +970,7 @@ impl App {
         keymap: Keymap,
         readonly: bool,
         show_help: bool,
+        metrics_interval_secs: u64,
     ) -> Self {
         let tabs: Vec<ContextTabState> = contexts
             .iter()
@@ -1040,6 +1046,7 @@ impl App {
             metrics: None,
             pod_metrics: HashMap::new(),
             metrics_gen: 0,
+            metrics_interval: Duration::from_secs(metrics_interval_secs.max(1)),
             metrics_fetched: None,
         }
     }
@@ -2003,15 +2010,16 @@ impl App {
         out.join("\n")
     }
 
-    /// Refresh live usage (metrics.k8s.io) for the active context+namespace, at most every 15s:
-    /// cluster totals (node metrics) for the pulse and per-pod usage for the table columns. On any
-    /// error/absence (no metrics-server) the caches clear and the UI degrades — never blocks.
+    /// Refresh live usage (metrics.k8s.io) for the active context+namespace, at most once per
+    /// `metrics_interval` (config `runtime.metrics_interval_secs`, default 5s): cluster totals (node
+    /// metrics) for the pulse and per-pod usage for the table columns. On any error/absence (no
+    /// metrics-server) the caches clear and the UI degrades — never blocks.
     async fn maybe_refresh_metrics(&mut self) {
         let context = self.current_tab().context.clone();
         let namespace = self.current_tab().namespace.clone();
         let stale = match &self.metrics_fetched {
             Some((ctx, ns, at)) => {
-                ctx != &context || ns != &namespace || at.elapsed() > Duration::from_secs(15)
+                ctx != &context || ns != &namespace || at.elapsed() > self.metrics_interval
             }
             None => true,
         };
@@ -2894,6 +2902,7 @@ mod tests {
             Keymap::default(),
             false,
             true,
+            5,
         )
     }
 

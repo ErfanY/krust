@@ -225,6 +225,14 @@ Root problem: full object JSON kept for every entity.
 - [~] **5.2 Reconnect-storm & mixed-RBAC soak** — partial: the 5.1 soak exercised periodic watcher
   relists (every ~20s) under load with flat fds + RSS (no reconnect/fd leak). Still TODO: explicit
   forced-reconnect storm and a mixed-RBAC (some 403) context.
+  **Per-context auth resilience** (DONE): a context that can't authenticate (expired SSO / exec-auth
+  failure) no longer aborts startup — provider client warmup is best-effort, and `replace_watch_plan`
+  records a per-context `StateDelta::Error` (shown as `[XX]` with the message) instead of failing the
+  call. Other contexts stay usable; the broken one recovers on a later watch tick once creds refresh.
+  Test: bad-context watch plan records an error delta and returns Ok.
+- [x] **5.8 Configurable metrics refresh interval** — `runtime.metrics_interval_secs` (default **5s**,
+  down from a hardcoded 15s; k9s polls every 2s). Lower = more live, bounded by metrics-server's
+  ~15s sample resolution; raise on large fleets to cut API load.
 - [~] **5.0 UX consistency (labels/keybindings/help)** — ongoing pass to keep each view's help,
   labels, and key hints accurate. Done so far: per-pane help corrected (table no longer claims
   detail-only `ctrl+d/u` paging or `gg`; added namespace/sort/reverse/events/help/close hints);

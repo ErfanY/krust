@@ -135,14 +135,20 @@ impl KubeResourceProvider {
             delta_tx: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         };
 
-        // Optional eager auth/client warmup.
+        // Optional eager auth/client warmup. Best-effort: a context that fails to authenticate
+        // (e.g. an expired SSO token) must not abort startup — the other clusters stay usable and
+        // the broken one surfaces its error when its watches run. Warmup just primes the cache.
         if options.all_contexts {
             let contexts = provider.contexts.clone();
             for context in contexts {
-                provider.client_for_context(&context).await?;
+                if let Err(err) = provider.client_for_context(&context).await {
+                    warn!(context = %context, error = %err, "context auth/client warmup failed");
+                }
             }
-        } else if let Some(context) = provider.default_context.clone() {
-            provider.client_for_context(&context).await?;
+        } else if let Some(context) = provider.default_context.clone()
+            && let Err(err) = provider.client_for_context(&context).await
+        {
+            warn!(context = %context, error = %err, "default context auth/client warmup failed");
         }
 
         Ok(provider)
@@ -219,7 +225,21 @@ impl ResourceProvider for KubeResourceProvider {
             .as_ref()
             .cloned()
             .context("resource provider is not started")?;
-        let client = self.client_for_context(context).await?;
+        // A context whose client can't be built (e.g. expired SSO / exec-auth failure) records a
+        // per-context error for the UI instead of failing the call — other contexts keep working,
+        // and a later retry recovers once credentials are refreshed.
+        let client = match self.client_for_context(context).await {
+            Ok(client) => client,
+            Err(err) => {
+                let _ = tx
+                    .send(StateDelta::Error {
+                        context: context.to_string(),
+                        message: format!("auth/connect failed: {err}"),
+                    })
+                    .await;
+                return Ok(());
+            }
+        };
         let now = Instant::now();
 
         let warm_contexts = {
@@ -1510,8 +1530,8 @@ mod tests {
         extract_status, is_forbidden_watcher_error, next_watch_backoff, select_warm_contexts,
     };
     use crate::{
-        cluster::ActionExecutor,
-        model::{ResourceKey, ResourceKind},
+        cluster::{ActionExecutor, ResourceProvider, WatchTarget},
+        model::{ResourceKey, ResourceKind, StateDelta},
     };
     use kube::config::Kubeconfig;
     use std::{
@@ -1519,6 +1539,7 @@ mod tests {
         time::{Duration, Instant},
     };
     use tokio::sync::Mutex;
+    use tokio::sync::mpsc;
 
     // Representative non-trivial pod (labels, annotations, 2 containers w/ env+resources, status).
     fn representative_pod_json() -> serde_json::Value {
@@ -1891,6 +1912,30 @@ mod tests {
             watched: std::sync::Arc::new(Mutex::new(HashMap::new())),
             context_last_active: std::sync::Arc::new(Mutex::new(HashMap::new())),
             delta_tx: std::sync::Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_plan_records_error_for_unauthorized_context_without_failing() {
+        // The readonly provider's "ctx" has no entry in its (empty) kubeconfig, so building a
+        // client fails — standing in for an expired-auth/unreachable context.
+        let provider = readonly_provider();
+        let (tx, mut rx) = mpsc::channel(8);
+        provider.start(tx).await.expect("start");
+
+        let targets = [WatchTarget {
+            kind: ResourceKind::Pods,
+            namespace: None,
+        }];
+        let result = provider.replace_watch_plan("ctx", &targets).await;
+        assert!(result.is_ok(), "a bad context must not fail the call");
+
+        match rx.try_recv() {
+            Ok(StateDelta::Error { context, message }) => {
+                assert_eq!(context, "ctx");
+                assert!(message.contains("auth/connect failed"), "{message}");
+            }
+            other => panic!("expected a per-context Error delta, got {other:?}"),
         }
     }
 

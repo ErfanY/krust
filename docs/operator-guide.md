@@ -250,6 +250,9 @@ fps_limit = 60
 delta_channel_capacity = 2048
 warm_contexts = 1
 warm_context_ttl_secs = 20
+# How often to re-fetch live metrics. metrics-server usually produces a new sample only every
+# ~15s, so values much below that mostly re-fetch identical numbers; raise on large fleets.
+metrics_interval_secs = 5
 
 [ui]
 theme = "default"
@@ -280,6 +283,12 @@ Clipboard issues:
 Auth mismatch vs shell:
 - run from shell session where `kubectl` is already working
 - ensure exec auth dependencies are available in PATH
+
+One context failing auth (e.g. expired SSO token):
+- does **not** abort startup or other contexts — krust starts with the working clusters
+- the failed context shows a watch error (`[XX]`) with the auth message; switch tabs to a healthy one
+- it recovers on its own once credentials refresh (krust retries the client on the next watch tick),
+  or refresh manually in your shell (e.g. `aws sso login`)
 
 ## Related Docs
 
