@@ -32,6 +32,10 @@ pub struct RuntimeConfig {
     pub delta_channel_capacity: usize,
     pub warm_contexts: usize,
     pub warm_context_ttl_secs: u64,
+    /// How often to re-fetch live metrics (metrics.k8s.io). metrics-server typically only produces
+    /// a new sample every ~15s, so polling much faster mostly re-fetches identical numbers; lower
+    /// for a more live feel at the cost of API load on large fleets.
+    pub metrics_interval_secs: u64,
 }
 
 impl Default for RuntimeConfig {
@@ -41,6 +45,7 @@ impl Default for RuntimeConfig {
             delta_channel_capacity: 2048,
             warm_contexts: 1,
             warm_context_ttl_secs: 20,
+            metrics_interval_secs: 5,
         }
     }
 }
