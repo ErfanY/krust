@@ -229,11 +229,16 @@ pub async fn run(
     fps_limit: u16,
     show_help: bool,
     metrics_interval_secs: u64,
+    mouse_capture: bool,
 ) -> anyhow::Result<()> {
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-        .context("failed to enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
+    // Mouse capture enables scroll-wheel but disables the terminal's native text selection, so it's
+    // opt-out (config `ui.mouse_capture`, runtime `:mouse`).
+    if mouse_capture {
+        execute!(stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+    }
 
     let _guard = TerminalGuard;
     let backend = CrosstermBackend::new(stdout);
@@ -251,6 +256,7 @@ pub async fn run(
         readonly,
         show_help,
         metrics_interval_secs,
+        mouse_capture,
     );
 
     app.ensure_active_watch().await;
@@ -357,6 +363,7 @@ pub async fn run_bench(
         readonly,
         false,
         5,
+        false,
     );
     app.run_bench(
         delta_rx,
@@ -419,6 +426,9 @@ struct App {
     metrics_gen: u64,
     /// How often live metrics are re-fetched (config `runtime.metrics_interval_secs`).
     metrics_interval: Duration,
+    /// Whether the mouse is currently captured (scroll wheel on, native selection off). Toggled at
+    /// runtime with `:mouse`.
+    mouse_capture: bool,
 }
 
 /// Cluster-wide actual usage summed from node metrics (Phase 4.2).
@@ -974,6 +984,7 @@ impl App {
         readonly: bool,
         show_help: bool,
         metrics_interval_secs: u64,
+        mouse_capture: bool,
     ) -> Self {
         let tabs: Vec<ContextTabState> = contexts
             .iter()
@@ -1050,6 +1061,7 @@ impl App {
             pod_metrics: HashMap::new(),
             metrics_gen: 0,
             metrics_interval: Duration::from_secs(metrics_interval_secs.max(1)),
+            mouse_capture,
             metrics_fetched: None,
         }
     }
@@ -1775,6 +1787,23 @@ impl App {
             .map(|i| (i + 1) % cols.len())
             .unwrap_or(0);
         tab.sort = cols[next];
+    }
+
+    /// Toggle mouse capture at runtime. Capturing enables scroll-wheel but blocks the terminal's
+    /// native click-drag text selection; releasing it does the reverse.
+    fn set_mouse_capture(&mut self, capture: bool) {
+        self.mouse_capture = capture;
+        let mut stdout = io::stdout();
+        let result = if capture {
+            execute!(stdout, EnableMouseCapture)
+        } else {
+            execute!(stdout, DisableMouseCapture)
+        };
+        self.status_line = match result {
+            Ok(()) if capture => "Mouse: captured (scroll on, text selection off)".to_string(),
+            Ok(()) => "Mouse: released (text selection on, scroll off)".to_string(),
+            Err(err) => format!("Mouse toggle failed: {err}"),
+        };
     }
 
     fn toggle_helm_secrets(&mut self) {
@@ -2914,6 +2943,7 @@ mod tests {
             false,
             true,
             5,
+            true,
         )
     }
 
@@ -3903,6 +3933,18 @@ mod tests {
         let vm = app.projected_view(&req);
         let names: Vec<String> = vm.order.iter().map(|k| k.name.clone()).collect();
         assert_eq!(names, vec!["high", "mid", "low"], "sorted by cpu desc");
+    }
+
+    #[tokio::test]
+    async fn mouse_command_toggles_capture() {
+        let mut app = test_app(); // starts captured
+        assert!(app.mouse_capture);
+        app.execute_colon_command("mouse off").await;
+        assert!(!app.mouse_capture);
+        app.execute_colon_command("mouse on").await;
+        assert!(app.mouse_capture);
+        app.execute_colon_command("mouse").await; // bare toggle
+        assert!(!app.mouse_capture);
     }
 
     #[tokio::test]

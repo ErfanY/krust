@@ -261,6 +261,10 @@ metrics_interval_secs = 5
 [ui]
 theme = "default"
 show_help = true
+# Capture the mouse for scroll-wheel. When true (default), the terminal's native click-drag text
+# selection is disabled while krust runs. Set false (or toggle at runtime with `:mouse`) to keep
+# native selection — `y`/`:dump` copy from within krust either way.
+mouse_capture = true
 ```
 
 Defaults for initial context/namespace follow kubeconfig unless overridden by CLI flags.
@@ -283,6 +287,13 @@ Slow startup:
 
 Clipboard issues:
 - tries `pbcopy`/`wl-copy`/`xclip`/`xsel`, then OSC52 fallback
+
+Can't select/copy text with the mouse:
+- krust captures the mouse for scroll-wheel, which disables the terminal's native selection
+- run `:mouse` (or `:mouse off`) to release it — native click-drag selection then works; `:mouse on`
+  re-enables scroll. Set `[ui] mouse_capture = false` to default to released.
+- or hold the terminal's bypass modifier while dragging (Option in iTerm2, Fn/Option in Terminal.app)
+- or copy from within krust: `y` (current view) / `:dump` (whole table)
 
 Auth mismatch vs shell:
 - run from shell session where `kubectl` is already working

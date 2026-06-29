@@ -230,6 +230,16 @@ impl App {
                 self.status_line = "Namespace: all".to_string();
                 false
             }
+            "mouse" => {
+                // :mouse [on|off] — toggle if no arg. Off restores native terminal text selection.
+                let capture = match args.first().map(|a| a.to_ascii_lowercase()) {
+                    Some(a) if a == "on" || a == "capture" => true,
+                    Some(a) if a == "off" || a == "release" => false,
+                    _ => !self.mouse_capture,
+                };
+                self.set_mouse_capture(capture);
+                false
+            }
             "helm" => {
                 match args.first().map(|a| a.to_ascii_lowercase()) {
                     Some(a) if a == "show" || a == "on" => {
