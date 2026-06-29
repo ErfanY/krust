@@ -132,11 +132,15 @@ Without a metrics-server these degrade gracefully (columns show `-`, the table t
 - `s`: tail toggle
 - `p`: pause/resume stream
 - `P`: toggle previous container instance (`kubectl logs -p`) — a one-shot fetch for crashloops
+- `m`: message-only — hide the `[source]` prefix and timestamp, keeping just the log message
+  (great for multi-pod streams where the pod name eats half the width)
 - `S`: source selector
 - `c`: container selector
 
-The logs status line shows `instance:current` or `instance:previous`. Previous-instance logs don't
-follow or auto-reconnect (the container is gone); press `P` again to return to the live stream.
+The logs status line shows `instance:current`/`previous` and `view: full`/`message-only`.
+Previous-instance logs don't follow or auto-reconnect (the container is gone); press `P` again to
+return to the live stream. `m` toggles message-only when source prefixes/timestamps crowd out the
+message (still searchable by source/time — only the display is trimmed).
 
 Pod behavior:
 - multi-container pods can stream from all containers
