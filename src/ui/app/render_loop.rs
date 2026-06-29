@@ -1065,7 +1065,7 @@ impl App {
                     let detail_wrap = active.detail_wrap;
                     let (max_v, max_h) = if detail_wrap {
                         let body = if logs_line_count > 0 {
-                            if self.logs.hidden_sources.is_empty() {
+                            if self.logs.hidden_sources.is_empty() && !self.logs.messages_only {
                                 self.log_joined_text().to_string()
                             } else {
                                 self.filtered_log_body_text()
@@ -1136,7 +1136,7 @@ impl App {
                     );
                     if detail_wrap {
                         let body = if logs_line_count > 0 {
-                            if self.logs.hidden_sources.is_empty() {
+                            if self.logs.hidden_sources.is_empty() && !self.logs.messages_only {
                                 self.log_joined_text().to_string()
                             } else {
                                 self.filtered_log_body_text()
@@ -1175,7 +1175,11 @@ impl App {
                             if visible.len() >= viewport_h {
                                 break;
                             }
-                            visible.push(slice_chars(line, detail_hscroll as usize, viewport_w));
+                            visible.push(slice_chars(
+                                self.display_log_line(line),
+                                detail_hscroll as usize,
+                                viewport_w,
+                            ));
                             visible_idx = visible_idx.saturating_add(1);
                         }
                         if visible.is_empty() {

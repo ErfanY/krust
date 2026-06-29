@@ -566,6 +566,8 @@ struct LogViewState {
     /// Stream the previous (terminated) container instance's logs (`kubectl logs -p`) — a one-shot
     /// fetch (no follow/reconnect), used for crashloop debugging.
     previous: bool,
+    /// Show only the log message, hiding the `[source]` prefix and the timestamp (toggle `m`).
+    messages_only: bool,
     paused_skipped_lines: u64,
     container_override_pod: Option<ResourceKey>,
     container_override: Option<String>,
@@ -606,6 +608,7 @@ impl Default for LogViewState {
             reconnect_blocked: false,
             paused: false,
             previous: false,
+            messages_only: false,
             paused_skipped_lines: 0,
             container_override_pod: None,
             container_override: None,
@@ -1240,6 +1243,14 @@ impl App {
                 || (key.code == KeyCode::Char('p') && key.modifiers.contains(KeyModifiers::SHIFT)))
         {
             self.toggle_previous_logs().await;
+            self.ensure_active_watch().await;
+            return Ok(false);
+        }
+        if self.current_tab().pane == Pane::Logs
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('m')
+        {
+            self.toggle_log_messages_only();
             self.ensure_active_watch().await;
             return Ok(false);
         }
@@ -4021,6 +4032,41 @@ mod tests {
         assert!(snap.contains("[default/pod-a/main] line-1"));
         // Defaults to the current container instance.
         assert!(snap.contains("instance: current"), "instance: {snap}");
+    }
+
+    #[test]
+    fn logs_message_only_hides_source_and_timestamp() {
+        let mut app = test_app();
+        app.current_tab_mut().pane = Pane::Logs;
+        app.current_tab_mut().detail_wrap = false;
+        app.logs.selection = Some(super::LogSelection {
+            scope: "pod default/pod-a".to_string(),
+            targets: vec![super::LogTarget {
+                context: "ctx-dev".to_string(),
+                namespace: "default".to_string(),
+                pod: "pod-a".to_string(),
+                container: Some("main".to_string()),
+            }],
+        });
+        app.push_log_line(
+            "[default/pod-a/main] 2026-05-26T22:41:01.812Z hello from the app".to_string(),
+        );
+
+        // Full view shows the source prefix and timestamp.
+        let snap = render_snapshot(&mut app, 120, 16);
+        assert!(snap.contains("[default/pod-a/main]"), "full prefix: {snap}");
+        assert!(snap.contains("2026-05-26T22:41:01"), "full ts: {snap}");
+
+        // Message-only hides both, keeps the message; title notes the mode.
+        app.toggle_log_messages_only();
+        let snap = render_snapshot(&mut app, 120, 16);
+        assert!(snap.contains("hello from the app"), "message kept: {snap}");
+        assert!(
+            !snap.contains("[default/pod-a/main]"),
+            "prefix hidden: {snap}"
+        );
+        assert!(!snap.contains("2026-05-26T22:41:01"), "ts hidden: {snap}");
+        assert!(snap.contains("view: message-only"), "title flag: {snap}");
     }
 
     #[tokio::test]

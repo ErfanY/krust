@@ -514,12 +514,17 @@ impl App {
         };
 
         format!(
-            "[LOGS] {} · instance: {} · streams: {} · state: {} · src: {} · lines: {} · dropped: {} · paused-drop: {}{} · wrap: {}",
+            "[LOGS] {} · instance: {} · streams: {} · state: {} · src: {} · view: {} · lines: {} · dropped: {} · paused-drop: {}{} · wrap: {}",
             target,
             instance,
             streams,
             state,
             source_filters,
+            if self.logs.messages_only {
+                "message-only"
+            } else {
+                "full"
+            },
             self.logs.lines.len(),
             self.logs.dropped_lines,
             self.logs.paused_skipped_lines,
@@ -530,6 +535,17 @@ impl App {
                 "off"
             }
         )
+    }
+
+    pub(super) fn toggle_log_messages_only(&mut self) {
+        self.logs.messages_only = !self.logs.messages_only;
+        // Width changes, so reset horizontal scroll to avoid a stranded offset.
+        self.current_tab_mut().detail_hscroll = 0;
+        self.status_line = if self.logs.messages_only {
+            "Logs: message-only (source + timestamp hidden)".to_string()
+        } else {
+            "Logs: full lines (source + timestamp shown)".to_string()
+        };
     }
 
     pub(super) fn set_log_paused(&mut self, paused: bool) {
@@ -592,7 +608,8 @@ impl App {
     }
 
     pub(super) fn filtered_log_line_count_and_width(&self) -> (usize, usize) {
-        if self.logs.hidden_sources.is_empty() {
+        // Fast path: no source filter and full lines → use the cached width.
+        if self.logs.hidden_sources.is_empty() && !self.logs.messages_only {
             return (self.logs.lines.len(), self.logs.max_line_width);
         }
         let mut count = 0usize;
@@ -600,23 +617,30 @@ impl App {
         for line in &self.logs.lines {
             if is_visible_log_line(line, &self.logs.hidden_sources) {
                 count = count.saturating_add(1);
-                max_width = max_width.max(line.chars().count());
+                max_width = max_width.max(self.display_log_line(line).chars().count());
             }
         }
         (count, max_width)
     }
 
     pub(super) fn filtered_log_body_text(&mut self) -> String {
-        if self.logs.hidden_sources.is_empty() {
+        // Fast path only when nothing transforms the lines.
+        if self.logs.hidden_sources.is_empty() && !self.logs.messages_only {
             return self.log_joined_text().to_string();
         }
+        let messages_only = self.logs.messages_only;
         self.logs
             .lines
             .iter()
             .filter(|line| is_visible_log_line(line, &self.logs.hidden_sources))
-            .cloned()
+            .map(|line| display_log_line(line, messages_only))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The line as displayed: full, or message-only (source prefix + timestamp stripped).
+    pub(super) fn display_log_line<'a>(&self, line: &'a str) -> &'a str {
+        display_log_line(line, self.logs.messages_only)
     }
 
     pub(super) fn log_search_match_lines(&mut self, query: &str) -> Vec<usize> {
@@ -650,6 +674,38 @@ impl App {
         self.logs.search_cache_matches = matches.clone();
         matches
     }
+}
+
+/// A stored log line is `[source] <rfc3339-timestamp> <message>`. In message-only mode, strip the
+/// `[source]` prefix and the leading timestamp so only the message shows. Returns a borrowed slice
+/// (the message is a contiguous tail), so this stays allocation-free on the render hot path.
+fn display_log_line(line: &str, messages_only: bool) -> &str {
+    if !messages_only {
+        return line;
+    }
+    let mut rest = line;
+    // Strip a leading "[...] " source prefix.
+    if rest.starts_with('[')
+        && let Some(idx) = rest.find("] ")
+    {
+        rest = &rest[idx + 2..];
+    }
+    // Strip a leading RFC3339 timestamp token followed by a space.
+    if let Some(sp) = rest.find(' ')
+        && looks_like_timestamp(&rest[..sp])
+    {
+        rest = &rest[sp + 1..];
+    }
+    rest
+}
+
+/// Heuristic RFC3339 check (e.g. `2026-05-26T22:41:01.812Z`) — enough to recognize the kubelet
+/// timestamp prefix without a full parse.
+fn looks_like_timestamp(token: &str) -> bool {
+    token.len() >= 20
+        && token.as_bytes()[0].is_ascii_digit()
+        && token.contains('T')
+        && (token.ends_with('Z') || token.contains('+') || token.contains(':'))
 }
 
 /// Build a multi-pod log selection, capping the number of concurrent streams to LOG_MAX_STREAMS.
@@ -714,5 +770,25 @@ mod tests {
     #[test]
     fn empty_targets_yield_no_selection() {
         assert!(capped_multi_pod_selection("rs", "ns", "app", Vec::new()).is_none());
+    }
+
+    #[test]
+    fn message_only_strips_source_prefix_and_timestamp() {
+        let line = "[orbit-production/backend-65495400b-4n3q/backend] 2026-05-26T22:41:01.812Z Resolved spring controller";
+        // full mode returns the line untouched
+        assert_eq!(display_log_line(line, false), line);
+        // message-only drops the [source] prefix and the RFC3339 timestamp
+        assert_eq!(display_log_line(line, true), "Resolved spring controller");
+
+        // No source prefix, just a timestamp
+        assert_eq!(
+            display_log_line("2026-05-26T22:41:01Z hello world", true),
+            "hello world"
+        );
+        // A message that merely starts with a non-timestamp token is left intact
+        assert_eq!(
+            display_log_line("[ns/pod/c] INFO starting up", true),
+            "INFO starting up"
+        );
     }
 }
