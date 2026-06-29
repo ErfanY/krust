@@ -55,6 +55,10 @@ impl Default for RuntimeConfig {
 pub struct UiConfig {
     pub theme: String,
     pub show_help: bool,
+    /// Capture the mouse for scroll-wheel support. When true (default), the terminal's native
+    /// click-drag text selection is disabled while krust runs; set false (or toggle with `:mouse`)
+    /// to keep native selection. Either way `y`/`:dump` copy from within krust.
+    pub mouse_capture: bool,
 }
 
 impl Default for UiConfig {
@@ -62,6 +66,7 @@ impl Default for UiConfig {
         Self {
             theme: "default".to_string(),
             show_help: true,
+            mouse_capture: true,
         }
     }
 }
